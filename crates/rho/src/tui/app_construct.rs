@@ -112,8 +112,6 @@ impl App {
             turn: TurnUi::default(),
             image_picker: picker_from_environment(),
             pending: PendingWorkUi::default(),
-            pending_inline_shells: Vec::new(),
-            deferred_inline_shell_context: Vec::new(),
             goal: None,
             history: HistoryUi::default(),
             credential_store,

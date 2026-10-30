@@ -143,11 +143,10 @@ impl App {
     /// The request the composer currently calls for, if any.
     pub(super) fn mcp_argument_cursor(&self) -> Option<McpArgumentCursor> {
         // Nothing is asked for a value no palette would show it for: a picker
-        // or a shell line is holding the composer, or the palette was dismissed
-        // for this keystroke. The checks are the cheapest available, and they
-        // run before the catalog is touched.
+        // is holding the composer, or the palette was dismissed for this
+        // keystroke. The checks are the cheapest available, and they run
+        // before the catalog is touched.
         if !matches!(self.input_ui.composer(), ComposerMode::Input)
-            || self.input_ui.shell_mode().is_some()
             || self.input_ui.command_palette_dismissed()
         {
             return None;

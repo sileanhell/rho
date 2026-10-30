@@ -180,7 +180,7 @@ impl App {
             }
             (_, KeyCode::Esc) => {
                 let cancelled_compact = self.cancel_compact(agent).await?;
-                if cancelled_compact || (!self.cancel_inline_shells() && !self.exit_shell_mode()) {
+                if !cancelled_compact {
                     self.take_back_held_turn();
                 }
                 self.ctrl_c_streak = 0;
@@ -224,20 +224,8 @@ impl App {
             self.expanded_input().trim().to_string(),
             self.input_ui.text().trim().to_string(),
         );
-        if turn.model.is_empty()
-            && self.input_ui.attachments().is_empty()
-            && self.input_ui.shell_mode().is_none()
-        {
+        if turn.model.is_empty() && self.input_ui.attachments().is_empty() {
             self.clear_submitted_input();
-            return Ok(());
-        }
-        if let Some((mode, command)) = self.shell_submission() {
-            if !self.input_ui.paste_segments().is_empty() {
-                return self.block_pasted_inline_shell();
-            }
-            self.clear_submitted_input();
-            self.ensure_session(agent)?;
-            self.start_inline_shell(mode, command)?;
             return Ok(());
         }
 

@@ -613,9 +613,6 @@ impl App {
                 pending_input_request = self.start_pending_input_request(agent);
                 self.pending_input_changed();
             }
-            if self.finish_completed_inline_shells().await? {
-                terminal.draw(|frame| self.draw(frame))?;
-            }
         }
 
         self.subagent_inbox
@@ -639,27 +636,12 @@ impl App {
         tool_call_active.store(false, Ordering::SeqCst);
         let result = agent.finish_run().await;
         failed_turn.display_commit = agent.take_last_turn_display_commit();
-        let inline_shell_error = match self.finish_all_inline_shells().await {
-            Ok(()) => self.insert_deferred_inline_shell_context(agent).err(),
-            Err(error) => Some(error),
-        };
         if let Some(context) = agent.take_context_usage() {
             self.handle_queued_agent_event(ViewModelEvent::ContextUsage(context), terminal)?;
         }
         // Capture before `stop_loading` clears the turn clock.
         let turn_elapsed = self.turn.elapsed_at(Instant::now());
         let outcome = match result {
-            _ if inline_shell_error.is_some() => {
-                let outcome = self.finalize_failed_turn(
-                    inline_shell_error
-                        .expect("inline shell error checked above")
-                        .to_string(),
-                    failed_turn,
-                    interrupted_tool_entries,
-                );
-                self.debug_assert_provider_turn_sync(agent);
-                outcome
-            }
             Ok(outcome) if sdk_failure.is_none() => {
                 self.end_provider_turn_ui();
                 self.debug_assert_provider_turn_sync(agent);

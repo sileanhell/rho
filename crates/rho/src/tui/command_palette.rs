@@ -412,12 +412,10 @@ impl App {
             // Mentions are prompt text, so the submission mode stays as is.
             CommandChoiceKind::SkillMention { token } => {
                 self.complete_skill_mention(token, &choice.name);
-                self.input_ui.set_shell_mode(None);
                 return;
             }
         };
         self.input_ui.set_text_and_cursor(input, cursor);
-        self.input_ui.set_shell_mode(None);
     }
 }
 

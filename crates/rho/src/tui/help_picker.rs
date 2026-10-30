@@ -46,16 +46,6 @@ fn help_items(keybindings: &Keybindings) -> Vec<PickerItem> {
             "Type @ to open workspace file path autocomplete. Keep typing to fuzzy-search, then tab or enter to insert an @path reference.",
         ),
         entry(
-            "!",
-            "Run shell",
-            "Prefix a command with ! to run it in the configured inline shell. Output is shown in the transcript and included in model context. Press tab to complete a workspace path.",
-        ),
-        entry(
-            "!!",
-            "Run local shell",
-            "Prefix a command with !! to run it locally without adding the output to model context. The composer uses a distinct label for this mode.",
-        ),
-        entry(
             "Enter",
             "Send, run, steer",
             "Send the composer contents. While a model turn is running, enter queues a steering message for after the current assistant turn. In pickers, enter confirms the selection.",
@@ -63,7 +53,7 @@ fn help_items(keybindings: &Keybindings) -> Vec<PickerItem> {
         entry(
             "Esc",
             "Cancel or close",
-            "Abort the current model response and restore queued work, cancel a running inline shell command, leave shell mode, or close an open palette or picker.",
+            "Abort the current model response and restore queued work, or close an open palette or picker.",
         ),
         entry(
             "Shift+Tab",

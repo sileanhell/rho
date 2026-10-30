@@ -419,7 +419,7 @@ impl AppWorkflowToolService {
             .authorize_node_resolution_reads(&planned.program, &catalog, context)
             .await?;
         let mut available_tools = AgentCapabilities::all_host_tools();
-        crate::app::agent_binding::retain_configured_shell(&mut available_tools, &config);
+        crate::app::agent_binding::retain_configured_shell(&mut available_tools);
         let host = AuthorizedPlanHost::new(
             &self.cwd,
             &config,

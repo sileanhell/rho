@@ -10,7 +10,6 @@ use crate::tui::{
     composer_buffer::ComposerBuffer,
     composer_vim::{VimOutcome, VimState},
     feed_image::FeedImage,
-    inline_shell::InlineShellMode,
     paste_burst::PasteBurst,
     ChatMedia, ComposerAttachment, ComposerMode, InputDraft, InputSubmissionMode, MediaAttachId,
     PasteSegment, PendingAttachmentSource,
@@ -26,11 +25,6 @@ pub(in crate::tui) struct InputUi {
     buffer: ComposerBuffer,
     /// Vim mode and register; consulted only with `editing_mode = "vim"`.
     vim: VimState,
-    shell_mode: Option<InlineShellMode>,
-    /// Char offset of the word Tab opened path completion on, in shell mode.
-    /// `None` while completion is closed. The palette itself is derived from
-    /// text and cursor, like the `@` palette.
-    shell_completion_anchor: Option<usize>,
     attachments: Vec<ComposerAttachmentSlot>,
     /// Bumped on every attachment mutation so composer layout caches invalidate.
     attachment_epoch: u64,
@@ -91,8 +85,6 @@ impl InputUi {
     pub(in crate::tui) fn clear_submitted(&mut self) {
         self.buffer.clear();
         self.reset_vim();
-        self.shell_mode = None;
-        self.shell_completion_anchor = None;
         self.pointer.clicks.cancel();
         self.attachments.clear();
         self.attachment_epoch = self.attachment_epoch.wrapping_add(1);
@@ -103,10 +95,7 @@ impl InputUi {
     }
 
     pub(in crate::tui) fn has_pending_draft(&self) -> bool {
-        !self.buffer.is_empty()
-            || self.shell_mode.is_some()
-            || !self.attachments.is_empty()
-            || self.paste_burst.has_pending()
+        !self.buffer.is_empty() || !self.attachments.is_empty() || self.paste_burst.has_pending()
     }
 
     pub(in crate::tui) fn reset_history_navigation(&mut self) {
@@ -143,7 +132,6 @@ impl InputUi {
     }
 
     pub(in crate::tui) fn apply_input_draft(&mut self, draft: InputDraft) {
-        self.set_shell_mode(draft.shell_mode);
         self.buffer.replace_all(draft.input, draft.paste_segments);
         self.submission_mode = draft.submission_mode;
         self.pointer.clicks.cancel();
@@ -294,28 +282,6 @@ impl InputUi {
 
     pub(in crate::tui) fn clear_paste_segments(&mut self) {
         self.buffer.set_paste_segments(Vec::new());
-    }
-
-    pub(in crate::tui) fn shell_mode(&self) -> Option<InlineShellMode> {
-        self.shell_mode
-    }
-
-    pub(in crate::tui) fn set_shell_mode(&mut self, mode: Option<InlineShellMode>) {
-        self.shell_mode = mode;
-        self.shell_completion_anchor = None;
-    }
-
-    pub(in crate::tui) fn take_shell_mode(&mut self) -> Option<InlineShellMode> {
-        self.shell_completion_anchor = None;
-        self.shell_mode.take()
-    }
-
-    pub(in crate::tui) fn shell_completion_anchor(&self) -> Option<usize> {
-        self.shell_completion_anchor
-    }
-
-    pub(in crate::tui) fn set_shell_completion_anchor(&mut self, anchor: Option<usize>) {
-        self.shell_completion_anchor = anchor;
     }
 
     pub(in crate::tui) fn attachment_slots(&self) -> &[ComposerAttachmentSlot] {

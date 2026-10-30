@@ -472,7 +472,6 @@ impl App {
     }
 
     pub(super) fn restore_pending_prompt(&mut self, prompt: QueuedPrompt) {
-        self.input_ui.set_shell_mode(None);
         self.input_ui.set_text(prompt.display_prompt);
         self.input_ui.set_paste_segments(prompt.paste_segments);
         for media in prompt.media {

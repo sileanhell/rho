@@ -10,7 +10,6 @@ use super::{
     doctor_overlay,
     feed_image::FeedImage,
     inline_choice::InlineChoiceModal,
-    inline_shell::InlineShellMode,
     limits_command,
     login::SecretInput,
     markdown::{CodeFenceState, StreamLineStart},
@@ -326,7 +325,6 @@ pub(super) struct InputDraft {
     pub(in crate::tui) input: String,
     pub(in crate::tui) paste_segments: Vec<PasteSegment>,
     pub(in crate::tui) submission_mode: InputSubmissionMode,
-    pub(in crate::tui) shell_mode: Option<InlineShellMode>,
 }
 
 impl From<&str> for QueuedPrompt {

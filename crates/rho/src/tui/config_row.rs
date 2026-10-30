@@ -52,12 +52,8 @@ pub(super) enum ConfigRow {
     Notifications,
     Number(ConfigNumberKey),
     ClearPromptHistory,
-    InlineShell,
     EditTool,
     EditToolChoice(String),
-    InlineShellChoice(String),
-    ShellTool,
-    ShellToolChoice(String),
     WebSearch,
     WebSearchAction(WebSearchAction),
     XaiImageGeneration,
@@ -77,12 +73,6 @@ impl ConfigRow {
         }
         if let Some(tool) = value.strip_prefix(config_picker::EDIT_TOOL_PREFIX) {
             return Some(Self::EditToolChoice(tool.to_string()));
-        }
-        if let Some(shell) = value.strip_prefix(config_picker::INLINE_SHELL_PREFIX) {
-            return Some(Self::InlineShellChoice(shell.to_string()));
-        }
-        if let Some(shell) = value.strip_prefix(config_picker::SHELL_TOOL_PREFIX) {
-            return Some(Self::ShellToolChoice(shell.to_string()));
         }
         if let Some(action) = WebSearchAction::parse(value) {
             return Some(Self::WebSearchAction(action));
@@ -139,8 +129,6 @@ impl ConfigRow {
                 Self::Number(ConfigNumberKey::PromptHistoryLimit)
             }
             config_picker::CLEAR_PROMPT_HISTORY_VALUE => Self::ClearPromptHistory,
-            config_picker::INLINE_SHELL_VALUE => Self::InlineShell,
-            config_picker::SHELL_TOOL_VALUE => Self::ShellTool,
             config_picker::EDIT_TOOL_VALUE => Self::EditTool,
             config_picker::WEB_SEARCH_VALUE => Self::WebSearch,
             config_picker::XAI_IMAGE_GENERATION_VALUE => Self::XaiImageGeneration,

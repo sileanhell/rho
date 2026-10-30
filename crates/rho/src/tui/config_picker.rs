@@ -98,10 +98,6 @@ pub(super) const MAX_TOOL_OUTPUT_LINES_VALUE: &str = "max_tool_output_lines";
 pub(super) const PROMPT_HISTORY_LIMIT_VALUE: &str = "prompt_history_limit";
 pub(super) const CLEAR_PROMPT_HISTORY_VALUE: &str = "clear_prompt_history";
 pub(super) const WEB_SEARCH_VALUE: &str = "web_search";
-pub(super) const INLINE_SHELL_VALUE: &str = "inline_shell";
-pub(super) const INLINE_SHELL_PREFIX: &str = "inline_shell:";
-pub(super) const SHELL_TOOL_VALUE: &str = "shell_tool";
-pub(super) const SHELL_TOOL_PREFIX: &str = "shell_tool:";
 pub(super) const EDIT_TOOL_VALUE: &str = "edit_tool";
 pub(super) const EDIT_TOOL_PREFIX: &str = "edit_tool:";
 pub(super) const XAI_IMAGE_GENERATION_VALUE: &str = "xai_image_generation";
@@ -275,7 +271,7 @@ pub(super) fn config_picker(info: &super::RuntimeModelView, config: &Config) -> 
             ),
             item(
                 "Tools",
-                "Inline shell, shell tool, edit tool, and web search.",
+                "Edit tool and web search.",
                 Some(tools_summary(info, config)),
                 TOOLS_CATEGORY_VALUE,
             ),
@@ -293,8 +289,7 @@ pub(super) fn config_picker(info: &super::RuntimeModelView, config: &Config) -> 
 
 fn tools_summary(info: &super::RuntimeModelView, config: &Config) -> String {
     let summary = format!(
-        "{} shell · {} · {}",
-        config.shell_tool_display_label(),
+        "{} · {}",
         config.edit_tool_display_label_for_provider(&info.provider),
         web_search_summary(info, config)
     );
@@ -552,18 +547,6 @@ pub(super) fn category_picker(
         TOOLS_CATEGORY_VALUE => {
             let mut items = vec![
                 item(
-                    "Inline shell",
-                    "Shell used by ! and !! commands.",
-                    Some(config.inline_shell.clone()),
-                    INLINE_SHELL_VALUE,
-                ),
-                item(
-                    "Shell tool",
-                    "Shell command tool exposed to the model. Applies to new sessions; the running chat keeps its tools.",
-                    Some(config.shell_tool_display_label()),
-                    SHELL_TOOL_VALUE,
-                ),
-                item(
                     "Edit tool",
                     "File edit format exposed to models. Auto follows the active provider.",
                     Some(config.edit_tool_display_label_for_provider(&info.provider)),
@@ -666,11 +649,9 @@ pub(super) fn category_for_setting(value: &str) -> Option<&'static str> {
         | MAX_OUTPUT_BYTES_VALUE
         | PROMPT_HISTORY_LIMIT_VALUE
         | CLEAR_PROMPT_HISTORY_VALUE => Some(CONTEXT_CATEGORY_VALUE),
-        INLINE_SHELL_VALUE
-        | SHELL_TOOL_VALUE
-        | EDIT_TOOL_VALUE
-        | WEB_SEARCH_VALUE
-        | XAI_IMAGE_GENERATION_VALUE => Some(TOOLS_CATEGORY_VALUE),
+        EDIT_TOOL_VALUE | WEB_SEARCH_VALUE | XAI_IMAGE_GENERATION_VALUE => {
+            Some(TOOLS_CATEGORY_VALUE)
+        }
         PROVIDER_LOGIN_VALUE
         | PROVIDER_LOGOUT_VALUE
         | SWITCH_AUTH_MODE_VALUE
@@ -716,43 +697,6 @@ fn permission_mode_description(mode: PermissionMode) -> &'static str {
             "Ask before writes, processes, and outside-workspace reads."
         }
     }
-}
-
-pub(super) fn inline_shell_picker(config: &Config) -> UiPicker {
-    UiPicker::config(
-        "Inline shell",
-        super::inline_shell::available_shells(&config.inline_shell)
-            .into_iter()
-            .map(|shell| PickerItem {
-                detail: Some("Use this shell for inline ! and !! commands.".into()),
-                badge: (shell == config.inline_shell).then_some(PickerBadge {
-                    text: "selected".into(),
-                    tone: PickerBadgeTone::Selected,
-                }),
-                ..PickerItem::new(shell.clone(), format!("{INLINE_SHELL_PREFIX}{shell}"))
-            })
-            .collect(),
-    )
-}
-
-pub(super) fn shell_tool_picker(selected: crate::config::ShellTool) -> UiPicker {
-    UiPicker::config(
-        "Shell tool",
-        crate::config::ShellTool::all()
-            .into_iter()
-            .map(|shell_tool| PickerItem {
-                detail: Some(shell_tool.detail().into()),
-                badge: (shell_tool == selected).then_some(PickerBadge {
-                    text: "selected".into(),
-                    tone: PickerBadgeTone::Selected,
-                }),
-                ..PickerItem::new(
-                    shell_tool.label().into(),
-                    format!("{SHELL_TOOL_PREFIX}{}", shell_tool.as_str()),
-                )
-            })
-            .collect(),
-    )
 }
 
 pub(super) fn edit_tool_picker(selected: EditTool) -> UiPicker {

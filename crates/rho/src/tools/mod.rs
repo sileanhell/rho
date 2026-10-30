@@ -24,17 +24,9 @@ pub(crate) mod workflow;
 mod workflow_output;
 pub(crate) mod workflow_tracker;
 
-/// Executable the model-facing shell tools launch for `kind`.
-///
-/// On Windows a configured `bash` resolves past PATH to the copy Git for
-/// Windows keeps beside `git.exe`, then to Rho's managed `bash.exe`; the bare
-/// name stays as the fallback so a missing bash fails at spawn under its own
-/// name. Everywhere else the kind's PATH-resolved name is used.
+/// Executable the model-facing shell tools launch for `kind`, resolved
+/// through PATH by name.
 pub(crate) fn shell_executable(kind: rho_tools::ShellKind) -> std::path::PathBuf {
-    #[cfg(windows)]
-    if kind == rho_tools::ShellKind::Bash {
-        return crate::tui::managed_shell::model_bash_executable();
-    }
     std::path::PathBuf::from(kind.default_executable())
 }
 

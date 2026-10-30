@@ -18,7 +18,7 @@ use super::{
     divider::{labeled_divider_line, DividerCaption},
     file_picker,
     inline_choice::inline_choice_frame,
-    inline_shell, input_frame,
+    input_frame,
     line_editor_view::{EditorViewport, EditorWindow},
     list_picker_frame,
     login::secret_input_frame,
@@ -138,23 +138,15 @@ impl App {
         labeled_divider_line(left, right, style, width)
     }
 
-    /// Longest-first left captions for the top rule: the vim mode, the
-    /// shell mode, or both, while the free-text composer is showing.
+    /// Longest-first left captions for the top rule while the free-text
+    /// composer is showing.
     fn composer_mode_captions(&self) -> Vec<String> {
         if !matches!(self.input_ui.composer(), ComposerMode::Input) {
             return Vec::new();
         }
-        let shell = self
-            .input_ui
-            .shell_mode()
-            .map_or(&[][..], inline_shell::mode_divider_labels);
         match self.composer_vim_mode() {
-            None => shell.iter().map(|label| (*label).to_owned()).collect(),
-            Some(mode) => shell
-                .iter()
-                .map(|label| format!("{} · {label}", mode.label()))
-                .chain(std::iter::once(mode.label().to_owned()))
-                .collect(),
+            None => Vec::new(),
+            Some(mode) => vec![mode.label().to_owned()],
         }
     }
 
@@ -196,7 +188,7 @@ impl App {
                         },
                     );
                 }
-                if self.input_ui.text().is_empty() && self.input_ui.shell_mode().is_none() {
+                if self.input_ui.text().is_empty() {
                     let placeholder = if self.composer_shows_abort_hint() {
                         "esc abort"
                     } else {
@@ -361,7 +353,7 @@ impl App {
                 for (index, entry) in matches.rows(start, MAX_COMMAND_SUGGESTIONS) {
                     let selected = index == selected_index;
                     let marker = if selected { ">" } else { " " };
-                    let text = format!("{marker} {}", file_palette_row(&entry, matches.source));
+                    let text = format!("{marker} {}", file_palette_row(&entry));
                     frame.push_row(
                         styled_line(
                             truncate_one_line(&text, width.max(1)),
@@ -406,21 +398,13 @@ fn palette_row_style(selected: bool) -> ratatui::style::Style {
 
 /// One path palette row.
 ///
-/// A workspace file shows what picking it inserts: `@path` for a mention, the
-/// bare path for a shell word. A resource shows its server, its own label, and
-/// whether picking it attaches content or writes a template the user still
-/// has to fill in, because those look identical otherwise and behave
-/// differently.
-fn file_palette_row(
-    entry: &file_picker::FilePaletteEntry,
-    source: file_picker::PathTokenSource,
-) -> String {
-    let prefix = match source {
-        file_picker::PathTokenSource::Mention => "@",
-        file_picker::PathTokenSource::ShellWord => "",
-    };
+/// A workspace file shows what picking it inserts: `@path`. A resource shows
+/// its server, its own label, and whether picking it attaches content or
+/// writes a template the user still has to fill in, because those look
+/// identical otherwise and behave differently.
+fn file_palette_row(entry: &file_picker::FilePaletteEntry) -> String {
     match entry {
-        file_picker::FilePaletteEntry::WorkspaceFile(path) => format!("{prefix}{path}"),
+        file_picker::FilePaletteEntry::WorkspaceFile(path) => format!("@{path}"),
         file_picker::FilePaletteEntry::McpResource(resource) => {
             let suffix = if resource.templated {
                 " · template"
@@ -428,7 +412,7 @@ fn file_palette_row(
                 ""
             };
             format!(
-                "{prefix}{}  {}:{}{suffix}",
+                "@{}  {}:{}{suffix}",
                 resource.uri,
                 resource.server,
                 resource.label()

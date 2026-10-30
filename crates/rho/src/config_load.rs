@@ -13,7 +13,7 @@ use {
 use super::{
     inferred_provider_auth, provider_config::PartialProviderConfigs, web_search, Config,
     ConfigWarning, EditTool, InternalAgentModelConfig, InternalAgentTarget,
-    LegacyWebSearchCredentials, ModelKind, ShellTool,
+    LegacyWebSearchCredentials, ModelKind,
 };
 
 pub(super) fn emit_warnings(path_display: &str, warnings: &[ConfigWarning]) {
@@ -242,26 +242,8 @@ pub(super) fn parse_settings(text: &str) -> anyhow::Result<(Config, Vec<ConfigWa
         if let Some(value) = group.edit_tool {
             cfg.edit_tool = value;
         }
-        if let Some(value) = group.shell_tool {
-            cfg.shell_tool = value;
-            // `powershell` parses everywhere so a config shared with Windows
-            // still loads; on Unix only `bash` is offered, so the pin
-            // normalizes to `auto` instead of advertising a tool that cannot run.
-            #[cfg(not(windows))]
-            if value == ShellTool::PowerShell {
-                warnings.push(ConfigWarning::Normalized {
-                    key: "behavior.shell_tool",
-                    from: "powershell".into(),
-                    to: "auto; powershell is only selectable on Windows".into(),
-                });
-                cfg.shell_tool = ShellTool::Auto;
-            }
-        }
         if let Some(value) = group.rtk {
             cfg.rtk = value;
-        }
-        if let Some(value) = group.inline_shell.filter(|value| !value.trim().is_empty()) {
-            cfg.inline_shell = value;
         }
     }
     if let Some(keybindings) = file.keybindings {
@@ -330,6 +312,8 @@ struct PartialConfig {
     web_search_exa_api_key: Option<String>,
     web_search_brave_api_key: Option<String>,
     rtk: Option<bool>,
+    // Legacy key: accepted so old configs parse under `deny_unknown_fields`,
+    // ignored since inline shell commands were removed.
     inline_shell: Option<String>,
     display: Option<PartialDisplayConfig>,
     output: Option<PartialOutputConfig>,
@@ -415,31 +399,16 @@ impl PartialConfig {
         }
 
         let _ = self.check_for_updates.take();
+        let _ = self.inline_shell.take();
         let enable_subagents = self.enable_subagents.take();
         let permission_mode = self.permission_mode.take();
         let rtk = self.rtk.take();
-        let inline_shell = self.inline_shell.take();
         if enable_subagents.is_some()
             || permission_mode.is_some()
             || rtk.is_some()
-            || inline_shell.is_some()
             || self.behavior.is_some()
         {
-            let group = self.behavior.take().unwrap_or(PartialBehaviorConfig {
-                check_for_updates: None,
-                enable_subagents: None,
-                agent_concurrency: None,
-                advisor_mode: None,
-                workspace_rewind: None,
-                keep_cache_warm: None,
-                _legacy_workspace_rewind: None,
-                permission_mode: None,
-                edit_tool: None,
-                credential_store: None,
-                rtk: None,
-                inline_shell: None,
-                shell_tool: None,
-            });
+            let group = self.behavior.take().unwrap_or_default();
             self.behavior = Some(PartialBehaviorConfig {
                 check_for_updates: group.check_for_updates,
                 enable_subagents: group.enable_subagents.or(enable_subagents),
@@ -452,7 +421,7 @@ impl PartialConfig {
                 edit_tool: group.edit_tool,
                 credential_store: group.credential_store,
                 rtk: group.rtk.or(rtk),
-                inline_shell: group.inline_shell.or(inline_shell),
+                inline_shell: group.inline_shell,
                 shell_tool: group.shell_tool,
             });
         }
@@ -723,7 +692,7 @@ struct PartialXaiConfig {
     image_generation: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PartialBehaviorConfig {
     // Legacy key: accepted so old configs parse under `deny_unknown_fields`,
@@ -745,6 +714,9 @@ struct PartialBehaviorConfig {
     // ignored since credentials always use the file store. Saving drops it.
     credential_store: Option<String>,
     rtk: Option<bool>,
+    // Legacy keys: accepted so old configs parse under `deny_unknown_fields`;
+    // the inline `!`/`!!` shell was removed and the model shell tool now
+    // always follows the platform. Saving drops both.
     inline_shell: Option<String>,
-    shell_tool: Option<ShellTool>,
+    shell_tool: Option<String>,
 }

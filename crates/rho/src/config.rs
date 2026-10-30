@@ -174,11 +174,6 @@ pub struct Config {
     ///
     /// [`EditTool::Auto`] resolves a concrete format from the active provider.
     pub edit_tool: EditTool,
-    /// Selects the shell tool exposed to models (`bash` or `powershell`).
-    ///
-    /// [`ShellTool::Auto`] keeps the platform default. Applies when a session
-    /// binds its tools, so a running chat keeps the shell it started with.
-    pub shell_tool: ShellTool,
 
     pub enable_subagents: bool,
     /// Maximum delegated agents that may execute at once, including background.
@@ -194,16 +189,11 @@ pub struct Config {
     pub permission_mode: PermissionMode,
     pub(crate) legacy_web_search_credentials: LegacyWebSearchCredentials,
     pub rtk: bool,
-    pub inline_shell: String,
     pub keybindings: Keybindings,
     pub prompt_templates: crate::prompt_templates::PromptTemplates,
     pub(crate) providers: ProviderConfigs,
     pub(crate) mcp: McpConfig,
     pub(crate) openapi: crate::tools::openapi::config::OpenApiConfig,
-}
-
-pub(crate) fn default_inline_shell() -> String {
-    if cfg!(windows) { "powershell" } else { "bash" }.into()
 }
 
 pub(super) fn inferred_provider_auth(
@@ -250,7 +240,6 @@ impl Default for Config {
             web_search: WebSearchSettings::default(),
             xai_image_generation: true,
             edit_tool: EditTool::default(),
-            shell_tool: ShellTool::default(),
 
             enable_subagents: true,
             agent_concurrency: DEFAULT_AGENT_CONCURRENCY,
@@ -260,7 +249,6 @@ impl Default for Config {
             permission_mode: PermissionMode::Bypass,
             legacy_web_search_credentials: LegacyWebSearchCredentials::default(),
             rtk: true,
-            inline_shell: default_inline_shell(),
             keybindings: Keybindings::default(),
             prompt_templates: Default::default(),
             providers: ProviderConfigs::default(),
@@ -412,16 +400,9 @@ impl Config {
         self.edit_tool_display_label_for_provider(&self.provider)
     }
 
-    /// The shell tool this config offers a freshly bound session.
+    /// The shell tool a freshly bound session offers: the platform shell.
     pub(crate) fn resolved_shell_tool(&self) -> rho_tools::ShellKind {
-        self.shell_tool.resolved()
-    }
-
-    pub(crate) fn shell_tool_display_label(&self) -> String {
-        match self.shell_tool {
-            ShellTool::Auto => format!("auto ({})", self.resolved_shell_tool().name()),
-            pinned => pinned.label().into(),
-        }
+        rho_tools::ShellKind::platform_default()
     }
 
     pub(crate) fn edit_tool_display_label_for_provider(&self, provider: &str) -> String {
@@ -488,136 +469,6 @@ impl Serialize for EditTool {
 }
 
 impl<'de> Deserialize<'de> for EditTool {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)
-    }
-}
-
-/// Configured model-facing shell preference (`behavior.shell_tool`).
-///
-/// [`Self::Auto`] offers the platform default: `bash` on Unix, `powershell`
-/// on Windows. Pinning `bash` works on every platform; `powershell` is only
-/// selectable on Windows.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ShellTool {
-    /// Offer the platform default shell.
-    #[default]
-    Auto,
-    /// Offer the `bash` tool (`bash -lc`).
-    Bash,
-    /// Offer the `powershell` tool (`powershell.exe -Command`). Windows only.
-    PowerShell,
-}
-
-impl ShellTool {
-    /// Every preference selectable on this platform, in UI display order.
-    ///
-    /// `powershell` is Windows-only: Unix builds offer just `bash`, so the
-    /// picker never presents a choice that cannot run.
-    pub fn all() -> Vec<Self> {
-        #[cfg(windows)]
-        {
-            vec![Self::Auto, Self::Bash, Self::PowerShell]
-        }
-        #[cfg(not(windows))]
-        {
-            vec![Self::Auto, Self::Bash]
-        }
-    }
-
-    /// Configured value and selector label (`behavior.shell_tool`).
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Bash => "bash",
-            Self::PowerShell => "powershell",
-        }
-    }
-
-    /// Short human-readable preference label.
-    pub const fn label(self) -> &'static str {
-        self.as_str()
-    }
-
-    /// Detail shown when selecting a shell preference.
-    pub fn detail(self) -> &'static str {
-        match self {
-            Self::Auto => {
-                "Offer the platform default: bash on Unix, powershell on Windows."
-            }
-            Self::Bash => "Expose the `bash` tool, running `bash -lc`, on every platform.",
-            Self::PowerShell => {
-                "Expose the `powershell` tool, running `powershell.exe -Command`, on every platform."
-            }
-        }
-    }
-
-    /// The concrete shell this preference resolves to.
-    ///
-    /// A `powershell` pin can still reach here from code paths that skip the
-    /// picker, so it degrades to `bash` off Windows rather than advertising a
-    /// tool that cannot run.
-    pub(crate) const fn resolved(self) -> rho_tools::ShellKind {
-        match self {
-            Self::Auto => rho_tools::ShellKind::platform_default(),
-            Self::Bash => rho_tools::ShellKind::Bash,
-            Self::PowerShell => {
-                if cfg!(windows) {
-                    rho_tools::ShellKind::PowerShell
-                } else {
-                    rho_tools::ShellKind::Bash
-                }
-            }
-        }
-    }
-}
-
-impl fmt::Display for ShellTool {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl FromStr for ShellTool {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "bash" => Ok(Self::Bash),
-            // Parsed everywhere so config load can normalize with a warning
-            // instead of failing a config file shared across platforms.
-            "powershell" | "pwsh" => Ok(Self::PowerShell),
-            normalized => {
-                let expected = Self::all()
-                    .into_iter()
-                    .map(Self::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                Err(format!(
-                    "unknown shell tool {normalized:?}; expected {expected}"
-                ))
-            }
-        }
-    }
-}
-
-impl Serialize for ShellTool {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ShellTool {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,

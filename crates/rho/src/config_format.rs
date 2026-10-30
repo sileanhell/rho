@@ -10,7 +10,7 @@ use {
 use super::{
     provider_config::PersistedProviderConfigs, Config, EditTool, ExaSearchConnection,
     InternalAgentModelConfig, InternalAgentTarget, OpenAiSearchConnection, SearchBackend,
-    ShellTool, WebSearchMode,
+    WebSearchMode,
 };
 
 pub(super) fn write_config(path: &Path, config: &Config) -> anyhow::Result<()> {
@@ -49,7 +49,7 @@ struct GroupedConfig<'a> {
     web_search: WebSearchConfig<'a>,
     #[serde(skip_serializing_if = "xai_config_is_default")]
     xai: XaiConfig,
-    behavior: BehaviorConfig<'a>,
+    behavior: BehaviorConfig,
     keybindings: &'a Keybindings,
     prompt_templates: &'a crate::prompt_templates::PromptTemplates,
     #[serde(skip_serializing_if = "crate::tools::mcp::config::McpConfig::is_empty")]
@@ -204,7 +204,7 @@ fn endpoint_is_default(config: &EndpointConfig<'_>) -> bool {
 }
 
 #[derive(Serialize)]
-struct BehaviorConfig<'a> {
+struct BehaviorConfig {
     enable_subagents: bool,
     agent_concurrency: usize,
     advisor_mode: bool,
@@ -213,8 +213,6 @@ struct BehaviorConfig<'a> {
     edit_tool: EditTool,
     permission_mode: PermissionMode,
     rtk: bool,
-    inline_shell: &'a str,
-    shell_tool: ShellTool,
 }
 
 impl<'a> From<&'a Config> for GroupedConfig<'a> {
@@ -294,8 +292,6 @@ impl<'a> From<&'a Config> for GroupedConfig<'a> {
                 edit_tool: config.edit_tool,
                 permission_mode: config.permission_mode,
                 rtk: config.rtk,
-                inline_shell: &config.inline_shell,
-                shell_tool: config.shell_tool,
             },
             keybindings: &config.keybindings,
             prompt_templates: &config.prompt_templates,

@@ -346,7 +346,7 @@ impl AgentExecutor {
         let config = self.config.read().expect("delegated config lock").clone();
         let mut capabilities = AgentCapabilities::all_host_tools();
         // web_search is gated after bind against the agent provider/model.
-        super::agent_binding::retain_configured_shell(&mut capabilities, &config);
+        super::agent_binding::retain_configured_shell(&mut capabilities);
         // Delegated questionnaires require a live parent host-input bridge.
         let questionnaire_target = if delegated_questionnaire_available(
             request.parent_session_id.as_ref(),
@@ -399,7 +399,7 @@ impl AgentExecutor {
     ) -> anyhow::Result<AgentRunHandle> {
         let config = self.config.read().expect("delegated config lock").clone();
         let mut current_tools = AgentCapabilities::all_host_tools();
-        super::agent_binding::retain_configured_shell(&mut current_tools, &config);
+        super::agent_binding::retain_configured_shell(&mut current_tools);
         current_tools.remove(&ToolCapability::Questionnaire);
         let bound = AgentBinder::bind_frozen(&request.agent, &config, &current_tools)?;
         let frozen_cli = match request.agent.runtime {

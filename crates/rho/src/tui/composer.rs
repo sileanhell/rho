@@ -150,6 +150,12 @@ impl App {
         self.input_ui.char_len()
     }
 
+    pub(super) fn clear_submitted_input(&mut self) {
+        self.cancel_all_pending_attachments();
+        self.input_ui.clear_submitted();
+        self.clamp_command_selection();
+    }
+
     pub(super) fn reset_input_history_navigation(&mut self) {
         self.input_ui.reset_history_navigation();
     }
@@ -179,7 +185,6 @@ impl App {
                     input: String::new(),
                     paste_segments: Vec::new(),
                     submission_mode: InputSubmissionMode::ParseCommands,
-                    shell_mode: None,
                 });
                 self.input_ui.apply_input_draft(draft);
                 self.input_ui.set_history_cursor(None);
@@ -199,14 +204,16 @@ impl App {
                 input: self.input_ui.text().to_string(),
                 paste_segments: self.input_ui.paste_segments().to_vec(),
                 submission_mode: self.input_ui.submission_mode(),
-                shell_mode: self.input_ui.shell_mode(),
             }));
         }
-        self.apply_composer_text(
-            self.input_ui.history()[index].clone(),
-            Vec::new(),
-            InputSubmissionMode::ParseCommands,
-        );
+        self.input_ui
+            .set_text(self.input_ui.history()[index].clone());
+        self.input_ui.clear_paste_segments();
+        self.input_ui
+            .set_submission_mode(InputSubmissionMode::ParseCommands);
+        self.input_ui.set_cursor(self.input_char_len());
+        self.clamp_command_selection();
+        self.clamp_file_selection();
         self.input_ui.set_history_cursor(Some(index));
         // Recalled text is finished content, not a live search. Keep both
         // palettes closed until the next typed edit.
@@ -224,7 +231,6 @@ impl App {
                 }
                 return;
             }
-            ComposerEditKey::Char('!') if self.try_enter_shell_mode_from_bang() => return,
             ComposerEditKey::Home | ComposerEditKey::End => self.reset_input_history_navigation(),
             ComposerEditKey::Newline => self.input_ui.clear_paste_burst(),
             _ => {}
@@ -313,9 +319,9 @@ impl App {
         self.apply_input_edit_key(ComposerEditKey::Char(ch));
     }
 
-    /// Insert plain composer text through the char path so rules like shell-mode
-    /// bang handling stay single-sourced. Paste-burst flushes land here; collapsed
-    /// paste markers use [`Self::insert_pasted_input_text`] instead.
+    /// Insert plain composer text through the char path so edit rules stay
+    /// single-sourced. Paste-burst flushes land here; collapsed paste markers
+    /// use [`Self::insert_pasted_input_text`] instead.
     pub(super) fn insert_input_text(&mut self, text: &str) {
         if text.is_empty() {
             return;

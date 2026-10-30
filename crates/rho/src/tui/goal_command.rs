@@ -358,13 +358,8 @@ impl App {
                             terminal.draw(|frame| self.draw(frame))?;
                         }
                     }
-                    if self.finish_completed_inline_shells().await? {
-                        terminal.draw(|frame| self.draw(frame))?;
-                    }
                 }
             };
-            self.finish_all_inline_shells().await?;
-            self.insert_deferred_inline_shell_context(agent)?;
             self.turn.stop_loading();
             self.end_busy_ui();
             let Some(evaluation) = evaluation else {
@@ -503,11 +498,8 @@ impl App {
                     self.update_activity_panels(agent)?;
                 }
             }
-            self.finish_completed_inline_shells().await?;
             terminal.draw(|frame| self.draw(frame))?;
         }
-        self.finish_all_inline_shells().await?;
-        self.insert_deferred_inline_shell_context(agent)?;
         self.turn.stop_loading();
         self.end_busy_ui();
         Ok(self.goal.is_some() && !self.should_quit)
@@ -589,12 +581,7 @@ impl App {
                     terminal.draw(|frame| self.draw(frame))?;
                 }
             }
-            if self.finish_completed_inline_shells().await? {
-                terminal.draw(|frame| self.draw(frame))?;
-            }
         };
-        self.finish_all_inline_shells().await?;
-        self.insert_deferred_inline_shell_context(agent)?;
         self.turn.stop_loading();
         self.end_busy_ui();
         Ok(should_retry && self.goal.is_some() && !self.should_quit)

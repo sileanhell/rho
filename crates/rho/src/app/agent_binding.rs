@@ -479,18 +479,11 @@ fn frozen_capabilities(
     capabilities
 }
 
-/// Keeps only the configured model shell in `capabilities`, so a bound run
-/// advertises exactly one shell tool.
-///
-/// This is what the old per-platform `cfg` removal did, now driven by
-/// `behavior.shell_tool`. Resolution happens at bind time: changing the
-/// preference affects the next bound run, never a running session's tool
-/// list.
-pub(crate) fn retain_configured_shell(
-    capabilities: &mut AgentCapabilities,
-    config: &crate::config::Config,
-) {
-    let withheld = match config.resolved_shell_tool() {
+/// Keeps only the platform model shell in `capabilities`, so a bound run
+/// advertises exactly one shell tool: `powershell` on Windows, `bash`
+/// elsewhere.
+pub(crate) fn retain_configured_shell(capabilities: &mut AgentCapabilities) {
+    let withheld = match rho_tools::ShellKind::platform_default() {
         rho_tools::ShellKind::Bash => ToolCapability::Powershell,
         rho_tools::ShellKind::PowerShell => ToolCapability::Bash,
     };
@@ -809,30 +802,11 @@ fn bind_profile_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ShellTool;
 
     #[test]
-    fn configured_shell_withholds_the_other_capability() {
-        let mut config = Config::default();
-        config.shell_tool = ShellTool::Bash;
+    fn platform_shell_withholds_the_other_capability() {
         let mut capabilities = AgentCapabilities::all_host_tools();
-        retain_configured_shell(&mut capabilities, &config);
-        assert!(capabilities.contains(&ToolCapability::Bash));
-        assert!(!capabilities.contains(&ToolCapability::Powershell));
-
-        config.shell_tool = ShellTool::PowerShell;
-        let mut capabilities = AgentCapabilities::all_host_tools();
-        retain_configured_shell(&mut capabilities, &config);
-        assert!(capabilities.contains(&ToolCapability::Powershell));
-        assert!(!capabilities.contains(&ToolCapability::Bash));
-    }
-
-    #[test]
-    fn auto_shell_keeps_the_platform_default() {
-        let config = Config::default();
-        assert_eq!(config.shell_tool, ShellTool::Auto);
-        let mut capabilities = AgentCapabilities::all_host_tools();
-        retain_configured_shell(&mut capabilities, &config);
+        retain_configured_shell(&mut capabilities);
         #[cfg(windows)]
         {
             assert!(capabilities.contains(&ToolCapability::Powershell));
@@ -843,33 +817,5 @@ mod tests {
             assert!(capabilities.contains(&ToolCapability::Bash));
             assert!(!capabilities.contains(&ToolCapability::Powershell));
         }
-    }
-}
-
-#[cfg(test)]
-mod shell_selection_tests {
-    use crate::config::ShellTool;
-
-    #[test]
-    fn powershell_is_only_selectable_on_windows() {
-        let all = ShellTool::all();
-        #[cfg(windows)]
-        assert!(all.contains(&ShellTool::PowerShell));
-        #[cfg(not(windows))]
-        assert!(!all.contains(&ShellTool::PowerShell));
-    }
-
-    #[test]
-    fn powershell_pin_degrades_to_bash_off_windows() {
-        #[cfg(windows)]
-        assert_eq!(
-            ShellTool::PowerShell.resolved(),
-            rho_tools::ShellKind::PowerShell
-        );
-        #[cfg(not(windows))]
-        assert_eq!(
-            ShellTool::PowerShell.resolved(),
-            rho_tools::ShellKind::Bash
-        );
     }
 }

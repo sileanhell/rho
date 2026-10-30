@@ -22,16 +22,12 @@ use super::{
 /// What Esc does in the live TUI.
 ///
 /// Approval deny-and-abort stays first. Visible or focused overlays and
-/// non-input composer modes then own Esc, matching during-turn key routing,
-/// so background pending inline shells and shell mode cannot steal a key
-/// the overlay would handle. Event handling and the empty-composer hint
-/// share this so chrome never advertises abort unless Esc would actually
-/// interrupt through the composer.
+/// non-input composer modes then own Esc, matching during-turn key routing.
+/// Event handling and the empty-composer hint share this so chrome never
+/// advertises abort unless Esc would actually interrupt through the composer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RunningEscapeAction {
     DenyApprovalAndAbort,
-    CancelInlineShells,
-    ExitShellMode,
     /// The focused composer owns Esc; use the normal key-routing chain.
     FocusedComposer,
     AbortTurn,
@@ -175,16 +171,8 @@ impl App {
         let prompt = self.expanded_input().trim().to_string();
         let display_prompt = self.input_ui.text().to_string();
         let paste_segments = self.input_ui.paste_segments().to_vec();
-        if prompt.is_empty() && self.input_ui.shell_mode().is_none() {
+        if prompt.is_empty() {
             self.clear_submitted_input();
-            return Ok(());
-        }
-        if let Some((mode, command)) = self.shell_submission() {
-            if !self.input_ui.paste_segments().is_empty() {
-                return self.block_pasted_inline_shell();
-            }
-            self.clear_submitted_input();
-            self.start_inline_shell(mode, command)?;
             return Ok(());
         }
 
@@ -489,19 +477,10 @@ impl App {
                                             ),
                                         )
                                     })?;
-                                    self.cancel_inline_shells();
                                     return Ok(self.request_running_interrupt(
                                         interrupt_requested,
                                         tool_call_active,
                                     ));
-                                }
-                                Some(RunningEscapeAction::CancelInlineShells) => {
-                                    let _ = self.cancel_inline_shells();
-                                    break 'event;
-                                }
-                                Some(RunningEscapeAction::ExitShellMode) => {
-                                    let _ = self.exit_shell_mode();
-                                    break 'event;
                                 }
                                 Some(RunningEscapeAction::AbortTurn) => {
                                     return Ok(self.request_running_interrupt(
@@ -588,10 +567,6 @@ impl App {
             Some(RunningEscapeAction::DenyApprovalAndAbort)
         } else if self.running_escape_has_overlay_target() || self.vim_captures_esc() {
             Some(RunningEscapeAction::FocusedComposer)
-        } else if !self.pending_inline_shells.is_empty() {
-            Some(RunningEscapeAction::CancelInlineShells)
-        } else if self.input_ui.shell_mode().is_some() {
-            Some(RunningEscapeAction::ExitShellMode)
         } else if self.turn.session_ui().esc_aborts_operation() {
             Some(RunningEscapeAction::AbortTurn)
         } else {
@@ -605,14 +580,12 @@ impl App {
             || !matches!(self.input_ui.composer(), ComposerMode::Input)
     }
 
-    /// Empty-composer abort copy. Overlays, shells, and palettes are already
-    /// excluded: this path only paints when the input is empty.
+    /// Empty-composer abort copy. Overlays and palettes are already excluded:
+    /// this path only paints when the input is empty.
     pub(super) fn composer_shows_abort_hint(&self) -> bool {
         matches!(self.input_ui.composer(), ComposerMode::Input)
-            && self.input_ui.shell_mode().is_none()
             && !self.pending_input_focused()
             && !self.vim_captures_esc()
-            && self.pending_inline_shells.is_empty()
             && self.turn.session_ui().esc_aborts_operation()
     }
 

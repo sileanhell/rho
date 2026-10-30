@@ -178,9 +178,6 @@ impl App {
                 self.refresh_model_lists(value, terminal).await
             }
             PickerAction::InsertSkillCommand => {
-                if matches!(commit.turn(), PickerTurn::Idle) {
-                    self.input_ui.set_shell_mode(None);
-                }
                 self.input_ui
                     .set_text_and_cursor(format!("/skill:{value}"), self.input_char_len());
                 self.input_ui.set_command_palette_dismissed(true);

@@ -344,6 +344,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         description: "run local setup diagnostics",
         argument_choices: &[],
     },
+    CommandSpec::alias(
+        "effort",
+        "/effort",
+        "alias for /reasoning",
+        CommandId::Reasoning,
+    ),
     CommandSpec {
         id: CommandId::Exit,
         name: "exit",

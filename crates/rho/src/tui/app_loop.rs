@@ -191,7 +191,6 @@ impl App {
                 || self.pending_session_title.is_some()
                 || self.mcp_argument_completions.is_pending()
                 || self.exclusive.wants_fast_ticks()
-                || !self.pending_inline_shells.is_empty()
                 || self.history.images().has_pending()
                 || agent.startup_hydrate_pending()
                 || self.loading_active()
@@ -301,12 +300,9 @@ impl App {
             // The composer decides what to ask about and changes on key events.
             needs_redraw |= self.poll_mcp_argument_completion().await;
             needs_redraw |= self.poll_markdown_images();
-            let shell_changed = self.finish_completed_inline_shells().await?;
             if !self.is_ui_busy() {
-                self.insert_deferred_inline_shell_context(agent)?;
                 needs_redraw |= self.start_deferred_info_tree();
             }
-            needs_redraw |= shell_changed;
             Ok(needs_redraw)
         })
     }

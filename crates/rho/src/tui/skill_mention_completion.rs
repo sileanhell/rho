@@ -43,7 +43,6 @@ impl App {
     /// for it.
     pub(super) fn skill_mention_cursor(&self) -> Option<SkillMentionCursor> {
         if !matches!(self.input_ui.composer(), ComposerMode::Input)
-            || self.input_ui.shell_mode().is_some()
             || self.input_ui.command_palette_dismissed()
         {
             return None;

@@ -91,7 +91,6 @@ impl App {
         let cursor = text.chars().count();
         self.input_ui.set_text_and_cursor(text, cursor);
         self.input_ui.clear_paste_segments();
-        self.input_ui.set_shell_mode(None);
         self.input_ui
             .set_submission_mode(InputSubmissionMode::ParseCommands);
         self.reset_input_history_navigation();

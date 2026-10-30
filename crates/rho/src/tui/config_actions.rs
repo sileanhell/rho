@@ -189,35 +189,6 @@ impl App {
             (ConfigRow::Notifications, _) => self.toggle_notifications(),
             (ConfigRow::Number(key), _) => self.open_config_number_editor(key),
             (ConfigRow::ClearPromptHistory, _) => self.prompt_clear_prompt_history(),
-            (ConfigRow::InlineShell, ctx) => {
-                let config = self.info.services.config_repository.load()?;
-                self.open_child_picker(config_picker::inline_shell_picker(&config));
-                if matches!(ctx, ConfigCommitCtx::DuringTurn) {
-                    self.set_status("select inline shell");
-                }
-                Ok(())
-            }
-            (ConfigRow::ShellTool, ctx) => {
-                let config = self.info.services.config_repository.load()?;
-                self.open_child_picker(config_picker::shell_tool_picker(config.shell_tool));
-                if matches!(ctx, ConfigCommitCtx::DuringTurn) {
-                    self.set_status("select shell tool");
-                }
-                Ok(())
-            }
-            (ConfigRow::ShellToolChoice(selected), _) => {
-                let shell_tool: crate::config::ShellTool =
-                    selected.parse().map_err(anyhow::Error::msg)?;
-                self.info.services.config_repository.update(|config| {
-                    config.shell_tool = shell_tool;
-                })?;
-                self.open_main_config_picker_selected(config_picker::SHELL_TOOL_VALUE)?;
-                self.set_status(format!(
-                    "shell tool: {}; applies to new sessions",
-                    shell_tool.label()
-                ));
-                Ok(())
-            }
             (ConfigRow::EditTool, ctx) => {
                 let config = self.info.services.config_repository.load()?;
                 self.open_child_picker(config_picker::edit_tool_picker(config.edit_tool));
@@ -237,14 +208,6 @@ impl App {
                 let status = self.status().to_string();
                 self.open_main_config_picker_selected(config_picker::EDIT_TOOL_VALUE)?;
                 self.set_status(status);
-                Ok(())
-            }
-            (ConfigRow::InlineShellChoice(shell), _) => {
-                self.info.services.config_repository.update(|config| {
-                    config.inline_shell.clone_from(&shell);
-                })?;
-                self.open_main_config_picker_selected(config_picker::INLINE_SHELL_VALUE)?;
-                self.set_status(format!("inline shell: {shell}"));
                 Ok(())
             }
             (ConfigRow::WebSearch, ctx) => {

@@ -592,7 +592,7 @@ pub(super) fn host_capabilities(
     }
     let mut tools = crate::agent::AgentCapabilities::all_host_tools();
     // web_search is gated after bind against the resolved provider/model.
-    super::agent_binding::retain_configured_shell(&mut tools, config);
+    super::agent_binding::retain_configured_shell(&mut tools);
     if cli.no_subagents || !config.enable_subagents {
         tools.remove(&ToolCapability::Agent);
         tools.remove(&ToolCapability::Agents);

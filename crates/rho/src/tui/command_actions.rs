@@ -201,7 +201,6 @@ impl App {
         self.input_ui.set_composer(ComposerMode::Input);
         self.input_ui.clear_text();
         self.input_ui.clear_paste_segments();
-        self.input_ui.set_shell_mode(None);
         self.input_ui
             .set_submission_mode(InputSubmissionMode::ParseCommands);
         self.input_ui.reset_history_navigation();

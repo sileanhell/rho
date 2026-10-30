@@ -550,7 +550,6 @@ impl App {
         self.input_ui.set_composer(ComposerMode::Input);
         self.input_ui.clear_text();
         self.input_ui.clear_paste_segments();
-        self.input_ui.set_shell_mode(None);
         self.input_ui.set_cursor(0);
         self.cancel_all_pending_attachments();
         self.input_ui.clear_attachments();

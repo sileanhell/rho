@@ -120,8 +120,6 @@ mod init_command;
 mod inline_choice;
 mod inline_prompt_input;
 pub(crate) use inline_prompt_input::InlinePromptInput;
-mod inline_shell;
-mod inline_shell_config;
 mod keybindings;
 mod keyboard_modes;
 mod limits_command;
@@ -133,7 +131,6 @@ mod login_pending;
 mod login_presentation;
 mod login_secret_input;
 mod login_target;
-pub(crate) mod managed_shell;
 mod markdown;
 mod markdown_image;
 mod mcp_actions;
@@ -194,7 +191,6 @@ mod sessions_hub;
 mod sessions_hub_groups;
 mod sessions_hub_tasks;
 mod setup_screen;
-mod shell_palette;
 mod side_chat;
 mod spend_overlay;
 mod spend_view;
@@ -296,7 +292,7 @@ use questionnaire::{
 };
 use render::{
     display_width, input_frame, list_picker_frame, session_header_lines, styled_line,
-    tool_entry_lines, truncate_one_line, InputFrame, LineFill,
+    truncate_one_line, InputFrame, LineFill,
 };
 use scrollbar::HistoryScrollbar;
 use session_title::PendingSessionTitle;
@@ -581,8 +577,6 @@ struct App {
     turn: TurnUi,
     image_picker: Option<ratatui_image::picker::Picker>,
     pending: PendingWorkUi,
-    pending_inline_shells: Vec<inline_shell::PendingShellTask>,
-    deferred_inline_shell_context: Vec<inline_shell::DeferredShellContext>,
     goal: Option<GoalState>,
     history: HistoryUi,
     credential_store: Arc<dyn CredentialStore>,
