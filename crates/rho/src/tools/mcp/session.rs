@@ -1,0 +1,746 @@
+//! Establishing, maintaining, and closing one MCP server session.
+//!
+//! Everything here is per-server. Startup is bounded so a broken server cannot
+//! stall a session; after the handshake succeeds a maintenance task owns the
+//! long-lived server-to-client traffic (tool-list changes, keepalive) so the
+//! tool call path stays a plain request/response.
+
+// `logging/setLevel` carries a SEP-2577 deprecation marker in rmcp while every
+// shipping server still uses it.
+#![expect(deprecated)]
+
+use std::{collections::BTreeMap, path::Path, process::Stdio, sync::Arc};
+
+use anyhow::{bail, Context};
+use http::{HeaderName, HeaderValue};
+use rho_sdk::Workspace;
+use rmcp::{
+    model::SetLevelRequestParams,
+    service::{PeerRequestOptions, RunningService},
+    transport::{
+        streamable_http_client::StreamableHttpClientTransportConfig, which_command,
+        StreamableHttpClientTransport, TokioChildProcess,
+    },
+    Peer, RoleClient, ServiceExt,
+};
+
+use super::{
+    catalog::{self, McpCatalogHandle},
+    client::{McpClientHandler, McpClientServices, McpEventReceiver, McpServerEvent},
+    config::{McpServerConfig, McpToolFilter, McpTransport},
+    definition::McpToolDefinition,
+    elicitation::{McpElicitationService, McpElicitationSupport},
+    http_client::McpTransportClient,
+    inflight::McpInFlightCalls,
+    oauth::{self, McpAuthorizationMode, McpHttpClient},
+    progress::McpProgressRouter,
+    report::McpLiveServerState,
+    roots::McpRoots,
+    sampling::{McpSamplingBridge, McpSamplingService},
+    tool::McpToolSlot,
+    validate,
+};
+
+pub(super) type McpSession = RunningService<RoleClient, McpClientHandler>;
+
+// The local end-to-end fixture initializes in about 40 ms. Two minutes leaves
+// a 3,000x margin for cold package runners while still bounding broken servers.
+pub(super) const MCP_SERVER_STARTUP_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(120);
+// Graceful MCP session teardown should be quick; bound it so one hung server
+// cannot stall process or CLI shutdown.
+const MCP_SESSION_CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+// Remote sessions can be dropped by an idle proxy without any local signal, so
+// they are pinged. A stdio child's death is observable directly and needs none.
+const MCP_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+// One task owns all of a session's maintenance, so a server that accepts a
+// request and never answers would stop every later tool-list change and
+// reachability update. Bound each request well inside the keepalive interval so
+// the next tick still gets its turn.
+const MCP_MAINTENANCE_REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(super) enum ConnectResult {
+    Ready(Box<ConnectedServer>),
+    Failed { error: anyhow::Error },
+    TimedOut,
+}
+
+/// A server that finished its handshake and first discovery.
+pub(super) struct ConnectedServer {
+    pub(super) session: McpSession,
+    pub(super) discovered: McpToolDiscovery,
+    /// `initialize` guidance, passed to the model as server-authored context.
+    pub(super) instructions: Option<String>,
+    pub(super) progress: McpProgressRouter,
+    /// The registry this server's tools publish themselves in, so server
+    /// requests can be routed back to the call that caused them.
+    pub(super) calls: McpInFlightCalls,
+    pub(super) events: McpEventReceiver,
+    pub(super) offers: McpServerOffers,
+}
+
+/// Selected, validated definitions and the tools excluded by configuration.
+#[derive(Debug, Default)]
+pub(super) struct McpToolDiscovery {
+    pub(super) definitions: Vec<(String, McpToolDefinition)>,
+    pub(super) filtered_out_count: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ToolDiscoveryError {
+    #[error("MCP tool discovery exceeded its deadline")]
+    TimedOut,
+    #[error(transparent)]
+    Failed(#[from] anyhow::Error),
+}
+
+/// What the host is able to serve a server beyond `roots/list`.
+///
+/// Passed in from the session plan because it is a property of the run, not of
+/// the server: an inventory pass has no turn to interrupt and no model bound.
+#[derive(Clone, Debug)]
+pub(super) struct McpSessionServices {
+    pub(super) elicitation: McpElicitationSupport,
+    /// `Some` when this run will bind a model for sampling.
+    pub(super) sampling: Option<McpSamplingBridge>,
+}
+
+/// Which optional primitives a server declared at `initialize`.
+///
+/// Rho only asks for what a server said it has. Listing prompts on a server
+/// that declares none is a guaranteed error and a wasted round-trip in the
+/// startup budget, and the same holds for argument completion, which is asked
+/// for while someone is still typing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct McpServerOffers {
+    pub(super) prompts: bool,
+    pub(super) resources: bool,
+    pub(super) completions: bool,
+}
+
+impl McpServerOffers {
+    fn from_session(session: &McpSession) -> Self {
+        session
+            .peer_info()
+            .map(|info| Self::from_capabilities(&info.capabilities))
+            .unwrap_or_default()
+    }
+
+    /// Read straight from the declared capabilities, so the mapping can be
+    /// checked without standing up a session.
+    fn from_capabilities(capabilities: &rmcp::model::ServerCapabilities) -> Self {
+        Self {
+            prompts: capabilities.prompts.is_some(),
+            resources: capabilities.resources.is_some(),
+            completions: capabilities.completions.is_some(),
+        }
+    }
+}
+
+/// Establish and discover under one startup budget. After the session exists,
+/// failures and timeouts always attempt a bounded close instead of relying on
+/// Drop alone.
+pub(super) async fn connect_server_bounded(
+    identity: &str,
+    server: &McpServerConfig,
+    roots: &McpRoots,
+    services: &McpSessionServices,
+    authorization: McpAuthorizationMode,
+) -> ConnectResult {
+    // Authorization runs before the startup clock. It carries its own budgets,
+    // and a browser login is a person's pace, not a server's.
+    let http_client = match resolve_http_client(identity, server, authorization).await {
+        Ok(http_client) => http_client,
+        Err(error) => return ConnectResult::Failed { error },
+    };
+
+    let deadline = tokio::time::Instant::now() + MCP_SERVER_STARTUP_BUDGET;
+    let progress = McpProgressRouter::new();
+    let calls = McpInFlightCalls::new();
+    let (event_sender, events) = tokio::sync::mpsc::unbounded_channel();
+    let handler = McpClientHandler::new(
+        identity,
+        roots.clone(),
+        progress.clone(),
+        event_sender,
+        client_services(identity, server, services, &calls),
+    );
+    let session = match tokio::time::timeout_at(
+        deadline,
+        establish_session(identity, server, handler, http_client),
+    )
+    .await
+    {
+        Ok(Ok(session)) => session,
+        Ok(Err(error)) => return ConnectResult::Failed { error },
+        Err(_) => return ConnectResult::TimedOut,
+    };
+
+    let instructions = session
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .filter(|instructions| !instructions.trim().is_empty());
+    apply_log_level(identity, server, &session, deadline).await;
+
+    let offers = McpServerOffers::from_session(&session);
+    match list_tool_definitions(identity, session.peer(), &server.tools, deadline).await {
+        Ok(discovered) => ConnectResult::Ready(Box::new(ConnectedServer {
+            session,
+            discovered,
+            instructions,
+            progress,
+            calls,
+            events,
+            offers,
+        })),
+        Err(ToolDiscoveryError::Failed(error)) => {
+            close_session(session).await;
+            ConnectResult::Failed {
+                // Reports display this error without anyhow's chain formatter.
+                error: anyhow::anyhow!("MCP server `{identity}` failed tools/list: {error:#}"),
+            }
+        }
+        Err(ToolDiscoveryError::TimedOut) => {
+            close_session(session).await;
+            ConnectResult::TimedOut
+        }
+    }
+}
+
+/// Filter before compiling output contracts, then validate the whole selected set
+/// before publishing any definitions. A bad selected declaration fails discovery
+/// without partially changing live slots; excluded declarations cannot block it.
+async fn list_tool_definitions(
+    identity: &str,
+    peer: &Peer<RoleClient>,
+    filter: &McpToolFilter,
+    deadline: tokio::time::Instant,
+) -> Result<McpToolDiscovery, ToolDiscoveryError> {
+    let tools = tokio::time::timeout_at(deadline, peer.list_all_tools())
+        .await
+        .map_err(|_| ToolDiscoveryError::TimedOut)?
+        .map_err(anyhow::Error::from)?;
+    compile_tool_definitions(identity, tools, filter, deadline).await
+}
+
+async fn compile_tool_definitions(
+    identity: &str,
+    tools: Vec<rmcp::model::Tool>,
+    filter: &McpToolFilter,
+    deadline: tokio::time::Instant,
+) -> Result<McpToolDiscovery, ToolDiscoveryError> {
+    let mut discovered = McpToolDiscovery::default();
+    for remote in tools {
+        // Bound one poll to one schema, including when other servers share
+        // this task. Check the absolute budget after every cancellation point.
+        tokio::task::yield_now().await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ToolDiscoveryError::TimedOut);
+        }
+        let name = remote.name.to_string();
+        if !filter.includes(&name) {
+            discovered.filtered_out_count += 1;
+            continue;
+        }
+        let definition = McpToolDefinition::from_remote(identity, &name, &remote)
+            .with_context(|| format!("MCP tool `{name}` has an unusable output schema"))?;
+        discovered.definitions.push((name, definition));
+    }
+    // The last synchronous compilation can itself cross the deadline. Never
+    // publish that batch, even though there is no subsequent yield to time out.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(ToolDiscoveryError::TimedOut);
+    }
+    Ok(discovered)
+}
+
+/// Resolve what this session declares and answers for one server.
+///
+/// Sampling needs both halves of its double gate before the capability is
+/// declared: the server opted in through config, and this run has somewhere to
+/// get a model from.
+fn client_services(
+    identity: &str,
+    server: &McpServerConfig,
+    services: &McpSessionServices,
+    calls: &McpInFlightCalls,
+) -> McpClientServices {
+    let sample = services
+        .sampling
+        .clone()
+        .filter(|_| server.sampling.is_offered())
+        .map(|bridge| McpSamplingService::new(identity, server.sampling, bridge, calls.clone()));
+    McpClientServices {
+        elicit: McpElicitationService::new(identity, calls.clone(), services.elicitation),
+        sample,
+    }
+}
+
+/// Ask the server to emit logs at the configured level. A server that does not
+/// declare `logging` is left alone; asking anyway would fail the request and
+/// tell the user nothing useful.
+///
+/// This runs inside the startup deadline. Logging is optional, so a server that
+/// never answers it must not push startup past the budget the user is told
+/// about; it spends the remaining budget and startup then times out as usual.
+async fn apply_log_level(
+    identity: &str,
+    server: &McpServerConfig,
+    session: &McpSession,
+    deadline: tokio::time::Instant,
+) {
+    let Some(level) = server.log_level else {
+        return;
+    };
+    let declares_logging = session
+        .peer_info()
+        .is_some_and(|info| info.capabilities.logging.is_some());
+    if !declares_logging {
+        tracing::debug!(
+            server = %identity,
+            "MCP server does not support logging; log_level was not applied"
+        );
+        return;
+    }
+    let set_level = session
+        .peer()
+        .set_level(SetLevelRequestParams::new(level.into()));
+    match tokio::time::timeout_at(deadline, set_level).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(server = %identity, error = %error, "MCP logging/setLevel failed");
+        }
+        Err(_) => tracing::warn!(
+            server = %identity,
+            limit_seconds = MCP_SERVER_STARTUP_BUDGET.as_secs(),
+            "MCP logging/setLevel exhausted the server startup budget"
+        ),
+    }
+}
+
+/// Resolve the HTTP client a remote session runs on. A stdio server has none.
+///
+/// Headers are resolved here and again when the transport is built. Resolution
+/// is a pure read of config plus the environment, so repeating it costs
+/// nothing and keeps each step's inputs local to it.
+async fn resolve_http_client(
+    identity: &str,
+    server: &McpServerConfig,
+    authorization: McpAuthorizationMode,
+) -> anyhow::Result<McpHttpClient> {
+    let McpTransport::StreamableHttp {
+        url,
+        headers: literal_headers,
+        headers_from_env,
+        oauth: oauth_config,
+        allow_insecure_http,
+    } = &server.transport
+    else {
+        return Ok(McpHttpClient::Default);
+    };
+    validate::parse_remote_url_with(
+        url,
+        validate::McpHttpSecurity::from_allow_insecure_http(*allow_insecure_http),
+    )?;
+    let headers = resolve_headers(literal_headers, headers_from_env)?;
+    oauth::prepare_http_client(
+        identity,
+        url,
+        oauth_config.as_ref(),
+        &headers,
+        authorization,
+    )
+    .await
+}
+
+async fn establish_session(
+    identity: &str,
+    server: &McpServerConfig,
+    handler: McpClientHandler,
+    http_client: McpHttpClient,
+) -> anyhow::Result<McpSession> {
+    prepare_server_filesystem(server)?;
+    match &server.transport {
+        McpTransport::Stdio {
+            command,
+            args,
+            cwd,
+            env,
+            env_from_env,
+        } => {
+            if command.trim().is_empty() {
+                bail!("stdio command must not be empty");
+            }
+            let mut command = which_command(command)
+                .with_context(|| format!("MCP executable `{command}` was not found"))?;
+            command.args(args);
+            if let Some(cwd) = cwd {
+                command.current_dir(cwd);
+            }
+            // Start from the shared sanitized base. Servers opt into all other
+            // inherited variables through `env_from_env`.
+            apply_stdio_environment(&mut command, env, env_from_env)?;
+            // Servers and anything they launch must not take over the TUI's terminal.
+            #[cfg(unix)]
+            rho_tools::process_session::start_new_session(command.as_std_mut());
+            // Child diagnostics must never write over the interactive terminal.
+            // MCP protocol logging and connection errors use host-owned reporting.
+            let (transport, _) = TokioChildProcess::builder(command)
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| format!("failed to spawn MCP server `{identity}`"))?;
+            Ok(handler.serve(transport).await?)
+        }
+        McpTransport::StreamableHttp {
+            url,
+            headers: literal_headers,
+            headers_from_env,
+            oauth: _,
+            allow_insecure_http,
+        } => {
+            validate::parse_remote_url_with(
+                url,
+                validate::McpHttpSecurity::from_allow_insecure_http(*allow_insecure_http),
+            )?;
+            let headers = resolve_headers(literal_headers, headers_from_env)?;
+            // Redirects are disabled on every client used here, so configured
+            // headers and bearer tokens never cross origins through a
+            // redirect. This satisfies the Agent Plugins header-forwarding
+            // rule.
+            let config =
+                StreamableHttpClientTransportConfig::with_uri(url.clone()).custom_headers(headers);
+            let transport = StreamableHttpClientTransport::with_client(
+                McpTransportClient::new(http_client)?,
+                config,
+            );
+            Ok(handler.serve(transport).await?)
+        }
+    }
+}
+
+fn resolve_headers(
+    literal_headers: &BTreeMap<String, String>,
+    headers_from_env: &BTreeMap<String, String>,
+) -> anyhow::Result<std::collections::HashMap<HeaderName, HeaderValue>> {
+    validate::validate_literal_headers(literal_headers)?;
+    validate::validate_environment_header_names(headers_from_env)?;
+    let mut headers = std::collections::HashMap::new();
+    // Literal headers apply first; environment-derived headers override them
+    // on a name collision.
+    for (name, value) in literal_headers {
+        headers.insert(header_name(name)?, header_value(name, value)?);
+    }
+    for (name, variable) in headers_from_env {
+        let value = std::env::var(variable).with_context(|| {
+            format!("environment variable `{variable}` for MCP header `{name}` is not set")
+        })?;
+        headers.insert(header_name(name)?, header_value(name, &value)?);
+    }
+    Ok(headers)
+}
+
+fn header_name(name: &str) -> anyhow::Result<HeaderName> {
+    HeaderName::try_from(name).with_context(|| format!("invalid header `{name}`"))
+}
+
+fn header_value(name: &str, value: &str) -> anyhow::Result<HeaderValue> {
+    HeaderValue::try_from(value).with_context(|| format!("invalid value for MCP header `{name}`"))
+}
+
+pub(super) async fn close_session(mut session: McpSession) {
+    match tokio::time::timeout(MCP_SESSION_CLOSE_BUDGET, session.close()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "MCP session shutdown failed");
+        }
+        Err(_) => {
+            tracing::warn!(
+                limit_seconds = MCP_SESSION_CLOSE_BUDGET.as_secs(),
+                "MCP session shutdown exceeded its close budget"
+            );
+        }
+    }
+}
+
+/// Everything the per-session maintenance task needs to keep one server's
+/// exported tools current.
+pub(super) struct SessionMaintenance {
+    pub(super) identity: String,
+    pub(super) peer: Peer<RoleClient>,
+    pub(super) server: McpServerConfig,
+    /// Remote tool name to the slot backing its exported native tool.
+    pub(super) slots: BTreeMap<String, Arc<McpToolSlot>>,
+    pub(super) live: McpLiveServerState,
+    pub(super) events: McpEventReceiver,
+    /// Write access to this server's prompt and resource listings.
+    pub(super) catalog: McpCatalogHandle,
+    pub(super) offers: McpServerOffers,
+}
+
+/// Own the long-lived server-to-client work for one session.
+///
+/// The task ends when the handler drops, which happens when the session closes,
+/// so shutdown needs no extra signal.
+pub(super) async fn maintain_session(mut maintenance: SessionMaintenance) {
+    let keepalive = matches!(
+        maintenance.server.transport,
+        McpTransport::StreamableHttp { .. }
+    );
+    let mut ticker = tokio::time::interval(MCP_KEEPALIVE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first tick completes immediately; a ping right after the handshake
+    // says nothing useful.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            event = maintenance.events.recv() => match event {
+                Some(McpServerEvent::ToolsChanged) => refresh_tools(&maintenance).await,
+                // Gated on what the server declared, for the same reason the
+                // connect-time listing is: a server that never offered the
+                // primitive can only answer the request with an error.
+                Some(McpServerEvent::PromptsChanged) if maintenance.offers.prompts => {
+                    list_prompts(&maintenance.catalog).await;
+                }
+                Some(McpServerEvent::ResourcesChanged) if maintenance.offers.resources => {
+                    list_resources(&maintenance.catalog).await;
+                }
+                Some(McpServerEvent::PromptsChanged | McpServerEvent::ResourcesChanged) => {}
+                None => break,
+            },
+            _ = ticker.tick(), if keepalive => {
+                if let Err(error) = ping(&maintenance.peer).await {
+                    tracing::warn!(
+                        server = %maintenance.identity,
+                        error = %error,
+                        "MCP keepalive ping failed"
+                    );
+                    maintenance.live.mark_unreachable(error.to_string());
+                } else {
+                    maintenance.live.mark_reachable();
+                }
+            }
+        }
+    }
+}
+
+/// List the prompts and resources a server declared, once at startup.
+///
+/// A failure here disables neither the server nor its tools: prompts and
+/// resources are things a person reaches for, and their absence is a smaller
+/// problem than losing a working tool set.
+pub(super) async fn list_offers(catalog: &McpCatalogHandle, offers: McpServerOffers) {
+    if offers.prompts {
+        list_prompts(catalog).await;
+    }
+    if offers.resources {
+        list_resources(catalog).await;
+    }
+}
+
+async fn list_prompts(catalog: &McpCatalogHandle) {
+    match catalog.peer().list_all_prompts().await {
+        Ok(prompts) => {
+            catalog.set_prompts(catalog::prompts_from_remote(catalog.identity(), prompts))
+        }
+        Err(error) => tracing::warn!(
+            server = %catalog.identity(),
+            error = %error,
+            "MCP prompts/list failed; this server offers no prompts this session"
+        ),
+    }
+}
+
+async fn list_resources(catalog: &McpCatalogHandle) {
+    let (concrete, templates) = tokio::join!(
+        catalog.peer().list_all_resources(),
+        catalog.peer().list_all_resource_templates(),
+    );
+    // A server may offer concrete resources, templates, or both. One failing
+    // must not discard the other.
+    if concrete.is_err() && templates.is_err() {
+        tracing::warn!(
+            server = %catalog.identity(),
+            "MCP resource listing failed; this server offers no resources this session"
+        );
+        return;
+    }
+    catalog.set_resources(catalog::resources_from_remote(
+        catalog.identity(),
+        concrete.unwrap_or_default(),
+        templates.unwrap_or_default(),
+    ));
+}
+
+/// Send an MCP `ping`. rmcp exposes no typed helper for it on the client peer,
+/// so the request goes out through the generic path, under the request budget
+/// rmcp applies to the handle: an unanswered ping fails and tells the server the
+/// request was cancelled rather than holding the maintenance task.
+async fn ping(peer: &Peer<RoleClient>) -> Result<(), rmcp::service::ServiceError> {
+    let mut options = PeerRequestOptions::no_options();
+    options.timeout = Some(MCP_MAINTENANCE_REQUEST_BUDGET);
+    peer.send_cancellable_request(
+        rmcp::model::ClientRequest::PingRequest(rmcp::model::PingRequest::default()),
+        options,
+    )
+    .await?
+    .await_response()
+    .await
+    .map(|_| ())
+}
+
+/// Re-run discovery and reconcile it against the tools exported at startup.
+///
+/// Revised descriptions and schemas reach the model on the next turn, because
+/// Rho reads each tool's spec when it builds a run. A tool the server withdrew
+/// starts failing with a clear reason. A tool the server added cannot join the
+/// registry mid-session, so it is recorded for `/mcp` to report instead of
+/// being silently dropped.
+///
+/// rmcp's paginated helper takes no request options, so the whole refresh runs
+/// under one budget instead of rmcp's per-request one. That bounds a server that
+/// answers pages slowly as well as one that never answers at all.
+async fn refresh_tools(maintenance: &SessionMaintenance) {
+    let deadline = tokio::time::Instant::now() + MCP_MAINTENANCE_REQUEST_BUDGET;
+    let discovered = match list_tool_definitions(
+        &maintenance.identity,
+        &maintenance.peer,
+        &maintenance.server.tools,
+        deadline,
+    )
+    .await
+    {
+        Ok(discovered) => discovered,
+        Err(ToolDiscoveryError::Failed(error)) => {
+            tracing::warn!(
+                server = %maintenance.identity,
+                error = %format!("{error:#}"),
+                "MCP tools/list refresh failed"
+            );
+            return;
+        }
+        Err(ToolDiscoveryError::TimedOut) => {
+            tracing::warn!(
+                server = %maintenance.identity,
+                limit_seconds = MCP_MAINTENANCE_REQUEST_BUDGET.as_secs(),
+                "MCP tools/list refresh exceeded its budget"
+            );
+            return;
+        }
+    };
+
+    let mut present = std::collections::HashSet::new();
+    let mut added = Vec::new();
+    for (remote_name, definition) in discovered.definitions {
+        match maintenance.slots.get(&remote_name) {
+            Some(slot) => {
+                present.insert(remote_name.clone());
+                if slot.refresh(definition) {
+                    tracing::info!(
+                        server = %maintenance.identity,
+                        tool = %remote_name,
+                        "MCP tool definition updated"
+                    );
+                }
+            }
+            None => added.push(remote_name),
+        }
+    }
+
+    let removed = maintenance
+        .slots
+        .iter()
+        .filter(|(name, _)| !present.contains(name.as_str()))
+        .map(|(name, slot)| {
+            slot.withdraw();
+            name.clone()
+        })
+        .collect::<Vec<_>>();
+    maintenance.live.record_tool_changes(added, removed);
+}
+
+fn apply_stdio_environment(
+    command: &mut tokio::process::Command,
+    env: &BTreeMap<String, String>,
+    env_from_env: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    crate::child_env::apply_base(command);
+    command.envs(env);
+    for (name, variable) in env_from_env {
+        let value = std::env::var(variable).with_context(|| {
+            format!("environment variable `{variable}` for MCP child variable `{name}` is not set")
+        })?;
+        command.env(name, value);
+    }
+    Ok(())
+}
+
+pub(super) fn prepare_server_filesystem(server: &McpServerConfig) -> anyhow::Result<()> {
+    let Some(policy) = &server.filesystem else {
+        return Ok(());
+    };
+    let storage = Workspace::new(&policy.directory_root).with_context(|| {
+        format!(
+            "cannot resolve package storage root `{}`",
+            policy.directory_root.display()
+        )
+    })?;
+    let requested_directory = storage.root().join(&policy.directory_relative_to_root);
+    let directory = storage
+        .resolve_for_write(&requested_directory)
+        .with_context(|| {
+            format!(
+                "package data directory `{}` escapes its storage root",
+                requested_directory.display()
+            )
+        })?;
+    std::fs::create_dir_all(directory.path()).with_context(|| {
+        format!(
+            "cannot create package data directory `{}`",
+            directory.path().display()
+        )
+    })?;
+    storage
+        .resolve_for_read(directory.path())
+        .with_context(|| {
+            format!(
+                "cannot revalidate package data directory `{}` after creation",
+                directory.path().display()
+            )
+        })?;
+
+    let (primary_root, granted_roots) = policy
+        .allowed_roots
+        .split_first()
+        .context("package MCP filesystem policy has no allowed roots")?;
+    let mut allowed = Workspace::new(primary_root).with_context(|| {
+        format!(
+            "cannot resolve allowed MCP root `{}`",
+            primary_root.display()
+        )
+    })?;
+    for root in granted_roots {
+        allowed = allowed
+            .with_granted_root(root)
+            .with_context(|| format!("cannot resolve allowed MCP root `{}`", root.display()))?;
+    }
+    if let McpTransport::Stdio { command, cwd, .. } = &server.transport {
+        let command_path = Path::new(command);
+        if command_path.is_absolute() {
+            allowed.resolve_for_read(command_path).with_context(|| {
+                format!(
+                    "MCP command `{}` escapes its permitted roots",
+                    command_path.display()
+                )
+            })?;
+        }
+        if let Some(cwd) = cwd {
+            allowed.resolve_for_read(cwd).with_context(|| {
+                format!(
+                    "MCP working directory `{}` escapes its permitted roots",
+                    cwd.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}

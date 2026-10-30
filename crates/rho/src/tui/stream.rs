@@ -1,0 +1,266 @@
+use super::markdown::{markdown_stream_bounds, StreamLineStart};
+#[cfg(test)]
+use super::render::{complete_visual_prefix, display_width};
+
+#[derive(Debug, Default)]
+pub(super) struct AppendOnlyStream {
+    pending: String,
+    emitted_text: String,
+    leading_blank_emitted: bool,
+    previous_emission_ended_at_wrap: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct StreamFragment {
+    text: String,
+    include_leading_blank: bool,
+    skip_leading_newline: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct StreamPreview {
+    text: String,
+    line_start: StreamLineStart,
+    include_leading_blank: bool,
+    skip_leading_newline: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RenderableSplit {
+    byte_index: usize,
+    skip_leading_newline: bool,
+    ends_with_wrap: bool,
+    line_start: StreamLineStart,
+}
+
+impl AppendOnlyStream {
+    pub(super) fn reset(&mut self) {
+        self.pending.clear();
+        self.emitted_text.clear();
+        self.leading_blank_emitted = false;
+        self.previous_emission_ended_at_wrap = false;
+    }
+
+    pub(super) fn push_delta(&mut self, delta: &str) {
+        self.pending.push_str(delta);
+    }
+
+    pub(super) fn pending_text(&self) -> &str {
+        &self.pending
+    }
+
+    #[cfg(test)]
+    pub(super) fn drain_renderable(&mut self, inner_width: usize) -> Option<StreamFragment> {
+        self.drain_renderable_with_prefix(inner_width, |_pending, byte_index| byte_index)
+    }
+
+    pub(super) fn drain_renderable_markdown(
+        &mut self,
+        inner_width: usize,
+        in_code_block: bool,
+    ) -> Option<StreamFragment> {
+        let split = self.markdown_renderable_split(inner_width, in_code_block, false)?;
+        Some(self.take_pending_prefix(
+            split.byte_index,
+            split.skip_leading_newline,
+            split.ends_with_wrap,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(super) fn drain_preview(&mut self) -> Option<StreamPreview> {
+        self.preview_with_width(display_width)
+    }
+
+    pub(super) fn drain_preview_markdown(
+        &self,
+        inner_width: usize,
+        in_code_block: bool,
+    ) -> Option<StreamPreview> {
+        let split = self.markdown_renderable_split(inner_width, in_code_block, true)?;
+        Some(self.pending_preview(
+            split.byte_index,
+            split.skip_leading_newline,
+            split.line_start,
+        ))
+    }
+
+    pub(super) fn finish(&mut self) -> Option<StreamFragment> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let skip_leading_newline = self.should_skip_leading_newline();
+        Some(self.take_pending_prefix(self.pending.len(), skip_leading_newline, false))
+    }
+
+    pub(super) fn emitted_text(&self) -> &str {
+        &self.emitted_text
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.emitted_text.is_empty()
+    }
+
+    fn should_skip_leading_newline(&self) -> bool {
+        self.previous_emission_ended_at_wrap && self.pending.starts_with('\n')
+    }
+
+    fn markdown_renderable_split(
+        &self,
+        inner_width: usize,
+        in_code_block: bool,
+        allow_partial_line: bool,
+    ) -> Option<RenderableSplit> {
+        let skip_leading_newline = self.should_skip_leading_newline();
+        let scan_start = usize::from(skip_leading_newline);
+        let pending = &self.pending[scan_start..];
+        let line_start = self.line_start(skip_leading_newline, in_code_block);
+        let bounds = markdown_stream_bounds(pending, inner_width, in_code_block, line_start);
+        // Previews may include the stable open-line prefix even when earlier
+        // complete lines or wraps are also ready. Drain still uses the drain
+        // bound only, so mid-line prose is not committed early.
+        let (renderable_byte_index, ends_with_wrap) = if allow_partial_line {
+            match bounds.preview_end {
+                Some(preview_end) if preview_end > bounds.drain.byte_index => (preview_end, false),
+                _ => (bounds.drain.byte_index, bounds.drain.ends_with_wrap),
+            }
+        } else {
+            (bounds.drain.byte_index, bounds.drain.ends_with_wrap)
+        };
+        let split_at = scan_start + renderable_byte_index;
+        if split_at == 0 {
+            return None;
+        }
+        Some(RenderableSplit {
+            byte_index: split_at,
+            skip_leading_newline,
+            ends_with_wrap,
+            line_start,
+        })
+    }
+
+    #[cfg(test)]
+    fn preview_with_width(&self, rendered_width: impl Fn(&str) -> usize) -> Option<StreamPreview> {
+        let skip_leading_newline = self.should_skip_leading_newline();
+        let scan_start = usize::from(skip_leading_newline);
+        let pending = &self.pending[scan_start..];
+        let split_at = scan_start + self.preview_byte_index(pending, rendered_width)?;
+        Some(self.pending_preview(split_at, skip_leading_newline, StreamLineStart::Fresh))
+    }
+
+    #[cfg(test)]
+    fn preview_byte_index(
+        &self,
+        pending: &str,
+        rendered_width: impl Fn(&str) -> usize,
+    ) -> Option<usize> {
+        if pending.is_empty() || pending.starts_with('\n') {
+            return None;
+        }
+        let line_end = pending.find('\n').unwrap_or(pending.len());
+        let current_line = &pending[..line_end];
+        let width = rendered_width(current_line);
+        (width > 0).then_some(line_end)
+    }
+
+    #[cfg(test)]
+    fn drain_renderable_with_prefix(
+        &mut self,
+        inner_width: usize,
+        renderable_prefix: impl FnOnce(&str, usize) -> usize,
+    ) -> Option<StreamFragment> {
+        let skip_leading_newline = self.should_skip_leading_newline();
+        let scan_start = usize::from(skip_leading_newline);
+        let pending = &self.pending[scan_start..];
+        let prefix = complete_visual_prefix(pending, inner_width);
+        let renderable_byte_index = renderable_prefix(pending, prefix.byte_index);
+        let split_at = scan_start + renderable_byte_index;
+        if split_at == 0 {
+            return None;
+        }
+        Some(self.take_pending_prefix(
+            split_at,
+            skip_leading_newline,
+            prefix.ends_with_wrap && renderable_byte_index == prefix.byte_index,
+        ))
+    }
+
+    /// Whether pending text continues a committed list item. A skipped
+    /// leading newline ends that line, so pending then starts fresh.
+    fn line_start(&self, skip_leading_newline: bool, in_code_block: bool) -> StreamLineStart {
+        if skip_leading_newline {
+            StreamLineStart::Fresh
+        } else {
+            StreamLineStart::after(&self.emitted_text, in_code_block)
+        }
+    }
+
+    fn pending_preview(
+        &self,
+        byte_index: usize,
+        skip_leading_newline: bool,
+        line_start: StreamLineStart,
+    ) -> StreamPreview {
+        StreamPreview {
+            text: self.pending[..byte_index].to_string(),
+            line_start,
+            // Prior entries own the separator blank. Stream text never inserts one.
+            include_leading_blank: false,
+            skip_leading_newline,
+        }
+    }
+
+    fn take_pending_prefix(
+        &mut self,
+        byte_index: usize,
+        skip_leading_newline: bool,
+        ends_with_wrap: bool,
+    ) -> StreamFragment {
+        let text: String = self.pending.drain(..byte_index).collect();
+        self.leading_blank_emitted = true;
+        self.previous_emission_ended_at_wrap = ends_with_wrap;
+        self.emitted_text.push_str(&text);
+        StreamFragment {
+            text,
+            include_leading_blank: false,
+            skip_leading_newline,
+        }
+    }
+}
+
+impl StreamFragment {
+    pub(super) fn render_text(&self) -> &str {
+        if self.skip_leading_newline {
+            &self.text['\n'.len_utf8()..]
+        } else {
+            &self.text
+        }
+    }
+
+    pub(super) fn into_text(self) -> String {
+        self.text
+    }
+
+    #[cfg(test)]
+    pub(super) fn include_leading_blank(&self) -> bool {
+        self.include_leading_blank
+    }
+}
+
+impl StreamPreview {
+    pub(super) fn render_text(&self) -> &str {
+        if self.skip_leading_newline {
+            &self.text['\n'.len_utf8()..]
+        } else {
+            &self.text
+        }
+    }
+
+    pub(super) fn include_leading_blank(&self) -> bool {
+        self.include_leading_blank
+    }
+
+    pub(super) fn line_start(&self) -> StreamLineStart {
+        self.line_start
+    }
+}

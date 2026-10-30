@@ -1,0 +1,659 @@
+//! Structured MCP session inventory for CLI and TUI consumers.
+
+use std::sync::{Arc, Mutex};
+
+use serde::Serialize;
+
+use super::{
+    config::{McpConfig, McpServerConfig, McpTransport},
+    exported_name::{McpToolIdentity, McpToolNames},
+};
+
+/// Facts about a connected server that only exist after startup.
+///
+/// The rest of a report is a startup snapshot. A server can revise its tool list
+/// and a remote session can go unreachable while the session runs, so those two
+/// live behind a shared handle the session's maintenance task writes and the
+/// `/mcp` inventory reads.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct McpLiveServerState {
+    inner: Arc<Mutex<LiveServerFacts>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct LiveServerFacts {
+    /// Tools discovered after startup. The tool registry is fixed for the
+    /// session, so these need a restart before the model can call them.
+    pub(crate) added_tools: Vec<String>,
+    /// Tools the server withdrew. They stay registered and fail when called.
+    pub(crate) removed_tools: Vec<String>,
+    /// Why the last keepalive ping failed, if it did.
+    pub(crate) unreachable: Option<String>,
+}
+
+impl McpLiveServerState {
+    pub(crate) fn snapshot(&self) -> LiveServerFacts {
+        self.lock().clone()
+    }
+
+    pub(crate) fn record_tool_changes(&self, added: Vec<String>, removed: Vec<String>) {
+        let mut facts = self.lock();
+        facts.added_tools = added;
+        facts.removed_tools = removed;
+    }
+
+    pub(crate) fn mark_unreachable(&self, reason: String) {
+        self.lock().unreachable = Some(reason);
+    }
+
+    pub(crate) fn mark_reachable(&self) {
+        self.lock().unreachable = None;
+    }
+
+    /// A poisoned lock still holds a valid fact set, so recover rather than
+    /// fail an inventory read on an unrelated panic.
+    fn lock(&self) -> std::sync::MutexGuard<'_, LiveServerFacts> {
+        self.inner.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+impl PartialEq for McpLiveServerState {
+    fn eq(&self, other: &Self) -> bool {
+        self.snapshot() == other.snapshot()
+    }
+}
+
+impl Eq for McpLiveServerState {}
+
+/// How the current process treated MCP configuration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum McpLoadMode {
+    #[default]
+    Native,
+    UnsupportedAgent,
+    ToolsDisabled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum McpServerStatus {
+    Connected,
+    Connecting,
+    Disabled,
+    InvalidConfig,
+    Failed,
+    TimedOut,
+    NotLoaded,
+}
+
+impl McpServerStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Connecting => "connecting",
+            Self::Disabled => "disabled",
+            Self::InvalidConfig => "invalid",
+            Self::Failed => "failed",
+            Self::TimedOut => "timeout",
+            Self::NotLoaded => "not loaded",
+        }
+    }
+
+    pub(crate) const fn is_healthy(self) -> bool {
+        matches!(
+            self,
+            Self::Connected | Self::Connecting | Self::Disabled | Self::NotLoaded
+        )
+    }
+}
+
+/// Transport facts safe to show in UI and CLI output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum McpTransportSummary {
+    Stdio { command: String, args: Vec<String> },
+    StreamableHttp { url: String },
+}
+
+impl McpTransportSummary {
+    pub(crate) fn from_server(server: &McpServerConfig) -> Self {
+        match &server.transport {
+            McpTransport::Stdio { command, args, .. } => Self::Stdio {
+                command: command.clone(),
+                args: args.clone(),
+            },
+            McpTransport::StreamableHttp { url, .. } => Self::StreamableHttp { url: url.clone() },
+        }
+    }
+
+    pub(crate) fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Stdio { .. } => "stdio",
+            Self::StreamableHttp { .. } => "streamable_http",
+        }
+    }
+
+    pub(crate) fn endpoint_summary(&self) -> String {
+        match self {
+            Self::Stdio { command, args } if args.is_empty() => command.clone(),
+            Self::Stdio { command, args } => format!("{command} {}", args.join(" ")),
+            Self::StreamableHttp { url } => url.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct McpToolReport {
+    pub(crate) remote_name: String,
+    pub(crate) exported_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum McpServerState {
+    Connected {
+        tools: Vec<McpToolReport>,
+        /// Server-authored `initialize` guidance for the model.
+        instructions: Option<String>,
+        live: McpLiveServerState,
+        filtered_out_count: usize,
+        collision_skipped_count: usize,
+    },
+    Connecting,
+    Disabled,
+    InvalidConfig {
+        error: String,
+    },
+    Failed {
+        error: String,
+    },
+    TimedOut {
+        error: String,
+    },
+    NotLoaded,
+}
+
+impl McpServerState {
+    const fn status(&self) -> McpServerStatus {
+        match self {
+            Self::Connected { .. } => McpServerStatus::Connected,
+            Self::Connecting => McpServerStatus::Connecting,
+            Self::Disabled => McpServerStatus::Disabled,
+            Self::InvalidConfig { .. } => McpServerStatus::InvalidConfig,
+            Self::Failed { .. } => McpServerStatus::Failed,
+            Self::TimedOut { .. } => McpServerStatus::TimedOut,
+            Self::NotLoaded => McpServerStatus::NotLoaded,
+        }
+    }
+
+    const fn enabled(&self) -> bool {
+        match self {
+            Self::Connected { .. }
+            | Self::Connecting
+            | Self::Failed { .. }
+            | Self::TimedOut { .. }
+            | Self::NotLoaded => true,
+            Self::Disabled | Self::InvalidConfig { .. } => false,
+        }
+    }
+
+    fn error(&self) -> Option<&str> {
+        match self {
+            Self::InvalidConfig { error } | Self::Failed { error } | Self::TimedOut { error } => {
+                Some(error)
+            }
+            Self::Connected { .. } | Self::Connecting | Self::Disabled | Self::NotLoaded => None,
+        }
+    }
+
+    fn tools(&self) -> &[McpToolReport] {
+        match self {
+            Self::Connected { tools, .. } => tools,
+            Self::Connecting
+            | Self::Disabled
+            | Self::InvalidConfig { .. }
+            | Self::Failed { .. }
+            | Self::TimedOut { .. }
+            | Self::NotLoaded => &[],
+        }
+    }
+
+    const fn filtered_out_count(&self) -> usize {
+        match self {
+            Self::Connected {
+                filtered_out_count, ..
+            } => *filtered_out_count,
+            Self::Connecting
+            | Self::Disabled
+            | Self::InvalidConfig { .. }
+            | Self::Failed { .. }
+            | Self::TimedOut { .. }
+            | Self::NotLoaded => 0,
+        }
+    }
+
+    const fn collision_skipped_count(&self) -> usize {
+        match self {
+            Self::Connected {
+                collision_skipped_count,
+                ..
+            } => *collision_skipped_count,
+            Self::Connecting
+            | Self::Disabled
+            | Self::InvalidConfig { .. }
+            | Self::Failed { .. }
+            | Self::TimedOut { .. }
+            | Self::NotLoaded => 0,
+        }
+    }
+
+    fn instructions(&self) -> Option<&str> {
+        match self {
+            Self::Connected { instructions, .. } => instructions.as_deref(),
+            Self::Connecting
+            | Self::Disabled
+            | Self::InvalidConfig { .. }
+            | Self::Failed { .. }
+            | Self::TimedOut { .. }
+            | Self::NotLoaded => None,
+        }
+    }
+
+    fn live(&self) -> LiveServerFacts {
+        match self {
+            Self::Connected { live, .. } => live.snapshot(),
+            Self::Connecting
+            | Self::Disabled
+            | Self::InvalidConfig { .. }
+            | Self::Failed { .. }
+            | Self::TimedOut { .. }
+            | Self::NotLoaded => LiveServerFacts::default(),
+        }
+    }
+}
+
+/// Inputs for a connected server's inventory row. Named because the row carries
+/// enough independent facts that positional arguments stop being readable.
+pub(crate) struct ConnectedServerReport {
+    pub(crate) identity: String,
+    pub(crate) transport: McpTransportSummary,
+    pub(crate) tools: Vec<McpToolReport>,
+    pub(crate) instructions: Option<String>,
+    pub(crate) live: McpLiveServerState,
+    pub(crate) filtered_out_count: usize,
+    pub(crate) collision_skipped_count: usize,
+}
+
+/// Per-server inventory row. The state enum prevents contradictory status,
+/// error, enabled, and tool combinations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct McpServerReport {
+    pub(crate) identity: String,
+    pub(crate) transport: Option<McpTransportSummary>,
+    state: McpServerState,
+}
+
+impl Serialize for McpServerReport {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            identity: &'a str,
+            enabled: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            transport: Option<&'a McpTransportSummary>,
+            status: McpServerStatus,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            error: Option<&'a str>,
+            tools: &'a [McpToolReport],
+            filtered_out_count: usize,
+            collision_skipped_count: usize,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            instructions: Option<&'a str>,
+            #[serde(flatten)]
+            live: LiveServerFacts,
+        }
+
+        Wire {
+            identity: &self.identity,
+            enabled: self.enabled(),
+            transport: self.transport.as_ref(),
+            status: self.status(),
+            error: self.error(),
+            tools: self.tools(),
+            filtered_out_count: self.filtered_out_count(),
+            collision_skipped_count: self.collision_skipped_count(),
+            instructions: self.instructions(),
+            live: self.live(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl McpServerReport {
+    pub(crate) fn disabled(identity: impl Into<String>, server: &McpServerConfig) -> Self {
+        Self {
+            identity: identity.into(),
+            transport: Some(McpTransportSummary::from_server(server)),
+            state: McpServerState::Disabled,
+        }
+    }
+
+    pub(crate) fn invalid(identity: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            identity: identity.into(),
+            transport: None,
+            state: McpServerState::InvalidConfig {
+                error: error.into(),
+            },
+        }
+    }
+
+    pub(crate) fn connecting(identity: impl Into<String>, server: &McpServerConfig) -> Self {
+        Self {
+            identity: identity.into(),
+            transport: Some(McpTransportSummary::from_server(server)),
+            state: if server.enabled {
+                McpServerState::Connecting
+            } else {
+                McpServerState::Disabled
+            },
+        }
+    }
+
+    pub(crate) fn not_loaded(identity: impl Into<String>, server: &McpServerConfig) -> Self {
+        Self {
+            identity: identity.into(),
+            transport: Some(McpTransportSummary::from_server(server)),
+            state: if server.enabled {
+                McpServerState::NotLoaded
+            } else {
+                McpServerState::Disabled
+            },
+        }
+    }
+
+    pub(crate) fn timed_out(
+        identity: impl Into<String>,
+        transport: McpTransportSummary,
+        limit_seconds: u64,
+    ) -> Self {
+        Self {
+            identity: identity.into(),
+            transport: Some(transport),
+            state: McpServerState::TimedOut {
+                error: format!("exceeded {limit_seconds}s startup budget"),
+            },
+        }
+    }
+
+    pub(crate) fn failed(
+        identity: impl Into<String>,
+        transport: McpTransportSummary,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            identity: identity.into(),
+            transport: Some(transport),
+            state: McpServerState::Failed {
+                error: error.into(),
+            },
+        }
+    }
+
+    pub(crate) fn connected(report: ConnectedServerReport) -> Self {
+        let ConnectedServerReport {
+            identity,
+            transport,
+            tools,
+            instructions,
+            live,
+            filtered_out_count,
+            collision_skipped_count,
+        } = report;
+        Self {
+            identity,
+            transport: Some(transport),
+            state: McpServerState::Connected {
+                tools,
+                instructions,
+                live,
+                filtered_out_count,
+                collision_skipped_count,
+            },
+        }
+    }
+
+    pub(crate) const fn status(&self) -> McpServerStatus {
+        self.state.status()
+    }
+
+    pub(crate) const fn enabled(&self) -> bool {
+        self.state.enabled()
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.state.error()
+    }
+
+    pub(crate) fn tools(&self) -> &[McpToolReport] {
+        self.state.tools()
+    }
+
+    pub(crate) fn tool_count(&self) -> usize {
+        self.tools().len()
+    }
+
+    pub(crate) const fn filtered_out_count(&self) -> usize {
+        self.state.filtered_out_count()
+    }
+
+    pub(crate) const fn collision_skipped_count(&self) -> usize {
+        self.state.collision_skipped_count()
+    }
+
+    /// Server-authored guidance from `initialize`, for the system prompt.
+    pub(crate) fn instructions(&self) -> Option<&str> {
+        self.state.instructions()
+    }
+
+    pub(crate) fn live(&self) -> LiveServerFacts {
+        self.state.live()
+    }
+
+    pub(crate) fn detail_text(&self) -> String {
+        let mut lines = vec![self
+            .transport
+            .as_ref()
+            .map(|transport| {
+                format!(
+                    "{} · {}",
+                    transport.kind_label(),
+                    transport.endpoint_summary()
+                )
+            })
+            .unwrap_or_else(|| "transport unavailable".into())];
+        if let Some(error) = self.error() {
+            lines.push(format!("error: {error}"));
+        }
+        match self.status() {
+            McpServerStatus::Connected if self.tools().is_empty() => {
+                lines.push("connected with no exported tools".into());
+            }
+            McpServerStatus::Connected => {
+                let names = self
+                    .tools()
+                    .iter()
+                    .map(|tool| tool.exported_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!("{} tool(s): {names}", self.tool_count()));
+            }
+            McpServerStatus::Connecting => {
+                lines.push("connecting".into());
+            }
+            McpServerStatus::Disabled => lines.push("enabled = false".into()),
+            McpServerStatus::NotLoaded => {
+                lines.push("configured but not loaded in this session".into());
+            }
+            McpServerStatus::InvalidConfig
+            | McpServerStatus::Failed
+            | McpServerStatus::TimedOut => {}
+        }
+        if self.filtered_out_count() > 0 {
+            lines.push(format!(
+                "filtered out {} tool(s) by allow/deny",
+                self.filtered_out_count()
+            ));
+        }
+        if self.collision_skipped_count() > 0 {
+            lines.push(format!(
+                "skipped {} colliding tool name(s)",
+                self.collision_skipped_count()
+            ));
+        }
+        lines.extend(live_lines(&self.live()));
+        lines.join("\n")
+    }
+}
+
+/// Inventory lines for changes a server made after startup. The tool registry
+/// is fixed for a session, so an added tool is reported rather than exposed.
+fn live_lines(live: &LiveServerFacts) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !live.added_tools.is_empty() {
+        lines.push(format!(
+            "added {} tool(s) after startup; restart the session to use them: {}",
+            live.added_tools.len(),
+            live.added_tools.join(", ")
+        ));
+    }
+    if !live.removed_tools.is_empty() {
+        lines.push(format!(
+            "withdrew {} tool(s): {}",
+            live.removed_tools.len(),
+            live.removed_tools.join(", ")
+        ));
+    }
+    if let Some(reason) = &live.unreachable {
+        lines.push(format!("last keepalive ping failed: {reason}"));
+    }
+    lines
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct McpSessionSummary {
+    pub(crate) mode: McpLoadMode,
+    pub(crate) configured: bool,
+    pub(crate) connected: usize,
+    pub(crate) connecting: usize,
+    pub(crate) problems: usize,
+    pub(crate) enabled: usize,
+    pub(crate) exported_tools: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct McpSessionReport {
+    pub(crate) mode: McpLoadMode,
+    pub(crate) servers: Vec<McpServerReport>,
+}
+
+impl McpSessionReport {
+    pub(crate) fn from_config_connecting(config: &McpConfig) -> Self {
+        let mut servers = config
+            .invalid_servers
+            .iter()
+            .map(|invalid| McpServerReport::invalid(&invalid.identity, &invalid.error))
+            .chain(
+                config
+                    .servers
+                    .iter()
+                    .map(|(identity, server)| McpServerReport::connecting(identity, server)),
+            )
+            .collect::<Vec<_>>();
+        servers.sort_by(|left, right| left.identity.cmp(&right.identity));
+        Self {
+            mode: McpLoadMode::Native,
+            servers,
+        }
+    }
+
+    /// Mark every still-connecting server as failed. Used when the deferred
+    /// connect never reports back, so `/mcp` says what happened instead of
+    /// showing `connecting` for the rest of the session.
+    pub(crate) fn fail_connecting(&mut self, error: &str) {
+        for server in &mut self.servers {
+            if matches!(server.state, McpServerState::Connecting) {
+                server.state = McpServerState::Failed {
+                    error: error.to_string(),
+                };
+            }
+        }
+    }
+
+    pub(crate) fn from_config_unloaded(config: &McpConfig, mode: McpLoadMode) -> Self {
+        let mut servers = config
+            .invalid_servers
+            .iter()
+            .map(|invalid| McpServerReport::invalid(&invalid.identity, &invalid.error))
+            .chain(
+                config
+                    .servers
+                    .iter()
+                    .map(|(identity, server)| McpServerReport::not_loaded(identity, server)),
+            )
+            .collect::<Vec<_>>();
+        servers.sort_by(|left, right| left.identity.cmp(&right.identity));
+        Self { mode, servers }
+    }
+
+    /// Every exported name a connected server registered, mapped to the
+    /// server and remote tool it calls.
+    pub(crate) fn tool_names(&self) -> McpToolNames {
+        self.servers
+            .iter()
+            .flat_map(|server| {
+                server.tools().iter().map(|tool| {
+                    let identity = McpToolIdentity {
+                        server: server.identity.clone(),
+                        tool: tool.remote_name.clone(),
+                    };
+                    (tool.exported_name.clone(), identity)
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn find(&self, identity: &str) -> Option<&McpServerReport> {
+        self.servers
+            .iter()
+            .find(|server| server.identity == identity)
+    }
+
+    pub(crate) fn summary(&self) -> McpSessionSummary {
+        let mut summary = McpSessionSummary {
+            mode: self.mode,
+            configured: !self.servers.is_empty(),
+            connected: 0,
+            connecting: 0,
+            problems: 0,
+            enabled: 0,
+            exported_tools: 0,
+        };
+        for server in &self.servers {
+            summary.enabled += usize::from(server.enabled());
+            summary.exported_tools += server.tool_count();
+            match server.status() {
+                McpServerStatus::Connected => summary.connected += 1,
+                McpServerStatus::Connecting => summary.connecting += 1,
+                McpServerStatus::InvalidConfig
+                | McpServerStatus::Failed
+                | McpServerStatus::TimedOut => summary.problems += 1,
+                McpServerStatus::Disabled | McpServerStatus::NotLoaded => {}
+            }
+        }
+        summary
+    }
+}

@@ -1,0 +1,95 @@
+//! Multi-select tool picker for the agent editor.
+//!
+//! Each runtime has its own vocabulary: Rho capabilities (plus `all`) and
+//! the closed Cursor and Antigravity allow lists. Rows carry an
+//! `on` badge when the draft allows them; confirming a row toggles it and the
+//! picker stays open.
+
+use super::{
+    agent_editor::{AGENT_TOOL_ALL, AGENT_TOOL_ROW_PREFIX},
+    PickerBadge, PickerBadgeTone, PickerItem, UiPicker,
+};
+use crate::agent::{
+    AgentDefinition, AgentRuntimeSpec, AntigravityTool, CursorTool, ToolPolicy,
+    BUILTIN_TOOL_CAPABILITIES,
+};
+
+/// Builds the tools picker for `draft`'s current runtime.
+pub(super) fn agent_tools_picker(draft: &AgentDefinition) -> UiPicker {
+    let items = match &draft.runtime {
+        AgentRuntimeSpec::Rho { tools, .. } => rho_items(tools),
+        AgentRuntimeSpec::Cursor(config) => cursor_items(&config.tools),
+        AgentRuntimeSpec::Antigravity(config) => antigravity_items(&config.tools),
+    };
+    UiPicker::edit_agent("tools", items)
+        .with_confirm_verb("toggle")
+        .with_space_confirm()
+}
+
+fn on_badge() -> PickerBadge {
+    PickerBadge {
+        text: "on".into(),
+        tone: PickerBadgeTone::Selected,
+    }
+}
+
+fn tool_row(name: &str, detail: impl Into<String>, on: bool, value: String) -> PickerItem {
+    PickerItem {
+        detail: Some(super::picker::PickerDetail::Text(detail.into())),
+        badge: on.then(on_badge),
+        ..PickerItem::new(name.into(), value)
+    }
+}
+
+fn rho_items(tools: &ToolPolicy) -> Vec<PickerItem> {
+    let all = matches!(tools, ToolPolicy::All);
+    let mut items = vec![PickerItem {
+        detail: Some(
+            "Every host tool, including ones added later. Toggle off to return to the explicit list it replaced."
+                .into(),
+        ),
+        badge: all.then(on_badge),
+        ..PickerItem::new("all".into(), AGENT_TOOL_ALL.into())
+    }];
+    items.extend(BUILTIN_TOOL_CAPABILITIES.iter().map(|capability| {
+        let on = match tools {
+            ToolPolicy::All => true,
+            ToolPolicy::Allow(set) => set.contains(capability),
+        };
+        tool_row(
+            capability.as_str(),
+            capability.detail(),
+            on,
+            format!("{AGENT_TOOL_ROW_PREFIX}{capability}"),
+        )
+    }));
+    items
+}
+
+fn cursor_items(current: &[CursorTool]) -> Vec<PickerItem> {
+    CursorTool::ALL
+        .iter()
+        .map(|tool| {
+            tool_row(
+                tool.label(),
+                format!("{} ({})", tool.detail(), tool.capability_kind().label()),
+                current.contains(tool),
+                format!("{AGENT_TOOL_ROW_PREFIX}{}", tool.as_flag()),
+            )
+        })
+        .collect()
+}
+
+fn antigravity_items(current: &[AntigravityTool]) -> Vec<PickerItem> {
+    AntigravityTool::ALL
+        .iter()
+        .map(|tool| {
+            tool_row(
+                tool.as_name(),
+                format!("{} ({})", tool.detail(), tool.capability_kind().label()),
+                current.contains(tool),
+                format!("{AGENT_TOOL_ROW_PREFIX}{}", tool.as_name()),
+            )
+        })
+        .collect()
+}

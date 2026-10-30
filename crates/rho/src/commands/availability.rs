@@ -1,0 +1,57 @@
+use super::CommandId;
+
+/// Current session facts used to advertise built-in commands. These do not
+/// authorize execution: a hidden command can still accept useful actions,
+/// such as disabling a saved preference on an unsupported model.
+pub(crate) struct CommandContext {
+    pub fast_mode_supported: bool,
+}
+
+impl CommandContext {
+    pub(crate) fn is_discoverable(&self, command: CommandId) -> bool {
+        match command {
+            CommandId::Fast => self.fast_mode_supported,
+            CommandId::AddDir
+            | CommandId::Advisor
+            | CommandId::New
+            | CommandId::Login
+            | CommandId::Logout
+            | CommandId::Model
+            | CommandId::RefreshModels
+            | CommandId::Remember
+            | CommandId::Resume
+            | CommandId::Reasoning
+            | CommandId::Rewind
+            | CommandId::Sessions
+            | CommandId::Tree
+            | CommandId::Config
+            | CommandId::Context
+            | CommandId::Permissions
+            | CommandId::Info
+            | CommandId::Init
+            | CommandId::Help
+            | CommandId::Compact
+            | CommandId::Computer
+            | CommandId::Copy
+            | CommandId::Goal
+            | CommandId::Skills
+            | CommandId::Theme
+            | CommandId::Hooks
+            | CommandId::Agents
+            | CommandId::CreateAgent
+            | CommandId::Attach
+            | CommandId::Codemode
+            | CommandId::Diff
+            | CommandId::Doctor
+            | CommandId::Limits
+            | CommandId::Export
+            | CommandId::Mcp
+            | CommandId::Title
+            | CommandId::Workflow
+            | CommandId::Side
+            | CommandId::Spend
+            | CommandId::Todo
+            | CommandId::Exit => true,
+        }
+    }
+}

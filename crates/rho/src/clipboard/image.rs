@@ -1,0 +1,288 @@
+use std::{
+    env, fs,
+    io::Read,
+    path::{Path, PathBuf},
+};
+
+use rho_providers::model::ImageContent;
+use rho_tools::{supported_image_mime_type, MAX_IMAGE_FILE_BYTES};
+
+use super::{
+    process::{command_available, command_output},
+    session::SessionKind,
+};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClipboardImageError {
+    #[error("no supported image found on clipboard")]
+    NoImage,
+    /// Platform clipboard helper is missing from PATH.
+    #[error("{0}")]
+    HelperMissing(String),
+    #[error("image file exceeds the {0} byte paste limit")]
+    TooLarge(u64),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+const SUPPORTED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+pub fn read_clipboard_image() -> Result<ImageContent, ClipboardImageError> {
+    read_clipboard_image_for_session(SessionKind::detect())
+}
+
+/// Loads a PNG, JPEG, GIF, or WebP file as pasteable image content.
+///
+/// Hosts such as Herdr paste clipboard images as filesystem paths. Rho treats a
+/// single-line paste of an image path as an attachment instead of plain text.
+pub fn read_image_file(path: &Path) -> Result<ImageContent, ClipboardImageError> {
+    read_image_file_with_limit(path, MAX_IMAGE_FILE_BYTES)
+}
+
+pub(crate) fn path_has_supported_image_magic(path: &Path) -> Result<bool, std::io::Error> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0_u8; 12];
+    let header_len = file.read(&mut header)?;
+    Ok(supported_image_mime_type(&header[..header_len]).is_some())
+}
+
+fn read_image_file_with_limit(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<ImageContent, ClipboardImageError> {
+    let file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(ClipboardImageError::NoImage);
+    }
+    let mut bytes = Vec::new();
+    let mut limited = file.take(max_bytes.saturating_add(1));
+    limited.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(ClipboardImageError::TooLarge(max_bytes));
+    }
+    image_content_from_bytes(bytes)
+}
+
+fn image_content_from_bytes(bytes: Vec<u8>) -> Result<ImageContent, ClipboardImageError> {
+    if bytes.is_empty() {
+        return Err(ClipboardImageError::NoImage);
+    }
+    let Some(mime_type) = supported_image_mime_type(&bytes) else {
+        return Err(ClipboardImageError::NoImage);
+    };
+    Ok(ImageContent {
+        data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+        mime_type: mime_type.into(),
+    })
+}
+
+pub(super) fn read_clipboard_image_for_session(
+    session: SessionKind,
+) -> Result<ImageContent, ClipboardImageError> {
+    read_clipboard_image_for_session_with(session, command_available)
+}
+
+pub(super) fn read_clipboard_image_for_session_with(
+    session: SessionKind,
+    host_command_available: impl Fn(&str) -> bool,
+) -> Result<ImageContent, ClipboardImageError> {
+    // Remote sessions have no path to the user's local image clipboard.
+    if matches!(session, SessionKind::Remote) {
+        return Err(ClipboardImageError::NoImage);
+    }
+
+    // Distinguish a missing helper from an empty clipboard so the status line
+    // points at the install step instead of the clipboard contents.
+    if available_image_helpers_with(session, &host_command_available).is_empty() {
+        return Err(ClipboardImageError::HelperMissing(
+            missing_image_helper_message(session),
+        ));
+    }
+
+    let image = match session {
+        SessionKind::Remote => unreachable!("remote sessions return before clipboard reads"),
+        SessionKind::Wsl => read_linux_clipboard_image().or_else(read_wsl_clipboard_image),
+        SessionKind::Local if cfg!(target_os = "linux") => read_linux_clipboard_image(),
+        SessionKind::Local if cfg!(target_os = "windows") => read_windows_clipboard_image(),
+        SessionKind::Local => None,
+    };
+
+    let Some((bytes, mime_type)) = image else {
+        return Err(ClipboardImageError::NoImage);
+    };
+    if bytes.is_empty() {
+        return Err(ClipboardImageError::NoImage);
+    }
+
+    Ok(ImageContent {
+        data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+        mime_type,
+    })
+}
+
+/// Actionable guidance when no supported clipboard image helper is on PATH.
+pub(super) fn missing_image_helper_message(session: SessionKind) -> String {
+    match session {
+        SessionKind::Remote => {
+            "Remote session detected. Image paste needs a local host clipboard helper and is unavailable over SSH/Mosh.".into()
+        }
+        SessionKind::Wsl => {
+            "clipboard image paste in WSL requires wl-paste, xclip, or powershell.exe, which were not found; install wl-clipboard or xclip, or ensure powershell.exe is on PATH".into()
+        }
+        SessionKind::Local => local_missing_image_helper_message(),
+    }
+}
+
+fn local_missing_image_helper_message() -> String {
+    if cfg!(target_os = "linux") {
+        "clipboard image paste on Linux requires wl-paste or xclip, which were not found; install wl-clipboard or xclip".into()
+    } else if cfg!(target_os = "windows") {
+        "clipboard image paste on Windows requires powershell.exe, which was not found; install PowerShell and ensure it is on PATH".into()
+    } else {
+        "clipboard image paste is not supported on this platform".into()
+    }
+}
+
+pub(super) fn available_image_helpers(session: SessionKind) -> Vec<&'static str> {
+    available_image_helpers_with(session, command_available)
+}
+
+pub(super) fn available_image_helpers_with(
+    session: SessionKind,
+    host_command_available: impl Fn(&str) -> bool,
+) -> Vec<&'static str> {
+    match session {
+        SessionKind::Remote => Vec::new(),
+        // WSL is always a Linux guest, even when these unit tests compile on
+        // macOS or Windows CI hosts.
+        SessionKind::Wsl => {
+            let mut helpers = ["wl-paste", "xclip"]
+                .into_iter()
+                .filter(|command| host_command_available(command))
+                .collect::<Vec<_>>();
+            if host_command_available("powershell.exe") {
+                helpers.push("powershell.exe");
+            }
+            helpers
+        }
+        SessionKind::Local => platform_image_helpers()
+            .iter()
+            .copied()
+            .filter(|command| host_command_available(command))
+            .collect(),
+    }
+}
+
+fn platform_image_helpers() -> &'static [&'static str] {
+    if cfg!(target_os = "linux") {
+        &["wl-paste", "xclip"]
+    } else if cfg!(target_os = "windows") {
+        &["powershell.exe"]
+    } else {
+        &[]
+    }
+}
+
+fn read_linux_clipboard_image() -> Option<(Vec<u8>, String)> {
+    read_clipboard_image_via_wl_paste().or_else(read_clipboard_image_via_xclip)
+}
+
+fn read_clipboard_image_via_wl_paste() -> Option<(Vec<u8>, String)> {
+    let types = command_output("wl-paste", &["--list-types"])?;
+    let selected_type = select_preferred_image_mime_type(&String::from_utf8_lossy(&types))?;
+    let data = command_output("wl-paste", &["--type", &selected_type, "--no-newline"])?;
+    Some((data, base_mime_type(&selected_type)))
+}
+
+fn read_clipboard_image_via_xclip() -> Option<(Vec<u8>, String)> {
+    let candidate_types =
+        command_output("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"])
+            .map(|types| String::from_utf8_lossy(&types).into_owned())
+            .unwrap_or_default();
+    let mut try_types = Vec::new();
+    if let Some(preferred) = select_preferred_image_mime_type(&candidate_types) {
+        try_types.push(preferred);
+    }
+    try_types.extend(
+        SUPPORTED_IMAGE_MIME_TYPES
+            .iter()
+            .map(|mime| (*mime).to_string()),
+    );
+
+    for mime_type in try_types {
+        if let Some(data) = command_output(
+            "xclip",
+            &["-selection", "clipboard", "-t", &mime_type, "-o"],
+        )
+        .filter(|data| !data.is_empty())
+        {
+            return Some((data, base_mime_type(&mime_type)));
+        }
+    }
+    None
+}
+
+fn read_wsl_clipboard_image() -> Option<(Vec<u8>, String)> {
+    let tmp_path = env::temp_dir().join(format!("rho-wsl-clip-{}.png", uuid::Uuid::new_v4()));
+    let win_path = command_output("wslpath", &["-w", tmp_path.to_str()?])
+        .and_then(|output| String::from_utf8(output).ok())?;
+    let win_path = win_path.trim();
+    if win_path.is_empty() {
+        return None;
+    }
+    let ok = save_windows_clipboard_image_to(PathBuf::from(win_path), "powershell.exe")?;
+    if !ok {
+        return None;
+    }
+    let bytes = fs::read(&tmp_path).ok()?;
+    let _ = fs::remove_file(&tmp_path);
+    Some((bytes, "image/png".into()))
+}
+
+fn read_windows_clipboard_image() -> Option<(Vec<u8>, String)> {
+    let tmp_path = env::temp_dir().join(format!("rho-clip-{}.png", uuid::Uuid::new_v4()));
+    let ok = save_windows_clipboard_image_to(tmp_path.clone(), "powershell.exe")?;
+    if !ok {
+        return None;
+    }
+    let bytes = fs::read(&tmp_path).ok()?;
+    let _ = fs::remove_file(&tmp_path);
+    Some((bytes, "image/png".into()))
+}
+
+fn save_windows_clipboard_image_to(path: PathBuf, powershell: &str) -> Option<bool> {
+    let path = path.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; \
+         $img = [System.Windows.Forms.Clipboard]::GetImage(); \
+         if ($img) {{ $img.Save('{path}', [System.Drawing.Imaging.ImageFormat]::Png); Write-Output 'ok' }} else {{ Write-Output 'empty' }}"
+    );
+    let output = command_output(powershell, &["-NoProfile", "-Command", &script])?;
+    Some(String::from_utf8_lossy(&output).trim() == "ok")
+}
+
+fn select_preferred_image_mime_type(types: &str) -> Option<String> {
+    let normalized = types
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|raw| (raw.to_string(), base_mime_type(raw)))
+        .collect::<Vec<_>>();
+
+    for preferred in SUPPORTED_IMAGE_MIME_TYPES {
+        if let Some((raw, _)) = normalized.iter().find(|(_, base)| base == preferred) {
+            return Some(raw.clone());
+        }
+    }
+    None
+}
+
+fn base_mime_type(mime_type: &str) -> String {
+    mime_type
+        .split(';')
+        .next()
+        .unwrap_or(mime_type)
+        .trim()
+        .to_ascii_lowercase()
+}

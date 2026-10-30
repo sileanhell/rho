@@ -1,0 +1,77 @@
+//! `tool_search` cards: the query, a hit count, and one `name · description`
+//! row per hit. Parameter summaries are for the model, not a reader.
+
+use rho_tools::tool_card::{ToolBody, ToolCard, ToolFact, ToolFamily, ToolHeader, ToolStatus};
+use serde::Deserialize;
+use serde_json::Value;
+
+use super::format::{push_error_output, quoted, split_body_lines, string_arg, truncate};
+use crate::tools::code_mode::TOOL_SEARCH_NAME;
+
+/// Header query budget, matching `get_search_content`.
+const QUERY_MAX_CHARS: usize = 80;
+/// Description budget per hit row. A 100-column pane leaves ~96 columns after
+/// the card indent; MCP names run ~25-30 chars, so 60 keeps a hit on one row.
+const DESCRIPTION_MAX_CHARS: usize = 60;
+
+/// The hit fields a card shows. Other fields are ignored, so replays of older
+/// sessions, whose hits carried full schemas, still render as rows.
+#[derive(Deserialize)]
+struct Hit {
+    name: String,
+    description: String,
+}
+
+pub(super) fn preview_card(arguments: &Value, status: ToolStatus) -> ToolCard {
+    let primary = string_arg(arguments, "query")
+        .filter(|query| !query.trim().is_empty())
+        .map(|query| quoted(&query, QUERY_MAX_CHARS));
+    ToolCard::new(
+        status,
+        ToolFamily::Default,
+        ToolHeader::call(TOOL_SEARCH_NAME, primary),
+    )
+}
+
+/// Hits arrive as JSON, optionally preceded by a one-line loading notice.
+/// Keep older bare-JSON results readable on replay; other output stays literal.
+pub(super) fn finished_card(arguments: &Value, content: &str, ok: bool) -> ToolCard {
+    let mut card = preview_card(arguments, ToolStatus::from_finished(ok));
+    if !ok {
+        push_error_output(&mut card, content);
+        return card;
+    }
+    let json = if content.trim_start().starts_with('[') {
+        content
+    } else {
+        content.split_once('\n').map_or(content, |(_, json)| json)
+    };
+    match serde_json::from_str::<Vec<Hit>>(json) {
+        Ok(hits) if !hits.is_empty() => {
+            let count = hits.len() as u64;
+            card.push_fact(ToolFact::Count {
+                label: if count == 1 { "tool" } else { "tools" }.into(),
+                value: count,
+                detail: None,
+            });
+            card.body = ToolBody::Lines(hits.iter().map(hit_row).collect());
+        }
+        Ok(_) | Err(_) => card.body = ToolBody::Lines(split_body_lines(content.trim())),
+    }
+    card
+}
+
+/// `name · first sentence`, so long tool docs stay one row.
+fn hit_row(hit: &Hit) -> String {
+    let first = hit
+        .description
+        .split_once(". ")
+        .map_or(hit.description.as_str(), |(sentence, _)| sentence)
+        .trim_end_matches('.');
+    let summary = truncate(first, DESCRIPTION_MAX_CHARS);
+    if summary.is_empty() {
+        hit.name.clone()
+    } else {
+        format!("{} · {summary}", hit.name)
+    }
+}

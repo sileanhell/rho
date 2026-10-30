@@ -1,0 +1,729 @@
+//! Shared shell-tool process runner.
+//!
+//! Platform tools supply only process-supervision policy (Unix process groups
+//! versus Windows job objects). Argument shapes, stream collection, the run
+//! loop, and result formatting live here so bash and PowerShell cannot drift.
+
+use crate::cancellation::RunCancellation;
+use crate::process_env::apply_process_environment;
+use crate::process_stream::{capture_failure_notice, StreamKind, StreamTail};
+use crate::tool::{truncate, ToolError, ToolSpec};
+use rho_sdk::{
+    tool::ProcessResult, ExecutableSelection, ProcessEnvironment, ProcessExecution,
+    ProcessInvocation,
+};
+use serde::Deserialize;
+use std::{ffi::OsString, process::Stdio, time::Duration, time::Instant};
+use tokio::{io::AsyncReadExt, process::Command};
+
+const FINAL_OUTPUT_GRACE: Duration = Duration::from_millis(250);
+const UPDATE_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Child environment variable carrying the parent process `PATH` into login shells.
+pub const PARENT_PATH_VAR: &str = "RHO_PARENT_PATH";
+
+/// Wraps a script for `bash -l` so login init cannot drop parent `PATH` entries.
+///
+/// `/etc/profile` on Debian resets `PATH` (macOS `path_helper` reorders it) before
+/// user dotfiles run, so anything the launching shell added outside the login
+/// chain (mise, nix, direnv, nvm) disappears inside `bash -lc`. The wrapper
+/// re-prepends [`PARENT_PATH_VAR`] after login init; callers set that variable
+/// from [`parent_path_for`] so environment policy still decides whether the child
+/// sees the parent `PATH` at all. When the variable is unset the script leaves
+/// `PATH` untouched. The prefix stays on the first line so bash error line numbers
+/// still match the caller's command.
+pub fn login_shell_script(command: &str) -> String {
+    format!("export PATH=\"${{{PARENT_PATH_VAR}:+${PARENT_PATH_VAR}:}}$PATH\"; {command}")
+}
+
+/// Returns the parent `PATH` when `environment` lets the child inherit it.
+///
+/// `Empty` and `InheritListed` without `PATH` deliberately hide the parent path,
+/// so re-exporting it through [`PARENT_PATH_VAR`] would bypass that policy.
+pub fn parent_path_for(environment: &ProcessEnvironment) -> Option<OsString> {
+    let inherits_path = match environment {
+        ProcessEnvironment::Empty => false,
+        ProcessEnvironment::InheritAll => true,
+        ProcessEnvironment::InheritExcept { variable_names } => {
+            !variable_names.iter().any(|name| name == "PATH")
+        }
+        ProcessEnvironment::InheritListed { variable_names } => {
+            variable_names.iter().any(|name| name == "PATH")
+        }
+        _ => false,
+    };
+    inherits_path.then(|| std::env::var_os("PATH")).flatten()
+}
+
+/// Spec for a shell tool whose `launch` clause names how the command runs.
+/// Execution rules shared by every shell live here with [`ShellArgs`].
+pub(crate) fn shell_tool_spec(name: &str, launch: &str) -> ToolSpec {
+    ToolSpec {
+        name: name.into(),
+        description: format!(
+            "{launch} in the session working directory and returns stdout, stderr, and the exit code when nonzero. \
+Each call is a fresh process: `cd`, variables, and other shell state do not carry over to the next call. \
+The call blocks until the command exits; there is no timeout unless `timeout_seconds` is set, and a timeout kills the whole process tree. \
+Output beyond the tool-output limit is truncated."
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Command text to run."},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "description": "Kill the command after this many seconds. Omit for no limit."}
+            },
+            "required": ["command"]
+        }),
+    }
+}
+
+/// Arguments accepted by the application shell tools.
+#[derive(Deserialize)]
+pub(crate) struct ShellArgs {
+    pub command: String,
+    pub timeout_seconds: Option<u64>,
+}
+
+impl ShellArgs {
+    pub(crate) fn parse(args: serde_json::Value) -> Result<Self, ToolError> {
+        Ok(serde_json::from_value(args)?)
+    }
+
+    /// Returns the optional run timeout.
+    ///
+    /// `None` means no timeout. `Some(0)` is rejected so the app shell tools and
+    /// the SDK adapter share one guard instead of spawning and immediately timing out.
+    pub(crate) fn timeout(&self) -> Result<Option<Duration>, ToolError> {
+        match self.timeout_seconds {
+            None => Ok(None),
+            Some(0) => Err(ToolError::Message(
+                "timeout_seconds must be greater than zero".into(),
+            )),
+            Some(seconds) => Ok(Some(Duration::from_secs(seconds))),
+        }
+    }
+}
+
+/// Platform-specific child supervision (process groups, job objects).
+///
+/// `run` calls [`Self::kill`] on completion, cancellation, and timeout. Drop
+/// implementations typically call `kill` again, so implementors must make
+/// `kill` idempotent and safe under repeated invocation. `kill` must terminate
+/// the full supervised tree (process group or job object), not only the direct
+/// child, so background descendants cannot outlive the tool call.
+pub(crate) trait ProcessSupervisor: Sized {
+    fn prepare(command: &mut Command);
+
+    fn attach(child: &tokio::process::Child) -> Result<Self, ToolError>;
+
+    fn kill(&mut self);
+}
+
+/// A finished shell command. Retained stdout and stderr share the tool's
+/// `max_output_bytes`; `truncated` reports dropped bytes.
+///
+/// `process` is the view lifecycle hooks read instead of parsing the
+/// model-facing text. It adds the tail of each stream past the budget, so it is
+/// not part of the script-facing structured content.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct ShellOutcome {
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    /// Process exit code; `None` when a signal terminated the command.
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) truncated: bool,
+    pub(crate) wall_time_ms: u64,
+    #[serde(skip)]
+    pub(crate) process: ProcessResult,
+}
+
+/// Dropped output kept per stream for [`ShellOutcome::process`]: enough to fill
+/// one hook payload field at its default bound.
+const PROCESS_TAIL_BYTES: usize = rho_sdk::hooks::DEFAULT_MAX_FIELD_BYTES;
+
+/// Spawns `execution`, supervises it with `S`, and streams output updates.
+pub(crate) async fn run<S: ProcessSupervisor>(
+    execution: ProcessExecution,
+    tool_name: &str,
+    cancellation: RunCancellation,
+    on_update: &mut (dyn FnMut(Vec<String>) + Send),
+) -> Result<crate::Rendered<ShellOutcome>, ToolError> {
+    let mut command = build_command(&execution, tool_name)?;
+    S::prepare(&mut command);
+    let mut child = command.spawn()?;
+    let mut supervisor = match S::attach(&child) {
+        Ok(supervisor) => supervisor,
+        Err(error) => {
+            // Windows children are still suspended if job assignment fails.
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error);
+        }
+    };
+
+    let start = Instant::now();
+    let max_output_bytes = execution.output_limits().max_output_bytes();
+    let mut streams = StreamSession::attach(&mut child, max_output_bytes);
+    let timeout = execution.output_limits().timeout();
+    let mut timeout_sleep = Box::pin(tokio::time::sleep(timeout.unwrap_or(Duration::MAX)));
+    let mut update_tick = tokio::time::interval(UPDATE_INTERVAL);
+    update_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    update_tick.tick().await;
+
+    let status = loop {
+        tokio::select! {
+            () = cancellation.cancelled() => {
+                supervisor.kill();
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(ToolError::Cancelled);
+            }
+            status = child.wait() => break status?,
+            chunk = streams.recv(), if streams.output_open => {
+                streams.apply_chunk(chunk);
+            }
+            _ = update_tick.tick() => {
+                if streams.dirty {
+                    streams.dirty = false;
+                    on_update(vec![running_content(&streams.stdout, &streams.stderr)]);
+                }
+            }
+            _ = &mut timeout_sleep, if timeout.is_some() => {
+                supervisor.kill();
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let output = streams.finish().await;
+                return Err(timeout_error(
+                    &output.stdout,
+                    &output.stderr,
+                    timeout.unwrap_or_default(),
+                    max_output_bytes,
+                ));
+            }
+        }
+    };
+
+    supervisor.kill();
+    let output = streams.finish().await;
+    let elapsed = start.elapsed();
+    let process = ProcessResult::new(
+        status.code(),
+        joined(&output.stdout, &output.stdout_tail),
+        joined(&output.stderr, &output.stderr_tail),
+    )
+    .with_truncated(output.stdout_tail.lost() || output.stderr_tail.lost());
+    let outcome = ShellOutcome {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        exit_code: status.code(),
+        truncated: output.truncated,
+        wall_time_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        process,
+    };
+    let result = finished_result(
+        status,
+        outcome.stdout.as_bytes(),
+        outcome.stderr.as_bytes(),
+        elapsed,
+        max_output_bytes,
+    );
+    Ok(crate::Rendered::new(result, outcome).failed_if(!status.success()))
+}
+
+/// A stream's retained start followed by its kept tail. They are contiguous
+/// unless the tail reports lost bytes, so one decode keeps characters whole.
+fn joined(head: &[u8], tail: &StreamTail) -> String {
+    String::from_utf8_lossy(&[head, tail.bytes()].concat()).into_owned()
+}
+
+fn build_command(execution: &ProcessExecution, tool_name: &str) -> Result<Command, ToolError> {
+    let ProcessInvocation::Shell {
+        executable,
+        selection: ExecutableSelection::SearchPath,
+        arguments,
+        command: shell_script,
+    } = execution.invocation()
+    else {
+        return Err(ToolError::Message(format!(
+            "{tool_name} received an unsupported process plan"
+        )));
+    };
+    let mut command = Command::new(executable);
+    // Compare the stem, not the whole path: hosts may pass a resolved bash
+    // (Git's `usr/bin/bash.exe`, Rho's managed copy) instead of the bare name.
+    let is_bash = executable
+        .file_stem()
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("bash"));
+    let login_bash = is_bash && arguments.iter().any(|arg| arg == "-lc");
+    let script = if login_bash {
+        login_shell_script(shell_script)
+    } else {
+        shell_script.clone()
+    };
+    command
+        .args(arguments)
+        .arg(script)
+        .current_dir(execution.working_directory())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    apply_process_environment(&mut command, execution.environment()).map_err(ToolError::Message)?;
+    if login_bash {
+        if let Some(path) = parent_path_for(execution.environment()) {
+            command.env(PARENT_PATH_VAR, path);
+        }
+    }
+    Ok(command)
+}
+
+/// In-flight chunk queue bound. Keeps producer backpressure without allowing
+/// unbounded allocation between the OS pipes and the retained output budget.
+const CHUNK_CHANNEL_CAPACITY: usize = 32;
+
+/// Collects child stdout/stderr and owns reader teardown.
+///
+/// Retained stdout+stderr never exceed `max_output_bytes`. Readers keep draining
+/// the pipes after that budget is full so a noisy command cannot exhaust memory
+/// before timeout or completion. `finish` is the only graceful shutdown path;
+/// Drop aborts any still-running readers so cancel/error returns cannot leak
+/// tasks behind a live pipe writer.
+struct StreamSession {
+    chunk_rx: tokio::sync::mpsc::Receiver<(StreamKind, Vec<u8>)>,
+    readers: Vec<tokio::task::JoinHandle<()>>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// Bytes past the retained budget, kept for the process result.
+    stdout_tail: StreamTail,
+    stderr_tail: StreamTail,
+    retained_bytes: usize,
+    max_output_bytes: usize,
+    /// Set once any output byte was dropped for the retained budget.
+    truncated: bool,
+    output_open: bool,
+    dirty: bool,
+}
+
+struct CollectedOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_tail: StreamTail,
+    stderr_tail: StreamTail,
+    truncated: bool,
+}
+
+impl StreamSession {
+    fn attach(child: &mut tokio::process::Child, max_output_bytes: usize) -> Self {
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(CHUNK_CHANNEL_CAPACITY);
+        let mut readers = Vec::new();
+        if let Some(stdout) = child.stdout.take() {
+            readers.push(tokio::spawn(read_stream(
+                StreamKind::Stdout,
+                stdout,
+                chunk_tx.clone(),
+            )));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            readers.push(tokio::spawn(read_stream(
+                StreamKind::Stderr,
+                stderr,
+                chunk_tx,
+            )));
+        }
+        Self {
+            chunk_rx,
+            readers,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdout_tail: StreamTail::new(PROCESS_TAIL_BYTES),
+            stderr_tail: StreamTail::new(PROCESS_TAIL_BYTES),
+            retained_bytes: 0,
+            max_output_bytes: max_output_bytes.max(1),
+            truncated: false,
+            output_open: true,
+            dirty: false,
+        }
+    }
+
+    fn recv(&mut self) -> impl std::future::Future<Output = Option<(StreamKind, Vec<u8>)>> + '_ {
+        self.chunk_rx.recv()
+    }
+
+    fn apply_chunk(&mut self, chunk: Option<(StreamKind, Vec<u8>)>) {
+        match chunk {
+            Some((kind, bytes)) => {
+                let remaining = self.max_output_bytes.saturating_sub(self.retained_bytes);
+                let take = bytes.len().min(remaining);
+                self.truncated |= take < bytes.len();
+                let (retained, tail) = match kind {
+                    StreamKind::Stdout => (&mut self.stdout, &mut self.stdout_tail),
+                    StreamKind::Stderr => (&mut self.stderr, &mut self.stderr_tail),
+                };
+                tail.push(&bytes[take..]);
+                if take > 0 {
+                    retained.extend_from_slice(&bytes[..take]);
+                    self.retained_bytes += take;
+                    self.dirty = true;
+                }
+            }
+            None => self.output_open = false,
+        }
+    }
+
+    async fn finish(mut self) -> CollectedOutput {
+        let drain = async {
+            while let Some(chunk) = self.chunk_rx.recv().await {
+                self.apply_chunk(Some(chunk));
+            }
+        };
+        let _ = tokio::time::timeout(FINAL_OUTPUT_GRACE, drain).await;
+        while let Ok(chunk) = self.chunk_rx.try_recv() {
+            self.apply_chunk(Some(chunk));
+        }
+        CollectedOutput {
+            stdout: std::mem::take(&mut self.stdout),
+            stderr: std::mem::take(&mut self.stderr),
+            stdout_tail: std::mem::take(&mut self.stdout_tail),
+            stderr_tail: std::mem::take(&mut self.stderr_tail),
+            truncated: self.truncated,
+        }
+    }
+
+    fn abort_readers(&mut self) {
+        for handle in self.readers.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for StreamSession {
+    fn drop(&mut self) {
+        self.abort_readers();
+    }
+}
+
+async fn read_stream<R>(
+    kind: StreamKind,
+    mut reader: R,
+    chunk_tx: tokio::sync::mpsc::Sender<(StreamKind, Vec<u8>)>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buffer = [0; 8192];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Err(error) => {
+                // Report the truncation instead of returning a silently short
+                // capture that reads like complete command output.
+                let _ = chunk_tx
+                    .send((
+                        StreamKind::Stderr,
+                        capture_failure_notice(kind, &error).into_bytes(),
+                    ))
+                    .await;
+                break;
+            }
+            Ok(n) => {
+                // Stop once the consumer is gone so escaped writers cannot keep
+                // these tasks allocating and discarding output forever.
+                if chunk_tx.send((kind, buffer[..n].to_vec())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn running_content(stdout: &[u8], stderr: &[u8]) -> String {
+    format_shell_output(
+        &String::from_utf8_lossy(stdout),
+        &String::from_utf8_lossy(stderr),
+        ShellFooter::Running,
+    )
+}
+
+fn finished_result(
+    status: std::process::ExitStatus,
+    stdout: &[u8],
+    stderr: &[u8],
+    elapsed: Duration,
+    max_output_bytes: usize,
+) -> String {
+    let exit_code = status
+        .code()
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "signal".into());
+    finished_content(
+        (!status.success()).then_some(exit_code.as_str()),
+        &String::from_utf8_lossy(stdout),
+        &String::from_utf8_lossy(stderr),
+        elapsed,
+        max_output_bytes,
+    )
+}
+
+/// The model-facing text of a finished command. `exit` is the exit code or
+/// signal of a command that did not succeed.
+pub(crate) fn finished_content(
+    exit: Option<&str>,
+    stdout: &str,
+    stderr: &str,
+    elapsed: Duration,
+    max_output_bytes: usize,
+) -> String {
+    truncate(
+        format_shell_output(stdout, stderr, ShellFooter::Finished { elapsed, exit }),
+        max_output_bytes,
+    )
+}
+
+pub(crate) fn timeout_error(
+    stdout: &[u8],
+    stderr: &[u8],
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> ToolError {
+    let secs = timeout.as_secs();
+    let streams = format_shell_output(
+        &String::from_utf8_lossy(stdout),
+        &String::from_utf8_lossy(stderr),
+        ShellFooter::None,
+    );
+    let message = if streams.is_empty() {
+        format!("command timed out after {secs}s")
+    } else {
+        format!("command timed out after {secs}s\n\n{streams}")
+    };
+    ToolError::Message(truncate(message, max_output_bytes))
+}
+
+#[derive(Clone, Copy)]
+enum ShellFooter<'a> {
+    None,
+    Running,
+    Finished {
+        elapsed: Duration,
+        exit: Option<&'a str>,
+    },
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    format!("{:.1}s", elapsed.as_secs_f64())
+}
+
+fn format_shell_output(stdout: &str, stderr: &str, footer: ShellFooter<'_>) -> String {
+    let mut sections = Vec::new();
+    if !stdout.is_empty() {
+        sections.push(format!("stdout:\n{stdout}"));
+    }
+    if !stderr.is_empty() {
+        sections.push(format!("stderr:\n{stderr}"));
+    }
+    match footer {
+        ShellFooter::None => {}
+        ShellFooter::Running => sections.push("time: running".into()),
+        ShellFooter::Finished {
+            elapsed,
+            exit: None,
+        } => {
+            sections.push(format!("time: {}", format_elapsed(elapsed)));
+        }
+        ShellFooter::Finished {
+            elapsed,
+            exit: Some(code),
+        } => sections.push(format!(
+            "time: {}  exit code: {code}",
+            format_elapsed(elapsed)
+        )),
+    }
+    sections.join("\n\n")
+}
+
+/// Structured view of the shell tool's stable output envelope.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ShellContent {
+    pub notice: Option<String>,
+    pub stdout: String,
+    pub exit_code: Option<i64>,
+    /// Non-numeric exit token (for example `signal`) when no exit code is present.
+    pub exit_status: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub running: bool,
+}
+
+/// Parse output produced by this module into presentation fields.
+pub fn parse_shell_content(content: &str) -> ShellContent {
+    let mut parsed = ShellContent::default();
+    if content.trim().is_empty() {
+        return parsed;
+    }
+
+    let (notice, rest) = split_shell_notice(content);
+    parsed.notice = notice;
+
+    let (body, footer) = split_shell_footer(rest);
+    apply_shell_footer(&mut parsed, footer);
+    apply_shell_body(&mut parsed, body);
+    parsed
+}
+
+fn split_shell_notice(content: &str) -> (Option<String>, &str) {
+    if content.starts_with("stdout:\n")
+        || content.starts_with("stderr:\n")
+        || content.starts_with("exit code:")
+        || content.starts_with("time:")
+    {
+        return (None, content);
+    }
+    if let Some((notice, _)) = content
+        .split_once("\n\nstdout:\n")
+        .or_else(|| content.split_once("\n\nstderr:\n"))
+        .or_else(|| content.split_once("\n\nexit code:"))
+    {
+        return (Some(notice.to_string()), &content[notice.len() + 2..]);
+    }
+    if content.starts_with("command timed out") {
+        if let Some((notice, rest)) = content.split_once("\n\n") {
+            return (Some(notice.to_string()), rest);
+        }
+        return (Some(content.trim().to_string()), "");
+    }
+    (None, content)
+}
+
+fn split_shell_footer(rest: &str) -> (&str, Option<&str>) {
+    if let Some((body, footer)) = rest.rsplit_once("\n\ntime:") {
+        return (body, Some(footer.trim()));
+    }
+    if let Some((body, _)) = rest.rsplit_once("\n\nexit code:") {
+        return (body, Some(&rest[body.len() + 2..]));
+    }
+    if let Some(footer) = rest.strip_prefix("time:") {
+        return ("", Some(footer.trim()));
+    }
+    if rest.starts_with("exit code:") {
+        return ("", Some(rest));
+    }
+    (rest, None)
+}
+
+fn apply_shell_footer(parsed: &mut ShellContent, footer: Option<&str>) {
+    let Some(footer) = footer else {
+        return;
+    };
+    if footer.starts_with("running") || footer == "time: running" {
+        parsed.running = true;
+        return;
+    }
+    let footer = footer.strip_prefix("time:").unwrap_or(footer).trim();
+    parsed.duration_ms = footer
+        .split_whitespace()
+        .next()
+        .and_then(|token| token.strip_suffix('s'))
+        .and_then(|seconds| seconds.parse::<f64>().ok())
+        .map(|seconds| (seconds * 1000.0).round() as u64);
+    if let Some(raw) = footer
+        .strip_prefix("exit code:")
+        .or_else(|| footer.split("exit code:").nth(1))
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+    {
+        if let Ok(code) = raw.parse::<i64>() {
+            parsed.exit_code = Some(code);
+        } else {
+            parsed.exit_status = Some(raw.to_string());
+        }
+    }
+}
+
+fn apply_shell_body(parsed: &mut ShellContent, body: &str) {
+    if body.is_empty() {
+        return;
+    }
+    if let Some(stdout) = body.strip_prefix("stdout:\n") {
+        parsed.stdout = stdout
+            .rsplit_once("\n\nstderr:")
+            .map_or(stdout, |(stdout, _)| stdout)
+            .trim_end()
+            .to_string();
+        return;
+    }
+    if body.starts_with("stderr:\n") {
+        return;
+    }
+    parsed.stdout = body
+        .rsplit_once("\n\nstderr:")
+        .map_or(body, |(stdout, _)| stdout)
+        .trim_end()
+        .to_string();
+}
+
+/// Child supervision both shell tools share now that either can run on either
+/// platform: a new session and a process-group kill on Unix, a kill-on-close
+/// job object on Windows.
+#[cfg(unix)]
+mod platform_supervisor {
+    use super::ProcessSupervisor;
+    use crate::tool::ToolError;
+    use tokio::process::Command;
+
+    pub(crate) struct PlatformSupervisor {
+        pid: Option<u32>,
+    }
+
+    impl ProcessSupervisor for PlatformSupervisor {
+        fn prepare(command: &mut Command) {
+            crate::process_session::start_new_session(command.as_std_mut());
+        }
+
+        fn attach(child: &tokio::process::Child) -> Result<Self, ToolError> {
+            Ok(Self { pid: child.id() })
+        }
+
+        fn kill(&mut self) {
+            let Some(pid) = self.pid.take().and_then(|pid| i32::try_from(pid).ok()) else {
+                return;
+            };
+            // A negative PID targets the process group created by
+            // `start_new_session`.
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+    }
+
+    impl Drop for PlatformSupervisor {
+        fn drop(&mut self) {
+            self.kill();
+        }
+    }
+}
+
+/// Windows counterpart: the job object's kill-on-close covers the whole tree.
+#[cfg(windows)]
+mod platform_supervisor {
+    use super::ProcessSupervisor;
+    use crate::tool::ToolError;
+    use tokio::process::Command;
+
+    pub(crate) struct PlatformSupervisor(crate::process_supervision::WindowsJob);
+
+    impl ProcessSupervisor for PlatformSupervisor {
+        fn prepare(command: &mut Command) {
+            crate::process_supervision::WindowsJob::prepare(command);
+        }
+
+        fn attach(child: &tokio::process::Child) -> Result<Self, ToolError> {
+            crate::process_supervision::WindowsJob::attach(child)
+                .map(Self)
+                .map_err(|error| ToolError::Message(error.to_string()))
+        }
+
+        fn kill(&mut self) {
+            self.0.kill();
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+pub(crate) use platform_supervisor::PlatformSupervisor;

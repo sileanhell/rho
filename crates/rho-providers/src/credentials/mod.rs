@@ -1,0 +1,693 @@
+//! Provider credential storage and helpers.
+//!
+//! Credentials are stored under stable account names in private files under
+//! the Rho home directory (`RHO_HOME` or `~/.rho`). Use
+//! [`FileCredentialStore::open`] to construct the store.
+
+mod file;
+mod file_document;
+mod file_permissions;
+#[cfg(windows)]
+mod file_windows;
+#[cfg(any(test, debug_assertions))]
+mod memory;
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::provider::{self, ProviderAuthKind};
+
+pub use file::FileCredentialStore;
+#[cfg(any(test, debug_assertions))]
+pub use memory::MemoryCredentialStore;
+
+const CODEX_TOKENS_ACCOUNT: &str = provider::CODEX_TOKENS_ACCOUNT;
+const GITHUB_COPILOT_TOKENS_ACCOUNT: &str = provider::GITHUB_COPILOT_TOKENS_ACCOUNT;
+const XAI_TOKENS_ACCOUNT: &str = provider::XAI_TOKENS_ACCOUNT;
+const WEB_SEARCH_OPENAI_API_KEY_ACCOUNT: &str = "web-search:openai:api-key";
+const WEB_SEARCH_EXA_API_KEY_ACCOUNT: &str = "web-search:exa:api-key";
+const WEB_SEARCH_BRAVE_API_KEY_ACCOUNT: &str = "web-search:brave:api-key";
+const WEB_SEARCH_FIRECRAWL_API_KEY_ACCOUNT: &str = "web-search:firecrawl:api-key";
+/// Ollama device keys live in `~/.ollama`, which the Ollama CLI shares, so a
+/// key on disk does not mean the user signed in to Rho. Device login sets this
+/// flag and logout deletes it; the key itself is never removed.
+const OLLAMA_DEVICE_SIGNED_IN_ACCOUNT: &str = "provider:ollama-cloud:device-signed-in";
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CodexTokens {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub id_token: Option<String>,
+    pub account_id: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GitHubCopilotTokens {
+    pub github_access_token: String,
+    pub github_refresh_token: Option<String>,
+    pub github_expires_at_unix: Option<i64>,
+    pub copilot_token: Option<String>,
+    pub copilot_expires_at_unix: Option<i64>,
+    pub copilot_refresh_after_unix: Option<i64>,
+    pub copilot_token_endpoint: Option<String>,
+    pub copilot_chat_endpoint: Option<String>,
+    pub copilot_models_endpoint: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct KimiTokens {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at_unix: Option<i64>,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default = "default_bearer_token_type")]
+    pub token_type: String,
+    #[serde(default)]
+    pub expires_in: Option<u64>,
+}
+
+fn default_bearer_token_type() -> String {
+    "Bearer".into()
+}
+
+/// Muse subscription session. The identity token mints Model API keys; it is
+/// not sent on inference requests.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MetaTokens {
+    pub identity_token: String,
+    pub api_key: String,
+    pub api_key_expires_at_unix: i64,
+}
+
+/// Claude subscription OAuth token triple.
+///
+/// `expires_at_ms` is a Unix epoch in milliseconds, matching the
+/// `claudeAiOauth.expiresAt` field of `~/.claude/.credentials.json`.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AnthropicTokens {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct XaiTokens {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at_unix: Option<i64>,
+    pub id_token: Option<String>,
+}
+
+macro_rules! redacted_token_debug {
+    ($type:ty, $($visible:ident),* $(,)?) => {
+        impl fmt::Debug for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let mut debug = formatter.debug_struct(stringify!($type));
+                debug.field("credentials", &"[REDACTED]");
+                $(debug.field(stringify!($visible), &self.$visible);)*
+                debug.finish()
+            }
+        }
+    };
+}
+
+redacted_token_debug!(CodexTokens, account_id);
+redacted_token_debug!(
+    GitHubCopilotTokens,
+    github_expires_at_unix,
+    copilot_expires_at_unix,
+    copilot_refresh_after_unix,
+    copilot_token_endpoint,
+    copilot_chat_endpoint,
+    copilot_models_endpoint,
+);
+redacted_token_debug!(KimiTokens, expires_at_unix);
+redacted_token_debug!(MetaTokens, api_key_expires_at_unix);
+redacted_token_debug!(AnthropicTokens, expires_at_ms);
+redacted_token_debug!(XaiTokens, expires_at_unix);
+
+#[derive(Clone, Debug, Error)]
+pub enum CredentialError {
+    #[error("credential store is unavailable: {0}. Check the file backend under RHO_HOME or ~/.rho, or use CI/dev env overrides such as OPENAI_API_KEY, ANTHROPIC_TOKEN, MOONSHOT_API_KEY, POOLSIDE_API_KEY, CODEX_ACCESS_TOKEN, GITHUB_COPILOT_TOKEN, KIMI_ACCESS_TOKEN, or XAI_ACCESS_TOKEN.")]
+    StoreUnavailable(String),
+    #[error("stored credential data is invalid: {0}")]
+    InvalidData(String),
+}
+
+pub type CredentialResult<T> = Result<T, CredentialError>;
+
+/// Stores provider credentials under stable rho account names.
+///
+/// Implementors should treat the `account` argument as an opaque key within the
+/// rho service namespace and return `Ok(None)` or `Ok(false)` for missing
+/// entries. Backend access, permission, serialization, or availability failures
+/// should be reported as `CredentialError` values instead of panicking.
+pub trait CredentialStore: Send + Sync {
+    fn get_secret(&self, account: &str) -> CredentialResult<Option<String>>;
+    fn set_secret(&self, account: &str, secret: &str) -> CredentialResult<()>;
+    fn delete_secret(&self, account: &str) -> CredentialResult<bool>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebSearchCredential {
+    OpenAi,
+    Exa,
+    Brave,
+    Firecrawl,
+}
+
+impl WebSearchCredential {
+    pub const ALL: [Self; 4] = [Self::OpenAi, Self::Exa, Self::Brave, Self::Firecrawl];
+
+    pub const fn account(self) -> &'static str {
+        match self {
+            Self::OpenAi => WEB_SEARCH_OPENAI_API_KEY_ACCOUNT,
+            Self::Exa => WEB_SEARCH_EXA_API_KEY_ACCOUNT,
+            Self::Brave => WEB_SEARCH_BRAVE_API_KEY_ACCOUNT,
+            Self::Firecrawl => WEB_SEARCH_FIRECRAWL_API_KEY_ACCOUNT,
+        }
+    }
+
+    pub const fn env_vars(self) -> &'static [&'static str] {
+        match self {
+            Self::OpenAi => &["OPENAI_API_KEY"],
+            Self::Exa => &["EXA_API_KEY"],
+            Self::Brave => &["BRAVE_SEARCH_API_KEY", "BRAVE_API_KEY"],
+            Self::Firecrawl => &["FIRECRAWL_API_KEY"],
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::OpenAi => "OpenAI web search API key",
+            Self::Exa => "Exa API key",
+            Self::Brave => "Brave Search API key",
+            Self::Firecrawl => "Firecrawl API key",
+        }
+    }
+}
+
+pub fn load_web_search_api_key(
+    store: &dyn CredentialStore,
+    credential: WebSearchCredential,
+) -> CredentialResult<Option<String>> {
+    store.get_secret(credential.account())
+}
+
+pub fn save_web_search_api_key(
+    store: &dyn CredentialStore,
+    credential: WebSearchCredential,
+    key: &str,
+) -> CredentialResult<()> {
+    store.set_secret(credential.account(), key)
+}
+
+pub fn delete_web_search_api_key(
+    store: &dyn CredentialStore,
+    credential: WebSearchCredential,
+) -> CredentialResult<bool> {
+    store.delete_secret(credential.account())
+}
+
+fn provider_descriptor_from_reference(
+    provider: &str,
+) -> Option<&'static provider::ProviderDescriptor> {
+    provider::resolve_provider_reference(provider)
+        .ok()
+        .map(|profile| profile.provider)
+}
+
+pub fn load_provider_api_key(
+    store: &dyn CredentialStore,
+    provider: &str,
+) -> CredentialResult<Option<String>> {
+    let Some(descriptor) = provider_descriptor_from_reference(provider) else {
+        return Ok(None);
+    };
+    let Some(ProviderAuthKind::ApiKey { account, .. }) = descriptor
+        .auth_modes()
+        .map(|mode| mode.auth_kind)
+        .find(|kind| matches!(kind, ProviderAuthKind::ApiKey { .. }))
+    else {
+        return Ok(None);
+    };
+    store.get_secret(account)
+}
+
+pub fn save_provider_api_key(
+    store: &dyn CredentialStore,
+    provider: &str,
+    key: &str,
+) -> CredentialResult<()> {
+    // Prefer an exact auth profile id, then fall back to the provider default.
+    let auth_kind = provider::resolve_auth_mode(provider)
+        .map(|(_, mode)| mode.auth_kind)
+        .or_else(|| {
+            provider_descriptor_from_reference(provider).and_then(|descriptor| {
+                descriptor
+                    .auth_modes()
+                    .find(|mode| matches!(mode.auth_kind, ProviderAuthKind::ApiKey { .. }))
+                    .map(|mode| mode.auth_kind)
+            })
+        });
+    let Some(ProviderAuthKind::ApiKey { account, .. }) = auth_kind else {
+        return Err(CredentialError::InvalidData(format!(
+            "provider '{provider}' does not use API key credentials"
+        )));
+    };
+    store.set_secret(account, key)
+}
+
+pub fn save_openrouter_oauth_key(store: &dyn CredentialStore, key: &str) -> CredentialResult<()> {
+    if key.trim().is_empty() {
+        return Err(CredentialError::InvalidData(
+            "OpenRouter OAuth key cannot be empty".into(),
+        ));
+    }
+    store.set_secret(provider::OPENROUTER_OAUTH_KEY_ACCOUNT, key)
+}
+
+pub fn delete_provider_credentials(
+    store: &dyn CredentialStore,
+    provider: &str,
+) -> CredentialResult<bool> {
+    let Some(descriptor) = provider_descriptor_from_reference(provider) else {
+        return Ok(false);
+    };
+    let mut deleted = false;
+    for mode in descriptor.auth_modes() {
+        deleted |= delete_auth_kind_credentials(store, mode.auth_kind)?;
+    }
+    Ok(deleted)
+}
+
+pub fn delete_auth_credentials(store: &dyn CredentialStore, auth: &str) -> CredentialResult<bool> {
+    let Some((_, mode)) = provider::resolve_auth_mode(auth) else {
+        return Ok(false);
+    };
+    delete_auth_kind_credentials(store, mode.auth_kind)
+}
+
+fn delete_auth_kind_credentials(
+    store: &dyn CredentialStore,
+    auth_kind: ProviderAuthKind,
+) -> CredentialResult<bool> {
+    let _fence = refresh_fence();
+    if matches!(auth_kind, ProviderAuthKind::OllamaDeviceKey { .. }) {
+        return store.delete_secret(OLLAMA_DEVICE_SIGNED_IN_ACCOUNT);
+    }
+    let Some(account) = auth_kind.account() else {
+        return Ok(false);
+    };
+    store.delete_secret(account)
+}
+
+/// True when the user completed a Rho device login and has not logged out.
+pub(crate) fn ollama_device_login_recorded(store: &dyn CredentialStore) -> CredentialResult<bool> {
+    Ok(store.get_secret(OLLAMA_DEVICE_SIGNED_IN_ACCOUNT)?.is_some())
+}
+
+/// True when Rho is signed in and a usable `~/.ollama` device key exists.
+fn ollama_device_signed_in(store: &dyn CredentialStore) -> CredentialResult<bool> {
+    Ok(ollama_device_login_recorded(store)?
+        && crate::auth::ollama_device::ollama_device_credentials_available())
+}
+
+pub(crate) fn sign_in_ollama_device(store: &dyn CredentialStore) -> CredentialResult<()> {
+    store.set_secret(OLLAMA_DEVICE_SIGNED_IN_ACCOUNT, "1")
+}
+
+/// Serializes refreshed-token saves with credential deletes and login saves
+/// in this process, so a refresh cannot save over a change made between its
+/// check and its write. Another process's change is fenced only by the check
+/// in [`save_refreshed_tokens`].
+fn refresh_fence() -> std::sync::MutexGuard<'static, ()> {
+    static FENCE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    FENCE.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// Stored OAuth tokens a refresh may replace.
+pub(crate) trait RefreshableTokens: Serialize + serde::de::DeserializeOwned {
+    /// The long-lived credential a refresh presents, which identifies the
+    /// sign-in: a logout or a new login changes it, while caches refreshed
+    /// alongside it (access tokens, Copilot API tokens) do not.
+    fn sign_in(&self) -> &str;
+}
+
+impl RefreshableTokens for CodexTokens {
+    fn sign_in(&self) -> &str {
+        self.refresh_token.as_deref().unwrap_or(&self.access_token)
+    }
+}
+
+impl RefreshableTokens for GitHubCopilotTokens {
+    fn sign_in(&self) -> &str {
+        self.github_refresh_token
+            .as_deref()
+            .unwrap_or(&self.github_access_token)
+    }
+}
+
+impl RefreshableTokens for KimiTokens {
+    fn sign_in(&self) -> &str {
+        self.refresh_token.as_deref().unwrap_or(&self.access_token)
+    }
+}
+
+impl RefreshableTokens for AnthropicTokens {
+    fn sign_in(&self) -> &str {
+        self.refresh_token.as_deref().unwrap_or(&self.access_token)
+    }
+}
+
+impl RefreshableTokens for MetaTokens {
+    fn sign_in(&self) -> &str {
+        &self.identity_token
+    }
+}
+
+impl RefreshableTokens for XaiTokens {
+    fn sign_in(&self) -> &str {
+        self.refresh_token.as_deref().unwrap_or(&self.access_token)
+    }
+}
+
+/// Saves the `refreshed` tokens a refresh of `replacing` produced over
+/// `account`, only while `account` still holds `replacing`'s sign-in.
+/// Otherwise the sign-in changed while the refresh ran: a logout deleted it,
+/// and saving would sign the user back in, or a new login replaced it, and
+/// saving would restore the old session. The refreshed tokens then live only
+/// as long as the provider holding them. Another session refreshing a cache
+/// of the same sign-in does not block the save. Logins save with the
+/// `save_*_tokens` functions, which always write.
+pub(crate) fn save_refreshed_tokens<T: RefreshableTokens>(
+    store: &dyn CredentialStore,
+    account: &str,
+    replacing: &T,
+    refreshed: &T,
+) -> CredentialResult<()> {
+    let secret = serde_json::to_string(refreshed)
+        .map_err(|err| CredentialError::InvalidData(format!("could not encode tokens: {err}")))?;
+    let _fence = refresh_fence();
+    let stored = store
+        .get_secret(account)?
+        .and_then(|stored| serde_json::from_str::<T>(&stored).ok());
+    if stored.as_ref().map(RefreshableTokens::sign_in) != Some(replacing.sign_in()) {
+        return Ok(());
+    }
+    store.set_secret(account, &secret)
+}
+
+pub fn load_codex_tokens(store: &dyn CredentialStore) -> CredentialResult<Option<CodexTokens>> {
+    let Some(secret) = store.get_secret(CODEX_TOKENS_ACCOUNT)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&secret).map(Some).map_err(|err| {
+        CredentialError::InvalidData(format!("invalid stored Codex token JSON: {err}"))
+    })
+}
+
+pub fn save_codex_tokens(
+    store: &dyn CredentialStore,
+    tokens: &CodexTokens,
+) -> CredentialResult<()> {
+    let secret = serde_json::to_string(tokens)
+        .map_err(|err| CredentialError::InvalidData(format!("could not encode tokens: {err}")))?;
+    let _fence = refresh_fence();
+    store.set_secret(CODEX_TOKENS_ACCOUNT, &secret)
+}
+
+pub fn load_kimi_tokens(store: &dyn CredentialStore) -> CredentialResult<Option<KimiTokens>> {
+    let Some(secret) = store.get_secret(crate::provider::KIMI_TOKENS_ACCOUNT)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&secret).map(Some).map_err(|err| {
+        CredentialError::InvalidData(format!("invalid stored Kimi token JSON: {err}"))
+    })
+}
+
+pub fn save_kimi_tokens(store: &dyn CredentialStore, tokens: &KimiTokens) -> CredentialResult<()> {
+    let secret = serde_json::to_string(tokens)
+        .map_err(|err| CredentialError::InvalidData(format!("could not encode tokens: {err}")))?;
+    let _fence = refresh_fence();
+    store.set_secret(crate::provider::KIMI_TOKENS_ACCOUNT, &secret)
+}
+
+pub fn load_meta_tokens(store: &dyn CredentialStore) -> CredentialResult<Option<MetaTokens>> {
+    let Some(secret) = store.get_secret(crate::provider::META_MUSE_TOKENS_ACCOUNT)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&secret).map(Some).map_err(|err| {
+        CredentialError::InvalidData(format!("invalid stored Muse subscription JSON: {err}"))
+    })
+}
+
+pub fn save_meta_tokens(store: &dyn CredentialStore, tokens: &MetaTokens) -> CredentialResult<()> {
+    let secret = serde_json::to_string(tokens)
+        .map_err(|err| CredentialError::InvalidData(format!("could not encode tokens: {err}")))?;
+    let _fence = refresh_fence();
+    store.set_secret(crate::provider::META_MUSE_TOKENS_ACCOUNT, &secret)
+}
+
+pub fn load_anthropic_tokens(
+    store: &dyn CredentialStore,
+) -> CredentialResult<Option<AnthropicTokens>> {
+    let Some(secret) = store.get_secret(crate::provider::ANTHROPIC_TOKENS_ACCOUNT)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&secret).map(Some).map_err(|err| {
+        CredentialError::InvalidData(format!("invalid stored Anthropic token JSON: {err}"))
+    })
+}
+
+pub fn save_anthropic_tokens(
+    store: &dyn CredentialStore,
+    tokens: &AnthropicTokens,
+) -> CredentialResult<()> {
+    let secret = serde_json::to_string(tokens)
+        .map_err(|err| CredentialError::InvalidData(format!("could not encode tokens: {err}")))?;
+    let _fence = refresh_fence();
+    store.set_secret(crate::provider::ANTHROPIC_TOKENS_ACCOUNT, &secret)
+}
+
+pub fn load_xai_tokens(store: &dyn CredentialStore) -> CredentialResult<Option<XaiTokens>> {
+    let Some(secret) = store.get_secret(XAI_TOKENS_ACCOUNT)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&secret).map(Some).map_err(|err| {
+        CredentialError::InvalidData(format!("invalid stored SpaceXAI token JSON: {err}"))
+    })
+}
+
+pub fn save_xai_tokens(store: &dyn CredentialStore, tokens: &XaiTokens) -> CredentialResult<()> {
+    let secret = serde_json::to_string(tokens)
+        .map_err(|err| CredentialError::InvalidData(format!("could not encode tokens: {err}")))?;
+    let _fence = refresh_fence();
+    store.set_secret(XAI_TOKENS_ACCOUNT, &secret)
+}
+
+pub fn load_github_copilot_tokens(
+    store: &dyn CredentialStore,
+) -> CredentialResult<Option<GitHubCopilotTokens>> {
+    let Some(secret) = store.get_secret(GITHUB_COPILOT_TOKENS_ACCOUNT)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&secret).map(Some).map_err(|err| {
+        CredentialError::InvalidData(format!("invalid stored GitHub Copilot token JSON: {err}"))
+    })
+}
+
+pub fn save_github_copilot_tokens(
+    store: &dyn CredentialStore,
+    tokens: &GitHubCopilotTokens,
+) -> CredentialResult<()> {
+    let secret = serde_json::to_string(tokens)
+        .map_err(|err| CredentialError::InvalidData(format!("could not encode tokens: {err}")))?;
+    let _fence = refresh_fence();
+    store.set_secret(GITHUB_COPILOT_TOKENS_ACCOUNT, &secret)
+}
+
+pub fn provider_has_env_override(provider: &str) -> bool {
+    provider_has_env_override_from(provider, |env_var| std::env::var(env_var).ok())
+}
+
+fn provider_has_env_override_from(
+    provider: &str,
+    env_value: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let Some(descriptor) = provider_descriptor_from_reference(provider) else {
+        return false;
+    };
+    descriptor.auth_modes().any(|mode| {
+        mode.auth_kind
+            .env_var()
+            .is_some_and(|env_var| env_value(env_var).is_some_and(|value| !value.trim().is_empty()))
+    })
+}
+
+pub fn auth_has_env_override(auth: &str) -> bool {
+    auth_has_env_override_from(auth, |env_var| std::env::var(env_var).ok())
+}
+
+fn auth_has_env_override_from(auth: &str, env_value: impl Fn(&str) -> Option<String>) -> bool {
+    let Some((_, mode)) = provider::resolve_auth_mode(auth) else {
+        return false;
+    };
+    mode.auth_kind
+        .env_var()
+        .is_some_and(|env_var| env_value(env_var).is_some_and(|value| !value.trim().is_empty()))
+}
+
+pub fn provider_has_stored_credentials(
+    store: &dyn CredentialStore,
+    provider: &str,
+) -> CredentialResult<bool> {
+    let Some(descriptor) = provider_descriptor_from_reference(provider) else {
+        return Ok(false);
+    };
+    for mode in descriptor.auth_modes() {
+        if auth_mode_has_stored_credentials(store, mode.auth_kind)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub fn auth_has_stored_credentials(
+    store: &dyn CredentialStore,
+    auth: &str,
+) -> CredentialResult<bool> {
+    let Some((_, mode)) = provider::resolve_auth_mode(auth) else {
+        return Ok(false);
+    };
+    auth_mode_has_stored_credentials(store, mode.auth_kind)
+}
+
+fn auth_mode_has_stored_credentials(
+    store: &dyn CredentialStore,
+    auth_kind: ProviderAuthKind,
+) -> CredentialResult<bool> {
+    match auth_kind {
+        ProviderAuthKind::None => Ok(true),
+        ProviderAuthKind::OllamaDeviceKey { .. } => ollama_device_signed_in(store),
+        auth_kind => {
+            let Some(account) = auth_kind.account() else {
+                return Ok(false);
+            };
+            Ok(store
+                .get_secret(account)?
+                .is_some_and(|value| !value.trim().is_empty()))
+        }
+    }
+}
+
+pub fn provider_has_credentials(
+    store: &dyn CredentialStore,
+    provider: &str,
+) -> CredentialResult<bool> {
+    if provider_has_env_override(provider) {
+        return Ok(true);
+    }
+    let Some(descriptor) = provider_descriptor_from_reference(provider) else {
+        return Ok(false);
+    };
+    for mode in descriptor.auth_modes() {
+        if auth_mode_has_credentials(store, mode.auth_kind)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub fn auth_has_credentials(store: &dyn CredentialStore, auth: &str) -> CredentialResult<bool> {
+    if auth_has_env_override(auth) {
+        return Ok(true);
+    }
+    let Some((_, mode)) = provider::resolve_auth_mode(auth) else {
+        return Ok(false);
+    };
+    auth_mode_has_credentials(store, mode.auth_kind)
+}
+
+fn credential_value_is_usable(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+fn auth_mode_has_credentials(
+    store: &dyn CredentialStore,
+    auth_kind: ProviderAuthKind,
+) -> CredentialResult<bool> {
+    match auth_kind {
+        ProviderAuthKind::None => Ok(true),
+        ProviderAuthKind::ApiKey { account, .. }
+        | ProviderAuthKind::BearerCredential { account, .. } => Ok(store
+            .get_secret(account)?
+            .is_some_and(|key| !key.trim().is_empty())),
+        ProviderAuthKind::AnthropicOAuth { .. } => {
+            // A usable credential comes from the store; env overrides were
+            // checked earlier.
+            Ok(load_anthropic_tokens(store)?.is_some_and(|tokens| {
+                credential_value_is_usable(&tokens.access_token)
+                    || tokens
+                        .refresh_token
+                        .as_deref()
+                        .is_some_and(credential_value_is_usable)
+            }))
+        }
+        ProviderAuthKind::CodexOAuth { .. } => {
+            Ok(load_codex_tokens(store)?.is_some_and(|tokens| {
+                credential_value_is_usable(&tokens.access_token)
+                    || tokens
+                        .refresh_token
+                        .as_deref()
+                        .is_some_and(credential_value_is_usable)
+            }))
+        }
+        ProviderAuthKind::GithubCopilotDevice { .. } => Ok(load_github_copilot_tokens(store)?
+            .is_some_and(|tokens| {
+                credential_value_is_usable(&tokens.github_access_token)
+                    || tokens
+                        .github_refresh_token
+                        .as_deref()
+                        .is_some_and(credential_value_is_usable)
+                    || tokens
+                        .copilot_token
+                        .as_deref()
+                        .is_some_and(credential_value_is_usable)
+            })),
+        ProviderAuthKind::XaiOAuth { .. } => Ok(load_xai_tokens(store)?.is_some_and(|tokens| {
+            credential_value_is_usable(&tokens.access_token)
+                || tokens
+                    .refresh_token
+                    .as_deref()
+                    .is_some_and(credential_value_is_usable)
+        })),
+        ProviderAuthKind::KimiOAuth { .. } => Ok(load_kimi_tokens(store)?.is_some_and(|tokens| {
+            credential_value_is_usable(&tokens.access_token)
+                || tokens
+                    .refresh_token
+                    .as_deref()
+                    .is_some_and(credential_value_is_usable)
+        })),
+        ProviderAuthKind::MetaOAuth { .. } => Ok(load_meta_tokens(store)?.is_some_and(|tokens| {
+            credential_value_is_usable(&tokens.api_key)
+                || credential_value_is_usable(&tokens.identity_token)
+        })),
+        ProviderAuthKind::OllamaDeviceKey { .. } => ollama_device_signed_in(store),
+    }
+}
+
+pub fn available_auth_modes(store: &dyn CredentialStore) -> Vec<String> {
+    let mut modes = provider::providers()
+        .into_iter()
+        .flat_map(|provider| provider.auth_modes())
+        .filter(|mode| auth_has_credentials(store, mode.id).unwrap_or(false))
+        .map(|mode| mode.id.to_string())
+        .collect::<Vec<_>>();
+    modes.sort();
+    modes.dedup();
+    modes
+}

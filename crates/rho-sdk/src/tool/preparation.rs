@@ -1,0 +1,453 @@
+use std::{fmt, path::PathBuf};
+
+use crate::{
+    AuthorizationDenialKind, CancellationToken, CapabilityRequest, HostInputRequest,
+    HostInputResponse, Workspace,
+};
+
+use super::{
+    Tool, ToolContext, ToolError, ToolErrorKind, ToolFuture, ToolInvocation, ToolMetadata,
+    ToolProgressSender,
+};
+
+/// Future returned while a [`Tool`](super::Tool) prepares one invocation.
+pub type ToolPrepareFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<PreparedToolInvocation<'a>, ToolError>> + Send + 'a,
+    >,
+>;
+
+/// Facts available while a tool validates and resolves an invocation.
+///
+/// Preparation cannot emit progress, ask for host input, or authorize work.
+pub struct ToolPreparationContext {
+    workspace: Option<Workspace>,
+    cancellation: CancellationToken,
+}
+
+impl ToolPreparationContext {
+    pub fn new(workspace: Option<Workspace>, cancellation: CancellationToken) -> Self {
+        Self {
+            workspace,
+            cancellation,
+        }
+    }
+
+    pub(crate) fn from_execution(execution: &ToolContext) -> Self {
+        Self::new(
+            execution.workspace().cloned(),
+            execution.cancellation().clone(),
+        )
+    }
+
+    pub fn workspace(&self) -> Option<&Workspace> {
+        self.workspace.as_ref()
+    }
+
+    pub fn workspace_root(&self) -> Option<&std::path::Path> {
+        self.workspace.as_ref().map(Workspace::root)
+    }
+
+    pub fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+}
+
+/// Execution context for a resource-aware invocation whose declared
+/// capabilities have already been authorized.
+///
+/// This type deliberately has no authorization method. A resource-aware
+/// executor can use only the capabilities declared by its prepared invocation.
+pub struct AuthorizedToolContext {
+    execution: ToolContext,
+}
+
+impl AuthorizedToolContext {
+    pub(crate) fn from_execution(execution: ToolContext) -> Self {
+        Self { execution }
+    }
+
+    pub fn workspace(&self) -> Option<&Workspace> {
+        self.execution.workspace()
+    }
+
+    pub fn workspace_root(&self) -> Option<&std::path::Path> {
+        self.execution.workspace_root()
+    }
+
+    pub fn cancellation(&self) -> &CancellationToken {
+        self.execution.cancellation()
+    }
+
+    pub fn progress(&self) -> &ToolProgressSender {
+        self.execution.progress()
+    }
+
+    pub async fn request_host_input(
+        &self,
+        request: HostInputRequest,
+    ) -> Result<HostInputResponse, crate::Error> {
+        self.execution.request_host_input(request).await
+    }
+}
+
+/// Scheduler access mode for one resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolAccessMode {
+    Shared,
+    Exclusive,
+}
+
+/// Secret-safe category of a scheduler resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolResourceKind {
+    WorkspacePath,
+    DirectoryTree,
+    DirectoryMembership,
+    ManagedProcess,
+    SessionState,
+    ManagerState,
+    ResponseStore,
+    Opaque,
+}
+
+/// Resource identity used only to decide whether prepared calls may overlap.
+///
+/// Filesystem constructors expect canonical paths produced from the same
+/// resolved workspace facts that execution will revalidate. Debug output omits
+/// all resource values so paths, IDs, and tool-owned keys do not enter logs.
+#[derive(Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ToolResource {
+    WorkspacePath(PathBuf),
+    DirectoryTree(PathBuf),
+    DirectoryMembership(PathBuf),
+    ManagedProcess(String),
+    SessionState,
+    ManagerState(String),
+    ResponseStore(String),
+    Opaque { owner: String, key: String },
+}
+
+impl ToolResource {
+    pub fn workspace_path(canonical_path: impl Into<PathBuf>) -> Self {
+        Self::WorkspacePath(canonical_path.into())
+    }
+
+    pub fn directory_tree(canonical_path: impl Into<PathBuf>) -> Self {
+        Self::DirectoryTree(canonical_path.into())
+    }
+
+    pub fn directory_membership(canonical_path: impl Into<PathBuf>) -> Self {
+        Self::DirectoryMembership(canonical_path.into())
+    }
+
+    pub fn managed_process(id: impl Into<String>) -> Self {
+        Self::ManagedProcess(id.into())
+    }
+
+    pub fn session_state() -> Self {
+        Self::SessionState
+    }
+
+    pub fn manager_state(owner: impl Into<String>) -> Self {
+        Self::ManagerState(owner.into())
+    }
+
+    pub fn response_store(id: impl Into<String>) -> Self {
+        Self::ResponseStore(id.into())
+    }
+
+    /// Creates a tool-owned resource. The owner namespace prevents accidental
+    /// collisions between unrelated tools.
+    pub fn opaque(owner: impl Into<String>, key: impl Into<String>) -> Self {
+        Self::Opaque {
+            owner: owner.into(),
+            key: key.into(),
+        }
+    }
+
+    pub fn kind(&self) -> ToolResourceKind {
+        match self {
+            Self::WorkspacePath(_) => ToolResourceKind::WorkspacePath,
+            Self::DirectoryTree(_) => ToolResourceKind::DirectoryTree,
+            Self::DirectoryMembership(_) => ToolResourceKind::DirectoryMembership,
+            Self::ManagedProcess(_) => ToolResourceKind::ManagedProcess,
+            Self::SessionState => ToolResourceKind::SessionState,
+            Self::ManagerState(_) => ToolResourceKind::ManagerState,
+            Self::ResponseStore(_) => ToolResourceKind::ResponseStore,
+            Self::Opaque { .. } => ToolResourceKind::Opaque,
+        }
+    }
+}
+
+/// Resolves a tool's plan, authorizes its capabilities, and executes it.
+///
+/// This backs the default [`Tool::call`], so a resource-aware tool gets the
+/// path for free by overriding [`Tool::prepare`]. A tool that overrides neither
+/// method fails here with a clear error rather than delegating in a loop.
+pub fn call_prepared<'a>(
+    tool: &'a dyn Tool,
+    invocation: ToolInvocation,
+    execution: ToolContext,
+) -> ToolFuture<'a> {
+    call_prepared_for(tool, invocation, execution)
+}
+
+/// [`call_prepared`] for a caller holding `Self` rather than a trait object.
+///
+/// The default [`Tool::call`] needs this because `Self` is `?Sized` there and
+/// so cannot coerce to `&dyn Tool`. Kept separate so the public signature stays
+/// object-taking, which callers depend on.
+pub(crate) fn call_prepared_for<'a, T>(
+    tool: &'a T,
+    invocation: ToolInvocation,
+    execution: ToolContext,
+) -> ToolFuture<'a>
+where
+    T: Tool + ?Sized,
+{
+    Box::pin(async move {
+        let execution = execution.with_invocation_source(invocation.source());
+        let preparation = ToolPreparationContext::from_execution(&execution);
+        let prepared = tool.prepare(invocation, preparation).await?;
+        // Reaching here means `call` routed to `prepare`. A plan that routes
+        // back to `call` means the tool overrode neither, so stop rather than
+        // authorize and re-enter forever.
+        if prepared.is_from_default_prepare() {
+            return Err(ToolError::new(
+                ToolErrorKind::Execution,
+                format!(
+                    "tool '{}' implements neither Tool::call nor Tool::prepare; \
+                     it must implement one of them",
+                    tool.spec().name
+                ),
+            ));
+        }
+        for capability in prepared.capabilities() {
+            execution
+                .authorize(capability.clone())
+                .await
+                .map_err(|error| {
+                    if matches!(error.kind(), AuthorizationDenialKind::Cancelled) {
+                        ToolError::cancelled()
+                    } else {
+                        ToolError::policy_denied(&error)
+                    }
+                })?;
+        }
+        prepared.execute(execution).await
+    })
+}
+
+impl fmt::Debug for ToolResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolResource")
+            .field("kind", &self.kind())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One access in a resource-aware execution policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolResourceAccess {
+    resource: ToolResource,
+    mode: ToolAccessMode,
+}
+
+impl ToolResourceAccess {
+    pub fn new(resource: ToolResource, mode: ToolAccessMode) -> Self {
+        Self { resource, mode }
+    }
+
+    pub fn shared(resource: ToolResource) -> Self {
+        Self::new(resource, ToolAccessMode::Shared)
+    }
+
+    pub fn exclusive(resource: ToolResource) -> Self {
+        Self::new(resource, ToolAccessMode::Exclusive)
+    }
+
+    pub fn resource(&self) -> &ToolResource {
+        &self.resource
+    }
+
+    pub fn mode(&self) -> ToolAccessMode {
+        self.mode
+    }
+}
+
+/// Scheduling contract for one prepared invocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolExecutionPolicy {
+    ResourceAware { accesses: Vec<ToolResourceAccess> },
+    Exclusive,
+}
+
+/// Controls what the host does with an authorized tool future after cancellation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolCancellationPolicy {
+    /// Drop the tool future as soon as cancellation is observed.
+    #[default]
+    Abort,
+    /// Let the tool future return within the given cleanup deadline after it
+    /// observes cancellation.
+    Complete { timeout: std::time::Duration },
+}
+
+impl ToolExecutionPolicy {
+    pub fn resource_aware(accesses: impl IntoIterator<Item = ToolResourceAccess>) -> Self {
+        Self::ResourceAware {
+            accesses: accesses.into_iter().collect(),
+        }
+    }
+
+    pub fn accesses(&self) -> Option<&[ToolResourceAccess]> {
+        match self {
+            Self::ResourceAware { accesses } => Some(accesses),
+            Self::Exclusive => None,
+        }
+    }
+}
+
+type ExclusiveExecutor<'a> = Box<dyn FnOnce(ToolContext) -> ToolFuture<'a> + Send + 'a>;
+type ResourceAwareExecutor<'a> =
+    Box<dyn FnOnce(AuthorizedToolContext) -> ToolFuture<'a> + Send + 'a>;
+
+enum ToolExecutor<'a> {
+    Exclusive(ExclusiveExecutor<'a>),
+    ResourceAware(ResourceAwareExecutor<'a>),
+}
+
+/// Validated, fully planned state for one tool invocation.
+///
+/// The executor consumes the prepared state exactly once. Resource-aware
+/// executors receive [`AuthorizedToolContext`], which cannot request further
+/// capabilities after the coordinator authorizes `capabilities()`.
+pub struct PreparedToolInvocation<'a> {
+    execution: ToolExecutionPolicy,
+    cancellation: ToolCancellationPolicy,
+    capabilities: Vec<CapabilityRequest>,
+    metadata: ToolMetadata,
+    executor: ToolExecutor<'a>,
+    /// True only for the plan built by the default [`Tool::prepare`], the one
+    /// a tool gets when it does not implement `prepare` itself.
+    from_default_prepare: bool,
+}
+
+impl<'a> PreparedToolInvocation<'a> {
+    pub fn exclusive<F>(metadata: ToolMetadata, executor: F) -> Self
+    where
+        F: FnOnce(ToolContext) -> ToolFuture<'a> + Send + 'a,
+    {
+        Self {
+            execution: ToolExecutionPolicy::Exclusive,
+            cancellation: ToolCancellationPolicy::Abort,
+            capabilities: Vec::new(),
+            metadata,
+            executor: ToolExecutor::Exclusive(Box::new(executor)),
+            from_default_prepare: false,
+        }
+    }
+
+    /// Builds an exclusive plan with capabilities known during preparation.
+    ///
+    /// The executor keeps a full [`ToolContext`] so it can request host input
+    /// or authorize facts that cannot be known until execution, such as a
+    /// source module discovered from already-authorized input.
+    pub fn exclusive_with_capabilities<F>(
+        capabilities: impl IntoIterator<Item = CapabilityRequest>,
+        metadata: ToolMetadata,
+        executor: F,
+    ) -> Self
+    where
+        F: FnOnce(ToolContext) -> ToolFuture<'a> + Send + 'a,
+    {
+        Self {
+            execution: ToolExecutionPolicy::Exclusive,
+            cancellation: ToolCancellationPolicy::Abort,
+            capabilities: capabilities.into_iter().collect(),
+            metadata,
+            executor: ToolExecutor::Exclusive(Box::new(executor)),
+            from_default_prepare: false,
+        }
+    }
+
+    /// Builds the plan returned by the default [`Tool::prepare`].
+    ///
+    /// Rust cannot ask which trait methods a type overrode, so the plan records
+    /// that it came from the default. That is what lets [`call_prepared`] tell
+    /// a real `prepare` from the default one that points back at `call`.
+    pub(crate) fn from_default_prepare<F>(metadata: ToolMetadata, executor: F) -> Self
+    where
+        F: FnOnce(ToolContext) -> ToolFuture<'a> + Send + 'a,
+    {
+        Self {
+            from_default_prepare: true,
+            ..Self::exclusive(metadata, executor)
+        }
+    }
+
+    /// Reports whether this plan came from the default [`Tool::prepare`].
+    pub(crate) fn is_from_default_prepare(&self) -> bool {
+        self.from_default_prepare
+    }
+
+    pub fn resource_aware<F>(
+        accesses: impl IntoIterator<Item = ToolResourceAccess>,
+        capabilities: impl IntoIterator<Item = CapabilityRequest>,
+        metadata: ToolMetadata,
+        executor: F,
+    ) -> Self
+    where
+        F: FnOnce(AuthorizedToolContext) -> ToolFuture<'a> + Send + 'a,
+    {
+        Self {
+            execution: ToolExecutionPolicy::resource_aware(accesses),
+            cancellation: ToolCancellationPolicy::Abort,
+            capabilities: capabilities.into_iter().collect(),
+            metadata,
+            executor: ToolExecutor::ResourceAware(Box::new(executor)),
+            from_default_prepare: false,
+        }
+    }
+
+    pub fn execution_policy(&self) -> &ToolExecutionPolicy {
+        &self.execution
+    }
+
+    /// Keeps this authorized tool future alive until it completes after cancellation.
+    ///
+    /// Use this only when the executor has a measured cleanup bound and must
+    /// return typed final data produced during cleanup.
+    pub fn complete_after_cancellation(mut self, timeout: std::time::Duration) -> Self {
+        self.cancellation = ToolCancellationPolicy::Complete { timeout };
+        self
+    }
+
+    pub(crate) fn cancellation_policy(&self) -> ToolCancellationPolicy {
+        self.cancellation
+    }
+
+    pub fn capabilities(&self) -> &[CapabilityRequest] {
+        &self.capabilities
+    }
+
+    pub fn start_metadata(&self) -> &ToolMetadata {
+        &self.metadata
+    }
+
+    pub(crate) fn execute(self, execution: ToolContext) -> ToolFuture<'a> {
+        match self.executor {
+            ToolExecutor::Exclusive(executor) => executor(execution),
+            ToolExecutor::ResourceAware(executor) => {
+                executor(AuthorizedToolContext::from_execution(execution))
+            }
+        }
+    }
+}

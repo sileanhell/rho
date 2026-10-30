@@ -1,0 +1,403 @@
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use {crate::model_identity::PromptModel, crate::skills, rho_tools::tool::ToolSpec};
+
+pub(crate) mod agents_md;
+mod mcp_context;
+pub(crate) mod model_prompt_edit;
+mod model_prompt_template;
+pub(crate) mod model_prompts;
+mod project_instructions;
+pub(crate) use mcp_context::tool_sources_context;
+pub(crate) use model_prompt_template::{ModelPromptTemplate, PromptSession};
+pub(crate) use project_instructions::added_dir_context;
+
+pub const BASE_SYSTEM_PROMPT: &str = r#"You are a coding agent in the rho coding-agent harness, working with the user in a shared workspace. Use available tools to inspect files, run commands, and edit or create files.
+
+Match actions to the request: for reviews or diagnoses, inspect and explain; for implementations or fixes, modify files. Continue until resolved. Make reasonable in-scope assumptions, but ask when a missing decision would materially affect the result or require new authority.
+
+During substantial work, give concise progress updates. Preserve existing work and unrelated changes. Never run destructive commands unless explicitly requested. Verify changes in proportion to risk, then report the outcome and any remaining concerns."#;
+
+/// Label for the absolute session cwd line injected into the base system prompt.
+const CWD_PROMPT_LABEL: &str = "Your current working directory: ";
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSourceKind {
+    Base,
+    ModelAppend,
+    ModelReplace,
+    Agents,
+    Skills,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PromptSource {
+    pub kind: PromptSourceKind,
+    pub path: Option<String>,
+    pub bytes: usize,
+}
+
+pub struct SystemPrompt {
+    pub text: String,
+    pub sources: Vec<PromptSource>,
+    pub(crate) model_prompt: Option<model_prompts::ModelPrompt>,
+}
+
+/// How plugin skills are supplied to system prompt assembly.
+pub(crate) enum PluginSkills {
+    /// Discover loose and plugin skills from the filesystem.
+    #[allow(dead_code)] // retained so callers can opt into filesystem discovery
+    Discover,
+    /// Use the already-discovered plugin skill list (including empty).
+    Provided(Vec<skills::Skill>),
+}
+
+pub(crate) fn system_prompt_template_with_plugin_skills(
+    tools: &[ToolSpec],
+    cwd: &Path,
+    advisor: Option<&PromptModel>,
+    plugin_skills: Vec<skills::Skill>,
+) -> ModelPromptTemplate {
+    let home = crate::paths::home_dir();
+    system_prompt_template_with_home_and_plugin_skills(
+        tools,
+        cwd,
+        home.as_deref(),
+        advisor,
+        PluginSkills::Provided(plugin_skills),
+    )
+}
+
+fn system_prompt_template_with_home_and_plugin_skills(
+    tools: &[ToolSpec],
+    cwd: &Path,
+    home: Option<&Path>,
+    advisor: Option<&PromptModel>,
+    plugin_skills: PluginSkills,
+) -> ModelPromptTemplate {
+    let mut text = String::new();
+    // Absolute path so the model need not probe with `pwd`.
+    // Encoded as JSON string path data so control characters cannot split the
+    // system prompt into extra instruction lines.
+    text.push_str("\n\n");
+    text.push_str(CWD_PROMPT_LABEL);
+    text.push_str(&crate::paths::prompt_data(cwd));
+    text.push('\n');
+    let before_model = std::mem::take(&mut text);
+    // The advisor's model belongs here rather than on the `advisor` tool
+    // description, which must stay fixed once written: `/advisor` can change the
+    // reviewer without rebuilding the tool list.
+    if let Some(advisor) = advisor {
+        text.push_str(&format!(
+            "The `advisor` tool consults {}.\n",
+            advisor.describe(),
+        ));
+    }
+    text.push_str(
+        r#"
+Use tools only when needed. For questions answerable from context, reply directly.
+
+Use structured tool calls when available. Do not write tool calls in prose.
+
+Do not invent tool results. When done, answer directly.
+
+When structure is the point - architecture, control flow, state machines, request sequences, class or module relationships, or entity relationships - prefer a short Mermaid diagram over a long prose walkthrough. Always wrap valid Mermaid source in a closed `mermaid` fenced code block. Bare Mermaid source does not render.
+
+Use only flowchart, stateDiagram, sequenceDiagram, classDiagram, erDiagram, gitGraph, gantt, or mindmap. Prefer gitGraph for branch topology, gantt for scheduled parallel work, and mindmap for hierarchical exploration; keep flowcharts for architecture and control flow. For flowcharts, prefer top-down direction (`flowchart TD` or `flowchart TB`) over left-right. Keep diagrams small. Node and edge labels word-wrap, but width comes from siblings: keep at most 3-4 nodes on one rank and fan wider structure into extra depth instead. Edge labels cost horizontal corridor space; keep them to a few short words. Diagrams wider than the pane render clipped at the right edge, so put the important flow on the left or restructure. Skip diagrams for routine edits, simple answers, linear checklists, or anything that mostly restates bullets. The interactive transcript also renders CommonMark.
+
+For display math, use closed `$$ ... $$` blocks. The TUI renders a limited TeX subset (TXM), not full LaTeX: core commands (`\frac`, `\sqrt`, sums/integrals, Greek, `\mathbf`/`\mathrm`, `matrix`/`bmatrix`/`pmatrix`) work; prefer separate `$$` equations. Avoid `aligned`/`align`/`gather`, `\dfrac`, `\varepsilon`, and `\leq`/`\geq`/`\neq` (use `\frac`, `\epsilon`, `\le`/`\ge`/`\ne`). Keep formulas compact.
+
+Inline `$...$` math renders only when it fits one text row: simple superscripts or subscripts (`x^2`, `a_i`), Greek letters, and symbols. Taller inline formulas (`\frac`, summation limits, mixed `x_i^2` scripts) stay raw source text, so put those in `$$` blocks instead.
+"#,
+    );
+    let grep_available = tools.iter().any(|tool| tool.name == "grep");
+    if grep_available {
+        text.push_str(
+            r#"
+Prefer the `grep` tool over shell `rg` or `grep` for workspace content search. Use `files_with_matches` or `count` when you only need paths or tallies. Prefer `glob` over shell `fd` or `find` for file discovery when it is available.
+"#,
+        );
+    }
+    // Format-agnostic: mid-session edit-tool switches keep this system prompt
+    // fixed, so do not name a concrete edit surface or embed hashline policy.
+    // Concrete contracts live on the live tool description/schema.
+    if tools
+        .iter()
+        .any(|tool| rho_tools::EditFormat::is_edit_tool_name(tool.name.as_str()))
+    {
+        text.push_str(
+            "\nUse the live file-edit tool from the tool list for existing UTF-8 files. Prefer `write` only to create or fully rewrite a file.\n",
+        );
+    }
+    if tools
+        .iter()
+        .any(|tool| tool.name == crate::tools::code_mode::CODEMODE_TOOL_NAME)
+    {
+        text.push_str(
+            r#"
+Use `codemode` to batch independent tool calls with `call_tools`, chain dependent calls, or filter large output, instead of issuing many separate calls.
+Top-level `tool_search` loads its returned tools, including MCP tools, for direct calls on the next model request. Wait for search to finish before calling a loaded tool directly. Script-side `search_tools`, `list_tools`, and `describe_tool` are read-only: they do not load tools, but scripts can call discovered tools immediately with `call_tool` or `call_tools`.
+"#,
+        );
+    }
+    if tools.iter().any(|tool| tool.name == "agent") {
+        text.push_str(
+            r#"
+Work directly by default. A subagent starts with fresh context and adds latency, token use, and coordination overhead. Delegate only a substantial, self-contained task when the saved work is likely to exceed that cost.
+
+Do not delegate simple questions, routine codebase inspection, or small/local changes. Every agent call starts a background run and returns its id immediately. Independent agents in the same batch run together, so issue parallel work in one turn. Completions arrive automatically and wake an idle parent. Continue independent work, or end your turn when you need a child's result before proceeding. Do not poll for results or declare the task complete while required children are still running. Subagents share the workspace, so avoid overlapping edits.
+"#,
+        );
+    }
+    if tools
+        .iter()
+        .any(|tool| tool.name == crate::session::search::TOOL_NAME)
+    {
+        text.push_str(
+            r#"
+Compaction summarizes older turns, so earlier details can drop out of context. When you need something from earlier in this conversation that is no longer visible, such as an exact error, command, decision, path, or note, search for it with the `sessions` tool using `scope: "current"`, then read a match's `anchor` with the returned `session` and the same `scope: "current"`, instead of guessing or redoing the work. Elided tool-result stubs carry a `recall_id` for `action: "recall"`.
+"#,
+        );
+    }
+
+    let sources = vec![PromptSource {
+        kind: PromptSourceKind::Base,
+        path: None,
+        bytes: text.len(),
+    }];
+    let mut template =
+        ModelPromptTemplate::new(home, before_model, text, sources).with_project_instructions(cwd);
+    let mut text = String::new();
+    let mut sources = Vec::new();
+
+    let skills = if tools.iter().any(|tool| tool.name == "skill") {
+        match plugin_skills {
+            PluginSkills::Discover => skills::discover_with_home(cwd, home),
+            PluginSkills::Provided(plugin_skills) => {
+                skills::discover_with_plugin_skills(cwd, home, plugin_skills)
+            }
+        }
+        .into_iter()
+        .filter(|skill| !skill.disable_model_invocation)
+        .collect()
+    } else {
+        Vec::new()
+    };
+    if !skills.is_empty() {
+        let start = text.len();
+        text.push_str("\nAvailable skills from skill files, in alphabetical order:\n");
+        text.push_str("Use the skill tool to load a skill when the task matches its description. If a skill references relative paths, resolve them against the skill directory.\n");
+        text.push_str("<available_skills>\n");
+        for skill in skills {
+            text.push_str("  <skill>\n");
+            text.push_str("    <name>");
+            text.push_str(&skill.name);
+            text.push_str("</name>\n");
+            text.push_str("    <description>");
+            text.push_str(&skill.description);
+            text.push_str("</description>\n");
+            text.push_str("    <source>");
+            text.push_str(&skill.source.to_string());
+            text.push_str("</source>\n");
+            text.push_str("  </skill>\n");
+        }
+        text.push_str("</available_skills>\n");
+        sources.push(PromptSource {
+            kind: PromptSourceKind::Skills,
+            path: None,
+            bytes: text.len() - start,
+        });
+    }
+
+    template.append_section(text, sources);
+    template
+}
+
+pub fn append_subagents_disabled_instruction(text: &mut String) {
+    text.push_str("\n\nAgent delegation is disabled. Do not attempt to delegate work.\n");
+}
+
+/// Why a mid-session model notice is being appended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModelSwitchKind {
+    /// The conversation's own model changed.
+    Conversation,
+    /// The reviewer behind `advisor` changed while advisor mode stayed on.
+    Advisor,
+}
+
+/// Model and display text for a mid-session model notice.
+///
+/// Conversation switches also rebuild the system prompt. This line preserves
+/// the switch in conversation history without repeating the previous identity.
+pub(crate) fn model_switch_context(
+    kind: ModelSwitchKind,
+    current: &PromptModel,
+) -> (String, String) {
+    let label = match kind {
+        ModelSwitchKind::Conversation => "conversation model switched to",
+        ModelSwitchKind::Advisor => "advisor model switched to",
+    };
+    let display = format!("{label} {}", current.describe());
+    (format!("[{display}]\n"), display)
+}
+
+/// Model and display text when the `advisor` tool becomes available.
+///
+/// Steering lives on the tool description so the system prompt stays free of
+/// tool-list-dependent text. This notice announces availability, the reviewer
+/// model, and the schema.
+pub(crate) fn advisor_enabled_context(spec: &ToolSpec, model: &PromptModel) -> (String, String) {
+    let model = format!(
+        "[advisor mode on]\n\n\
+The `advisor` tool is now available and consults {}.\n\n\
+{}\n",
+        model.describe(),
+        tool_schema_block(spec),
+    );
+    let display = "advisor mode on".into();
+    (model, display)
+}
+
+/// Model and display text when the `advisor` tool is removed.
+pub fn advisor_disabled_context() -> (String, String) {
+    let model = "\
+[advisor mode off]\n\n\
+The `advisor` tool is no longer available. Do not call `advisor`. \
+Follow the live tool list.\n"
+        .into();
+    let display = "advisor mode off".into();
+    (model, display)
+}
+
+/// Model and display text for a `/codemode on|only` change.
+pub(crate) fn codemode_mode_context(mode: crate::config::CodemodeMode) -> (String, String) {
+    use crate::config::CodemodeMode;
+    let body = match mode {
+        CodemodeMode::On => {
+            "Direct tools are declared again next to `codemode`. Call them directly for \
+single steps; prefer `codemode` for multi-step work, MCP tools, or filtering large output."
+        }
+        CodemodeMode::Only => {
+            "Direct tools are hidden by default. Reach them with `call_tool` or \
+`call_tools` inside a `codemode` script; use `list_tools()` or `search_tools()` in the script \
+to find them without loading direct schemas. Top-level `tool_search` explicitly loads its \
+matches for direct calls on the next model request, even in this mode."
+        }
+    };
+    let label = mode.as_str();
+    let model = format!(
+        "[codemode {label}]\n\n{body} Nested calls follow the current permission mode \
+exactly like direct tool calls. Follow the live tool list.\n"
+    );
+    (model, format!("codemode {label}"))
+}
+
+/// Model and display text for a mid-session edit-tool switch.
+///
+/// The system prompt stays format-agnostic. This notice carries the new tool
+/// contract so the model stops using the previous surface.
+pub fn edit_tool_switch_context(
+    previous: rho_tools::EditFormat,
+    current: rho_tools::EditFormat,
+    spec: &ToolSpec,
+) -> (String, String) {
+    let previous_name = previous.tool_name();
+    let current_name = current.tool_name();
+    let model = format!(
+        "[edit tool switched]\n\n\
+The file edit tool changed mid-session. Do not call `{previous_name}` anymore.\n\
+Use `{current_name}` for edits to existing UTF-8 files from now on.\n\
+Prefer `write` only to create or fully rewrite a file.\n\
+Follow the live tool list.\n\n\
+Previous tool: `{previous_name}` ({previous_label})\n\
+Current tool: `{current_name}` ({current_label})\n\n\
+{schema}\n",
+        previous_label = previous.as_str(),
+        current_label = current.as_str(),
+        schema = tool_schema_block(spec),
+    );
+    let display = format!("edit tool switched to {}", current.as_str());
+    (model, display)
+}
+
+pub(crate) fn tool_schema_block(spec: &ToolSpec) -> String {
+    let schema = serde_json::to_string_pretty(&spec.input_schema).unwrap_or_else(|_| "{}".into());
+    format!(
+        "Tool schema for `{name}`:\n\
+description:\n\
+{description}\n\n\
+input_schema:\n\
+{schema}",
+        name = spec.name,
+        description = spec.description,
+        schema = schema,
+    )
+}
+
+fn push_context_file(out: &mut String, tag: &str, path: &Path, contents: &str) {
+    out.push('\n');
+    out.push('<');
+    out.push_str(tag);
+    out.push_str(" path=");
+    // Attribute grammar, not JSON: quotes and angle brackets must stay inside
+    // the attribute so they cannot close the tag early.
+    out.push_str(&crate::paths::prompt_attr(path));
+    out.push_str(">\n");
+    out.push_str(contents.trim_end());
+    out.push_str("\n</");
+    out.push_str(tag);
+    out.push_str(">\n");
+}
+
+/// Global, project, then added-directory AGENTS.md files, in load order.
+/// Each added directory contributes its own git-root-to-directory chain; a file
+/// already listed (a shared monorepo root, for example) loads once. Precedence
+/// holds only within a chain, so the prompt states it by directory depth.
+fn agent_instruction_files(
+    cwd: &Path,
+    added_dirs: &[PathBuf],
+    home: Option<&Path>,
+) -> Vec<(PathBuf, String)> {
+    read_existing_files(agent_instruction_paths(cwd, added_dirs, home))
+}
+
+/// Candidate AGENTS.md paths for [`agent_instruction_files`], existing or not.
+fn agent_instruction_paths(
+    cwd: &Path,
+    added_dirs: &[PathBuf],
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = home {
+        paths.push(crate::paths::user_agents_md(home));
+    }
+    for dir in std::iter::once(cwd).chain(added_dirs.iter().map(PathBuf::as_path)) {
+        for path in crate::workspace::project_ancestor_dirs(dir)
+            .into_iter()
+            .map(|path| path.join("AGENTS.md"))
+        {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+fn read_existing_files(paths: Vec<PathBuf>) -> Vec<(PathBuf, String)> {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            if !path.is_file() {
+                return None;
+            }
+            std::fs::read_to_string(&path)
+                .ok()
+                .map(|contents| (path, contents))
+        })
+        .collect()
+}

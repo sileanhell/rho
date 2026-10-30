@@ -1,0 +1,471 @@
+use rho_sdk::{
+    model::{ContextUsage, ModelUsage},
+    HostInputRequest, ModelCallMetrics, ModelCallProfile, RunEvent,
+};
+use {
+    crate::app::interactive_presenter::{InteractiveToolPresenter, PresentedToolCard},
+    rho_tools::tool_card::{ToolCard, ToolFamily, ToolHeader, ToolStatus},
+};
+
+use super::{
+    activity::{ActivityPhase, ProviderRetryHint},
+    compaction_display::compaction_call_id,
+};
+
+pub(super) use super::compaction_display::CompactionUiOutcome;
+
+#[derive(Clone, Debug)]
+pub(super) enum ViewModelEvent {
+    RunStarted,
+    StepStarted(usize),
+    SteeringApplied(Vec<rho_sdk::SteeringId>),
+    SteeringDelivered(rho_sdk::SteeringId),
+    ToolStarted {
+        call_id: rho_sdk::ToolCallId,
+        card: PresentedToolCard,
+    },
+    ProviderStreamReset(ProviderRetryHint),
+    ProviderRetry,
+    OutputDelta(String),
+    ReasoningDelta(String),
+    ContextUsage(ContextUsage),
+    Usage(ModelUsage),
+    ModelCallCompleted {
+        profile: ModelCallProfile,
+        metrics: ModelCallMetrics,
+    },
+    ToolUpdated {
+        call_id: rho_sdk::ToolCallId,
+        card: PresentedToolCard,
+    },
+    /// Display-only stream text for live usage estimates (tool-call JSON, etc.).
+    ///
+    /// Distinct from card/bind events so metering does not force tool previews
+    /// to re-render and card suppress logic stays pure.
+    LiveOutputText(String),
+    ToolCallUpdated {
+        index: usize,
+        call_id: Option<rho_sdk::ToolCallId>,
+        /// Present when the streamed preview card changed. Identity-only binds
+        /// may omit a card so the batch can attach a late call id without a
+        /// forced re-render.
+        card: Option<PresentedToolCard>,
+    },
+    /// Final proposal for a tool call, keyed only by call id.
+    ///
+    /// Distinct from stream `ToolCallUpdated` so proposal never invents a dense
+    /// index in the provider output_index namespace.
+    ToolCallProposed {
+        call_id: rho_sdk::ToolCallId,
+        card: PresentedToolCard,
+    },
+    ToolFinished {
+        call_id: rho_sdk::ToolCallId,
+        presentation: crate::presentation::Presentation,
+        image_asset: Option<rho_sdk::tool::ToolAsset>,
+    },
+    ToolDetached {
+        call_id: rho_sdk::ToolCallId,
+    },
+}
+
+impl ViewModelEvent {
+    pub(super) fn activity_phase(&self) -> Option<ActivityPhase> {
+        match self {
+            Self::RunStarted => Some(ActivityPhase::Starting),
+            // Compaction is tool-shaped; keep the dedicated activity phase via call id.
+            Self::ToolFinished { call_id, .. } if call_id == &compaction_call_id() => {
+                Some(ActivityPhase::Starting)
+            }
+            Self::ToolFinished { .. } => None,
+            Self::StepStarted(_) => Some(ActivityPhase::WaitingForProvider),
+            Self::ToolStarted { call_id, .. } if call_id == &compaction_call_id() => {
+                Some(ActivityPhase::Compacting)
+            }
+            Self::ToolStarted { .. } | Self::ToolUpdated { .. } | Self::ToolDetached { .. } => {
+                Some(ActivityPhase::RunningTool)
+            }
+            Self::ToolCallUpdated { .. } | Self::ToolCallProposed { .. } => {
+                Some(ActivityPhase::PreparingTool)
+            }
+            Self::ProviderStreamReset(_) | Self::ProviderRetry => {
+                Some(ActivityPhase::RetryingProvider)
+            }
+            Self::OutputDelta(_) => Some(ActivityPhase::Responding),
+            Self::ReasoningDelta(_) => Some(ActivityPhase::Thinking),
+            Self::LiveOutputText(_) => None,
+            _ => None,
+        }
+    }
+
+    /// Compaction replaced older history, so the next request cannot hit the
+    /// prompt prefix the previous one established.
+    ///
+    /// Keyed on the synthetic compaction call id here, in the module that owns
+    /// that id, so consumers stay free of call-id equality checks. Both the
+    /// main-loop compact job and in-run auto-compact close the card through
+    /// this event, so one predicate covers both.
+    pub(super) fn rewrites_prompt_prefix(&self) -> bool {
+        matches!(self, Self::ToolFinished { call_id, .. } if call_id == &compaction_call_id())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum ViewEvent {
+    Update(ViewModelEvent),
+    Questionnaire {
+        call_id: rho_sdk::ToolCallId,
+        request: HostInputRequest,
+    },
+    Notice(String),
+    Completed,
+    Cancelled,
+    Failed(String),
+}
+
+#[derive(Default)]
+pub(crate) struct SdkEventAdapter {
+    presenter: Option<InteractiveToolPresenter>,
+    compaction_open: bool,
+    /// Provider output_index -> call id already emitted for a streamed preview.
+    bound_stream_call_ids: std::collections::BTreeMap<usize, String>,
+    /// Provider output_index -> attachment journal key for live tool previews.
+    attachment_preview_keys: std::collections::BTreeMap<usize, String>,
+    /// call_id -> attachment journal key so later events reuse the preview slot.
+    attachment_call_keys: std::collections::BTreeMap<String, String>,
+}
+
+impl SdkEventAdapter {
+    /// `mcp_tools` identifies the session's MCP calls on their cards.
+    pub(crate) fn new(
+        cwd: std::path::PathBuf,
+        mcp_tools: crate::tools::mcp::exported_name::McpToolNames,
+    ) -> Self {
+        Self {
+            presenter: Some(InteractiveToolPresenter::new(cwd, mcp_tools)),
+            compaction_open: false,
+            bound_stream_call_ids: std::collections::BTreeMap::new(),
+            attachment_preview_keys: std::collections::BTreeMap::new(),
+            attachment_call_keys: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn presenter(&mut self) -> &mut InteractiveToolPresenter {
+        self.presenter.get_or_insert_with(|| {
+            InteractiveToolPresenter::new(
+                std::path::PathBuf::new(),
+                crate::tools::mcp::exported_name::McpToolNames::default(),
+            )
+        })
+    }
+
+    /// Adopt MCP tools that connected after this adapter was built.
+    pub(crate) fn set_mcp_tools(
+        &mut self,
+        mcp_tools: crate::tools::mcp::exported_name::McpToolNames,
+    ) {
+        self.presenter().set_mcp_tools(mcp_tools);
+    }
+
+    fn close_compaction(&mut self, outcome: CompactionUiOutcome) -> Option<ViewEvent> {
+        if !self.compaction_open {
+            return None;
+        }
+        self.compaction_open = false;
+        Some(ViewEvent::Update(compact_finished_event(outcome)))
+    }
+
+    /// Stable attachment key for a streaming preview, reusing the index slot when
+    /// a call id arrives later.
+    pub(crate) fn attachment_key_for_preview(
+        &mut self,
+        index: usize,
+        call_id: Option<&rho_sdk::ToolCallId>,
+    ) -> String {
+        if let Some(call_id) = call_id {
+            let id = call_id.to_string();
+            if let Some(key) = self.attachment_call_keys.get(&id).cloned() {
+                self.attachment_preview_keys.insert(index, key.clone());
+                return key;
+            }
+            if let Some(key) = self.attachment_preview_keys.get(&index).cloned() {
+                self.attachment_call_keys.insert(id, key.clone());
+                return key;
+            }
+            self.attachment_preview_keys.insert(index, id.clone());
+            self.attachment_call_keys.insert(id.clone(), id.clone());
+            return id;
+        }
+        self.attachment_preview_keys
+            .entry(index)
+            .or_insert_with(|| format!("preview:{index}"))
+            .clone()
+    }
+
+    /// Attachment key for a call-id-addressed event, preferring any prior preview.
+    pub(crate) fn attachment_key_for_call(&mut self, call_id: &rho_sdk::ToolCallId) -> String {
+        let id = call_id.to_string();
+        self.attachment_call_keys
+            .entry(id.clone())
+            .or_insert(id)
+            .clone()
+    }
+
+    /// Consume the key for a finished call so a later call can reuse the slot.
+    pub(crate) fn take_attachment_key_for_call(&mut self, call_id: &rho_sdk::ToolCallId) -> String {
+        let id = call_id.to_string();
+        let key = self
+            .attachment_call_keys
+            .remove(&id)
+            .unwrap_or_else(|| id.clone());
+        self.attachment_preview_keys
+            .retain(|_, existing| existing != &key);
+        key
+    }
+
+    pub(crate) fn clear_attachment_preview_keys(&mut self) {
+        self.bound_stream_call_ids.clear();
+        self.attachment_preview_keys.clear();
+        self.attachment_call_keys.clear();
+    }
+
+    /// Translates one SDK run event into zero or more view events.
+    ///
+    /// Compaction failures and cancellations emit a finished tool block before
+    /// the run terminal event so auto-compact shares the manual lifecycle.
+    pub(super) fn translate(&mut self, event: RunEvent) -> Vec<ViewEvent> {
+        match event {
+            RunEvent::Started { .. } => {
+                vec![ViewEvent::Update(ViewModelEvent::RunStarted)]
+            }
+            RunEvent::StepStarted { step, .. } => {
+                self.presenter().step_started();
+                self.bound_stream_call_ids.clear();
+                vec![ViewEvent::Update(ViewModelEvent::StepStarted(step))]
+            }
+            RunEvent::SteeringApplied { ids } => {
+                vec![ViewEvent::Update(ViewModelEvent::SteeringApplied(ids))]
+            }
+            RunEvent::SteeringDelivered { id } => {
+                vec![ViewEvent::Update(ViewModelEvent::SteeringDelivered(id))]
+            }
+            RunEvent::AssistantTextDelta { text } => {
+                vec![ViewEvent::Update(ViewModelEvent::OutputDelta(text))]
+            }
+            RunEvent::ReasoningDelta { text } | RunEvent::ReasoningSummaryDelta { text } => {
+                vec![ViewEvent::Update(ViewModelEvent::ReasoningDelta(text))]
+            }
+            RunEvent::ToolCallUpdated {
+                index,
+                id,
+                name,
+                arguments_delta,
+            } => {
+                // StreamCapture re-emits known identity on later deltas, so the
+                // first rendered preview can bind the call-id slot.
+                let call_id = id.and_then(|id| rho_sdk::ToolCallId::from_string(id).ok());
+                let newly_bound = call_id.as_ref().is_some_and(|call_id| {
+                    self.bound_stream_call_ids
+                        .insert(index, call_id.to_string())
+                        .as_deref()
+                        != Some(call_id.as_str())
+                });
+                let card = self
+                    .presenter()
+                    .preview(index, name, &arguments_delta)
+                    .map(|presented| presented.card);
+                let mut events = Vec::new();
+                if !arguments_delta.is_empty() {
+                    events.push(ViewEvent::Update(ViewModelEvent::LiveOutputText(
+                        arguments_delta,
+                    )));
+                }
+                // Emit when the card changed or a late call id needs to bind.
+                if card.is_some() || newly_bound {
+                    events.push(ViewEvent::Update(ViewModelEvent::ToolCallUpdated {
+                        index,
+                        call_id,
+                        card,
+                    }));
+                }
+                events
+            }
+            RunEvent::ToolProposed { call } => {
+                let Ok(call_id) = rho_sdk::ToolCallId::from_string(call.id.clone()) else {
+                    return Vec::new();
+                };
+                let presented = self.presenter().proposed(call);
+                vec![ViewEvent::Update(ViewModelEvent::ToolCallProposed {
+                    call_id,
+                    card: presented.card,
+                })]
+            }
+            RunEvent::ToolStarted {
+                call_id,
+                name,
+                metadata,
+            } => {
+                let presented = self.presenter().started(call_id.clone(), name, metadata);
+                vec![ViewEvent::Update(ViewModelEvent::ToolStarted {
+                    call_id,
+                    card: presented.card,
+                })]
+            }
+            RunEvent::ToolUpdated { call_id, progress } => {
+                let presented = self.presenter().updated(&call_id, &progress);
+                vec![ViewEvent::Update(ViewModelEvent::ToolUpdated {
+                    call_id,
+                    card: presented.card,
+                })]
+            }
+            RunEvent::ToolFinished { call_id, result } => {
+                let (_ok, presented) = self.presenter().finished(&call_id, result);
+                vec![ViewEvent::Update(ViewModelEvent::ToolFinished {
+                    call_id,
+                    presentation: presented.presentation,
+                    image_asset: presented.image_asset,
+                })]
+            }
+            RunEvent::ToolDetached { call_id } => {
+                vec![ViewEvent::Update(ViewModelEvent::ToolDetached { call_id })]
+            }
+            RunEvent::UsageUpdated { usage } => {
+                vec![ViewEvent::Update(ViewModelEvent::Usage(usage))]
+            }
+            RunEvent::ModelCallCompleted { profile, metrics } => {
+                vec![ViewEvent::Update(ViewModelEvent::ModelCallCompleted {
+                    profile,
+                    metrics,
+                })]
+            }
+            RunEvent::WebSearch { detail } => {
+                vec![provider_native_activity_finished(
+                    "web_search",
+                    detail,
+                    ToolFamily::Web,
+                )]
+            }
+            RunEvent::HostedToolActivity { name, detail } => {
+                vec![provider_native_activity_finished(
+                    &name,
+                    detail,
+                    hosted_tool_family(&name),
+                )]
+            }
+            RunEvent::ProviderRequestRetry => {
+                vec![ViewEvent::Update(ViewModelEvent::ProviderRetry)]
+            }
+            RunEvent::ProviderStreamReset { reason, .. } => {
+                self.presenter().step_started();
+                self.bound_stream_call_ids.clear();
+                vec![ViewEvent::Update(ViewModelEvent::ProviderStreamReset(
+                    ProviderRetryHint { reason },
+                ))]
+            }
+            RunEvent::ProviderContextUpdated { .. } => Vec::new(),
+            RunEvent::ProviderDiagnostic { detail } => {
+                vec![ViewEvent::Notice(format!(
+                    "provider diagnostic:\n{}",
+                    detail.as_str()
+                ))]
+            }
+            RunEvent::ProviderServiceTierFallback { .. } => Vec::new(),
+            RunEvent::HostInputRequested { request } => {
+                vec![ViewEvent::Questionnaire {
+                    call_id: rho_sdk::ToolCallId::new(),
+                    request,
+                }]
+            }
+            RunEvent::ToolHostInputRequested { call_id, request } => {
+                vec![ViewEvent::Questionnaire { call_id, request }]
+            }
+            RunEvent::CompactionStarted { .. } => {
+                self.compaction_open = true;
+                vec![ViewEvent::Update(compact_started_event())]
+            }
+            RunEvent::CompactionCompleted { outcome, .. } => {
+                self.compaction_open = false;
+                vec![ViewEvent::Update(compact_finished_event(
+                    CompactionUiOutcome::from_sdk_outcome(&outcome),
+                ))]
+            }
+            RunEvent::Completed { .. } => {
+                let mut events = Vec::new();
+                if let Some(finished) = self.close_compaction(CompactionUiOutcome::Unchanged {
+                    detail: "compaction ended without a result".into(),
+                }) {
+                    events.push(finished);
+                }
+                events.push(ViewEvent::Completed);
+                events
+            }
+            RunEvent::Cancelled { .. } => {
+                let mut events = Vec::new();
+                if let Some(finished) = self.close_compaction(CompactionUiOutcome::Cancelled) {
+                    events.push(finished);
+                }
+                events.push(ViewEvent::Cancelled);
+                events
+            }
+            RunEvent::Failed { message, .. } => {
+                let mut events = Vec::new();
+                if let Some(finished) =
+                    self.close_compaction(CompactionUiOutcome::failed(message.clone()))
+                {
+                    events.push(finished);
+                }
+                events.push(ViewEvent::Failed(message));
+                events
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Same compact-card open the main-loop job applies.
+pub(super) fn compact_started_event() -> ViewModelEvent {
+    ViewModelEvent::ToolStarted {
+        call_id: compaction_call_id(),
+        card: super::compaction_display::running_card().into(),
+    }
+}
+
+fn hosted_tool_family(name: &str) -> ToolFamily {
+    match name {
+        // Hosted X Search is a network lookup; keep the web chrome.
+        "x_search" => ToolFamily::Web,
+        _ => ToolFamily::Default,
+    }
+}
+
+fn provider_native_activity_finished(name: &str, detail: String, family: ToolFamily) -> ViewEvent {
+    // Hosted activity card: verb-only header, optional detail fact, then
+    // "finished". Keeps operator-heavy queries out of `verb(primary)` parens
+    // and gives every hosted lookup the same chrome (not search-only).
+    let mut card = ToolCard::new(ToolStatus::Ok, family, ToolHeader::call(name, None));
+    let detail = detail.trim();
+    if !detail.is_empty() {
+        card.push_fact(rho_tools::tool_card::ToolFact::Text {
+            text: detail.to_owned(),
+        });
+    }
+    // Hosted lookups have no client result body; keep a finished fact so the
+    // card is not a bare header.
+    card.push_fact(rho_tools::tool_card::ToolFact::Meta {
+        text: "finished".into(),
+    });
+    ViewEvent::Update(ViewModelEvent::ToolFinished {
+        call_id: rho_sdk::ToolCallId::new(),
+        presentation: card.into(),
+        image_asset: None,
+    })
+}
+
+/// Same compact-card close the main-loop job applies.
+pub(super) fn compact_finished_event(outcome: CompactionUiOutcome) -> ViewModelEvent {
+    ViewModelEvent::ToolFinished {
+        call_id: compaction_call_id(),
+        presentation: outcome.card().into(),
+        image_asset: None,
+    }
+}

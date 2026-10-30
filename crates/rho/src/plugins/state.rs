@@ -1,0 +1,606 @@
+//! Durable plugin activation state.
+//!
+//! Enable and disable choices live outside package directories so install,
+//! link, and package updates never rewrite user policy. User state lives under
+//! the Rho data root (`$RHO_HOME` or `~/.rho`). Project state lives at
+//! `<repository>/.rho/plugins.toml` (or `<cwd>/.rho/plugins.toml` outside a
+//! git worktree). Missing files mean every discovered plugin is enabled.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
+
+use serde::{Deserialize, Serialize};
+
+use crate::config_writer;
+
+const STATE_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PluginScope {
+    Project,
+    User,
+}
+
+impl PluginScope {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::User => "user",
+        }
+    }
+}
+
+/// How a package entered a managed plugins root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PluginOrigin {
+    /// Placed by hand or by another tool under a discovery root.
+    Local,
+    /// Copied into a managed root by `rho plugins install`.
+    Install,
+    /// Symlinked into a managed root by `rho plugins link`.
+    Link,
+    /// Copied from a git repository by `rho plugins install <url>`.
+    Git,
+}
+
+impl PluginOrigin {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Install => "install",
+            Self::Link => "link",
+            Self::Git => "git",
+        }
+    }
+}
+
+/// The git source and commit a package was installed from.
+///
+/// `rho plugins update` refetches `url` at `ref` and replaces the package when
+/// the fetched commit differs from `commit`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GitRecord {
+    pub(crate) url: String,
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub(crate) git_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subdir: Option<String>,
+    pub(crate) commit: String,
+}
+
+/// How Rho placed a package into a managed root.
+///
+/// Stored as `origin` plus its payload (`link_target` or a `git` table) in
+/// `plugins.toml`; see [`StoredEntry`] for the on-disk shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum InstallRecord {
+    Copy,
+    Link { target: String },
+    Git(GitRecord),
+}
+
+impl InstallRecord {
+    pub(crate) fn origin(&self) -> PluginOrigin {
+        match self {
+            Self::Copy => PluginOrigin::Install,
+            Self::Link { .. } => PluginOrigin::Link,
+            Self::Git(_) => PluginOrigin::Git,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PluginStateStore {
+    pub(crate) user: PluginStateFile,
+    pub(crate) project: PluginStateFile,
+    pub(crate) user_path: PathBuf,
+    pub(crate) project_path: PathBuf,
+    /// Whether `cwd` has project plugins roots, so `project` was loaded.
+    project_scope: bool,
+    /// User plugins disabled by an older Rho in the project state file of a
+    /// repository rooted at `$HOME`; see [`Self::load`].
+    home_disables: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PluginStateFile {
+    #[serde(default = "default_version")]
+    pub(crate) version: u32,
+    #[serde(default)]
+    pub(crate) plugins: BTreeMap<String, PluginStateEntry>,
+}
+
+impl Default for PluginStateFile {
+    fn default() -> Self {
+        Self {
+            version: STATE_VERSION,
+            plugins: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "StoredEntry", into = "StoredEntry")]
+pub(crate) struct PluginStateEntry {
+    /// Absent means enabled. Explicit `false` disables the package.
+    pub(crate) enabled: bool,
+    /// How Rho installed the package; `None` for hand-placed packages.
+    pub(crate) install: Option<InstallRecord>,
+}
+
+impl Default for PluginStateEntry {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            install: None,
+        }
+    }
+}
+
+/// On-disk shape of one `[plugins.<name>]` entry.
+///
+/// Only combinations Rho writes are accepted, so `origin` always agrees with
+/// its payload once parsed into [`PluginStateEntry`].
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredEntry {
+    #[serde(default = "default_enabled", skip_serializing_if = "is_true")]
+    enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<PluginOrigin>,
+    /// Absolute path recorded for linked packages (display and inspect only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    link_target: Option<String>,
+    /// Source recorded for git-installed packages; read by `rho plugins update`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    git: Option<GitRecord>,
+}
+
+impl TryFrom<StoredEntry> for PluginStateEntry {
+    type Error = String;
+
+    fn try_from(stored: StoredEntry) -> Result<Self, String> {
+        let install = match (stored.origin, stored.link_target, stored.git) {
+            (None, None, None) => None,
+            (Some(PluginOrigin::Install), None, None) => Some(InstallRecord::Copy),
+            (Some(PluginOrigin::Link), Some(target), None) => Some(InstallRecord::Link { target }),
+            (Some(PluginOrigin::Git), None, Some(git)) => Some(InstallRecord::Git(git)),
+            (origin, link_target, git) => {
+                let origin = origin.map_or("(none)", PluginOrigin::as_str);
+                return Err(format!(
+                    "origin {origin} does not match its fields (link_target: {}, git: {})",
+                    presence(link_target.is_some()),
+                    presence(git.is_some()),
+                ));
+            }
+        };
+        Ok(Self {
+            enabled: stored.enabled,
+            install,
+        })
+    }
+}
+
+fn presence(present: bool) -> &'static str {
+    if present {
+        "present"
+    } else {
+        "absent"
+    }
+}
+
+impl From<PluginStateEntry> for StoredEntry {
+    fn from(entry: PluginStateEntry) -> Self {
+        let (origin, link_target, git) = match entry.install {
+            None => (None, None, None),
+            Some(InstallRecord::Copy) => (Some(PluginOrigin::Install), None, None),
+            Some(InstallRecord::Link { target }) => (Some(PluginOrigin::Link), Some(target), None),
+            Some(InstallRecord::Git(git)) => (Some(PluginOrigin::Git), None, Some(git)),
+        };
+        Self {
+            enabled: entry.enabled,
+            origin,
+            link_target,
+            git,
+        }
+    }
+}
+
+fn default_version() -> u32 {
+    STATE_VERSION
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+impl PluginStateStore {
+    /// Load user and project state for `cwd`. Missing files are empty defaults.
+    ///
+    /// Project state loads whenever `cwd` has project plugins roots
+    /// ([`project_plugin_dirs`]), including nested roots in a repository
+    /// rooted at `$HOME`. Without any, project scope does not exist and its
+    /// state file is not loaded as one.
+    ///
+    /// When the project root is `$HOME` and `RHO_HOME` is separate, older
+    /// builds recorded `disable` of user plugins from there in the project
+    /// state file. Those disables keep the user plugin off until `enable`,
+    /// `remove` or a fresh install clears them; with no project scope the file
+    /// is read only for them, leniently.
+    pub(crate) fn load(
+        cwd: &Path,
+        home: Option<&Path>,
+        rho_home: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        let mut store = Self {
+            user_path: user_state_path(rho_home)?,
+            project_scope: !project_plugin_dirs(cwd, home).is_empty(),
+            ..Self::empty(cwd, rho_home)
+        };
+        store.user = load_file(&store.user_path)?;
+        if store.project_scope {
+            store.project = load_file(&store.project_path)?;
+        }
+        let home_root = home.is_some_and(|home| project_plugins_root(cwd, home).is_none());
+        if home_root && !same_location(&store.project_path, &store.user_path) {
+            store.home_disables = if store.project_scope {
+                disabled_in(&store.project)
+            } else {
+                read_disabled(&store.project_path)
+            };
+        }
+        Ok(store)
+    }
+
+    /// Empty store with paths resolved for `cwd` (tests and fallback loads).
+    pub(crate) fn empty(cwd: &Path, rho_home: Option<&Path>) -> Self {
+        Self {
+            user: PluginStateFile::default(),
+            project: PluginStateFile::default(),
+            user_path: user_state_path(rho_home).unwrap_or_else(|_| PathBuf::from("plugins.toml")),
+            project_path: project_state_path(cwd),
+            project_scope: true,
+            home_disables: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn is_enabled(&self, scope: PluginScope, name: &str) -> bool {
+        let recorded = self
+            .file(scope)
+            .plugins
+            .get(name)
+            .is_none_or(|entry| entry.enabled);
+        recorded && !(scope == PluginScope::User && self.home_disables.contains(name))
+    }
+
+    pub(crate) fn entry(&self, scope: PluginScope, name: &str) -> Option<&PluginStateEntry> {
+        self.file(scope).plugins.get(name)
+    }
+
+    pub(crate) fn install_record(&self, scope: PluginScope, name: &str) -> Option<&InstallRecord> {
+        self.entry(scope, name)
+            .and_then(|entry| entry.install.as_ref())
+    }
+
+    pub(crate) fn git_record(&self, scope: PluginScope, name: &str) -> Option<&GitRecord> {
+        match self.install_record(scope, name)? {
+            InstallRecord::Git(git) => Some(git),
+            InstallRecord::Copy | InstallRecord::Link { .. } => None,
+        }
+    }
+
+    /// Names of packages in `scope` that were installed from git.
+    pub(crate) fn git_installed(&self, scope: PluginScope) -> Vec<String> {
+        self.file(scope)
+            .plugins
+            .iter()
+            .filter(|(_, entry)| matches!(entry.install, Some(InstallRecord::Git(_))))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    pub(crate) fn origin(
+        &self,
+        scope: PluginScope,
+        name: &str,
+        package_path: &Path,
+    ) -> PluginOrigin {
+        if let Some(record) = self.install_record(scope, name) {
+            return record.origin();
+        }
+        match std::fs::symlink_metadata(package_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => PluginOrigin::Link,
+            _ => PluginOrigin::Local,
+        }
+    }
+
+    pub(crate) fn set_enabled(
+        &mut self,
+        scope: PluginScope,
+        name: &str,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        self.update_scope(scope, |file| {
+            let entry = file.plugins.entry(name.to_string()).or_default();
+            entry.enabled = enabled;
+            Ok(())
+        })?;
+        if enabled {
+            self.clear_home_disable(scope, name)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_install(
+        &mut self,
+        scope: PluginScope,
+        name: &str,
+        record: InstallRecord,
+    ) -> anyhow::Result<()> {
+        self.update_scope(scope, |file| {
+            let entry = file.plugins.entry(name.to_string()).or_default();
+            entry.install = Some(record);
+            // Fresh installs start enabled even if a prior disable entry remained.
+            entry.enabled = true;
+            Ok(())
+        })?;
+        self.clear_home_disable(scope, name)
+    }
+
+    /// Record a new commit for a git-installed package, keeping enablement.
+    pub(crate) fn record_git_update(
+        &mut self,
+        scope: PluginScope,
+        name: &str,
+        git: GitRecord,
+    ) -> anyhow::Result<()> {
+        self.update_scope(scope, |file| {
+            let entry = file.plugins.entry(name.to_string()).or_default();
+            entry.install = Some(InstallRecord::Git(git));
+            Ok(())
+        })
+    }
+
+    pub(crate) fn clear_package_record(
+        &mut self,
+        scope: PluginScope,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        self.update_scope(scope, |file| {
+            file.plugins.remove(name);
+            Ok(())
+        })?;
+        self.clear_home_disable(scope, name)
+    }
+
+    /// Drop a user plugin's older-build disable from the project state file.
+    fn clear_home_disable(&mut self, scope: PluginScope, name: &str) -> anyhow::Result<()> {
+        if scope != PluginScope::User || !self.home_disables.remove(name) {
+            return Ok(());
+        }
+        // The file keys by name, so a same-named nested project plugin in a
+        // repository rooted at `$HOME` shares this entry, as it did before.
+        self.update_scope(PluginScope::Project, |file| {
+            if let Some(entry) = file.plugins.get_mut(name) {
+                entry.enabled = true;
+            }
+            Ok(())
+        })?;
+        if !self.project_scope {
+            // No project scope here, so the store keeps no copy of its file.
+            self.project = PluginStateFile::default();
+        }
+        Ok(())
+    }
+
+    fn file(&self, scope: PluginScope) -> &PluginStateFile {
+        match scope {
+            PluginScope::User => &self.user,
+            PluginScope::Project => &self.project,
+        }
+    }
+
+    fn file_mut(&mut self, scope: PluginScope) -> &mut PluginStateFile {
+        match scope {
+            PluginScope::User => &mut self.user,
+            PluginScope::Project => &mut self.project,
+        }
+    }
+
+    /// Serialize one scope mutation under a lock that covers reload + write.
+    fn update_scope<F>(&mut self, scope: PluginScope, mutate: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut PluginStateFile) -> anyhow::Result<()>,
+    {
+        let path = self.path(scope).to_path_buf();
+        let _guard = lock_scope_state(&path)?;
+        // Reload under the lock so concurrent writers cannot lose updates.
+        *self.file_mut(scope) = load_file(&path)?;
+        mutate(self.file_mut(scope))?;
+        self.persist_locked(scope)
+    }
+
+    fn path(&self, scope: PluginScope) -> &Path {
+        match scope {
+            PluginScope::User => &self.user_path,
+            PluginScope::Project => &self.project_path,
+        }
+    }
+
+    fn persist_locked(&self, scope: PluginScope) -> anyhow::Result<()> {
+        let path = self.path(scope);
+        let mut file = self.file(scope).clone();
+        // Drop inert default entries so a clean tree does not keep noise.
+        file.plugins
+            .retain(|_, entry| entry != &PluginStateEntry::default());
+        // Drop empty files so a clean tree does not keep an inert plugins.toml.
+        if file.plugins.is_empty() {
+            match std::fs::remove_file(path) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let serialized = toml::to_string_pretty(&file)?;
+        config_writer::write_atomically(path, &serialized)
+    }
+}
+
+fn lock_scope_state(path: &Path) -> anyhow::Result<rho_providers::file_lock::FileLock> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = scope_lock_path(path);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "cannot open plugin state lock {}: {error}",
+                crate::paths::display(&lock_path)
+            )
+        })?;
+    rho_providers::file_lock::FileLock::acquire(file).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot lock plugin state {}: {error}",
+            crate::paths::display(&lock_path)
+        )
+    })
+}
+
+fn scope_lock_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("plugins.toml");
+    path.with_file_name(format!(".{file_name}.lock"))
+}
+
+pub(crate) fn user_state_path(rho_home: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let root = match rho_home {
+        Some(path) => path.to_path_buf(),
+        None => crate::paths::rho_dir()?,
+    };
+    Ok(root.join("plugins.toml"))
+}
+
+pub(crate) fn project_state_path(cwd: &Path) -> PathBuf {
+    project_root(cwd).join(".rho").join("plugins.toml")
+}
+
+/// Repository root when inside a git worktree, otherwise `cwd`.
+pub(crate) fn project_root(cwd: &Path) -> PathBuf {
+    crate::workspace::project_ancestor_dirs(cwd)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| cwd.to_path_buf())
+}
+
+pub(crate) fn plugins_root_at(dir: &Path) -> PathBuf {
+    dir.join(".agents").join("plugins")
+}
+
+pub(crate) fn user_plugins_root(home: &Path) -> PathBuf {
+    plugins_root_at(home)
+}
+
+/// Project plugins root for `cwd`, or `None` when the project root shares the
+/// user plugins root (see [`shares_user_plugins_root`]). Project scope then has
+/// no packages of its own; that folder is user scope.
+pub(crate) fn project_plugins_root(cwd: &Path, home: &Path) -> Option<PathBuf> {
+    let project = project_root(cwd);
+    (!shares_user_plugins_root(&project, home)).then(|| plugins_root_at(&project))
+}
+
+/// Project directories whose `.agents/plugins` are project plugins roots for
+/// `cwd`, nearest first. Ancestors that share the user plugins root are
+/// dropped so that folder is only ever user scope.
+pub(crate) fn project_plugin_dirs(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    crate::workspace::project_ancestor_dirs(cwd)
+        .into_iter()
+        .rev()
+        .filter(|dir| home.is_none_or(|home| !shares_user_plugins_root(dir, home)))
+        .collect()
+}
+
+/// Whether project directory `dir` has the user plugins root as its plugins
+/// root, as when it is `$HOME` (no repository, or a dotfiles repository) or its
+/// `.agents/plugins` links there. Discovery and management both use this so
+/// that folder is only ever user scope.
+///
+/// The directories are compared too because the plugins roots usually do not
+/// exist before a first install, and `cwd` is physical while `$HOME` may pass
+/// through a symlink (`/home` -> `/var/home`).
+pub(crate) fn shares_user_plugins_root(dir: &Path, home: &Path) -> bool {
+    same_location(dir, home) || same_location(&plugins_root_at(dir), &user_plugins_root(home))
+}
+
+/// Whether `a` and `b` name the same location, compared as given and then
+/// canonically when both exist.
+pub(crate) fn same_location(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
+fn load_file(path: &Path) -> anyhow::Result<PluginStateFile> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_state_file(&text)
+            .map_err(|error| anyhow::anyhow!("invalid plugin state {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(PluginStateFile::default())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Names `file` disables.
+fn disabled_in(file: &PluginStateFile) -> BTreeSet<String> {
+    file.plugins
+        .iter()
+        .filter(|(_, entry)| !entry.enabled)
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Names disabled in the state file at `path`. Unreadable files only warn:
+/// the caller reads them for compatibility, not as a scope it manages.
+fn read_disabled(path: &Path) -> BTreeSet<String> {
+    match load_file(path) {
+        Ok(file) => disabled_in(&file),
+        Err(error) => {
+            tracing::warn!(
+                path = %crate::paths::display(path),
+                %error,
+                "ignoring unreadable plugin state"
+            );
+            BTreeSet::new()
+        }
+    }
+}
+
+pub(crate) fn parse_state_file(text: &str) -> Result<PluginStateFile, String> {
+    let file: PluginStateFile = toml::from_str(text).map_err(|error| error.to_string())?;
+    if file.version != STATE_VERSION {
+        return Err(format!(
+            "unsupported plugins.toml version {} (expected {STATE_VERSION})",
+            file.version
+        ));
+    }
+    for name in file.plugins.keys() {
+        super::manifest::validate_plugin_name(name)
+            .map_err(|error| format!("invalid plugin key `{name}`: {error}"))?;
+    }
+    Ok(file)
+}

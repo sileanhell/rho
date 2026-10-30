@@ -1,0 +1,159 @@
+use std::{ops::ControlFlow, path::Path};
+
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::{
+    path_glob::PathGlob,
+    search::{
+        clamp_limit, stop_reasons, with_reasons, NarrowHint, WorkspaceSearch, DEFAULT_MAX_RESULTS,
+        MAX_RESULTS_CEILING, SEARCH_DEADLINE,
+    },
+    tool::{ToolError, ToolSpec},
+    workspace_walk::{visit_files, HiddenFiles, WalkLimits, WalkOptions, WalkStop, WalkedFile},
+};
+
+/// How glob tells the model to shrink a search.
+const NARROW: NarrowHint = NarrowHint("the pattern or path");
+
+#[derive(Clone, Copy)]
+pub(crate) struct GlobSearch;
+
+#[derive(Deserialize)]
+struct Args {
+    pattern: String,
+    path: Option<String>,
+    include_hidden: Option<bool>,
+    max_results: Option<usize>,
+}
+
+pub(crate) struct GlobRequest {
+    pub(crate) path: String,
+    pattern_display: String,
+    glob: PathGlob,
+    hidden: HiddenFiles,
+    max_results: usize,
+}
+
+impl GlobRequest {
+    pub(crate) fn from_arguments(args: Value) -> Result<Self, ToolError> {
+        let args: Args = serde_json::from_value(args)?;
+        Ok(Self {
+            pattern_display: args.pattern.clone(),
+            glob: PathGlob::compile(&args.pattern)?,
+            path: args.path.unwrap_or_else(|| ".".into()),
+            hidden: if args.include_hidden.unwrap_or(false) {
+                HiddenFiles::Include
+            } else {
+                HiddenFiles::Skip
+            },
+            max_results: clamp_limit(args.max_results, DEFAULT_MAX_RESULTS, MAX_RESULTS_CEILING),
+        })
+    }
+}
+
+impl WorkspaceSearch for GlobSearch {
+    type Request = GlobRequest;
+    type Output = GlobOutput;
+
+    const NAME: &'static str = "glob";
+
+    fn spec() -> ToolSpec {
+        ToolSpec {
+            name: Self::NAME.into(),
+            description: "Finds files matching a glob pattern under a directory. Skips ignored and hidden files. Returns relative paths in directory order.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob pattern. Without `/` it matches file names at any depth; with `/` it matches paths relative to `path`. `*` does not cross `/`; use `**` for any depth. A leading `!` excludes matches instead."},
+                    "path": {"type": "string", "description": "Directory to search. Defaults to the working directory."},
+                    "include_hidden": {"type": "boolean", "description": "Include hidden files. Defaults to false."},
+                    "max_results": {"type": "integer", "minimum": 1, "description": "Maximum paths to return. Defaults to 200, capped at 1000."}
+                },
+                "required": ["pattern"]
+            }),
+        }
+    }
+
+    fn parse(arguments: Value) -> Result<GlobRequest, ToolError> {
+        GlobRequest::from_arguments(arguments)
+    }
+
+    fn root(request: &GlobRequest) -> &str {
+        &request.path
+    }
+
+    fn run(
+        &self,
+        root: &Path,
+        display_root: &str,
+        request: &GlobRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<crate::Rendered<GlobOutput>, ToolError> {
+        glob_search(root, display_root, request, cancelled)
+    }
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct GlobOutput {
+    /// Paths relative to the searched directory.
+    paths: Vec<String>,
+    stopped: Vec<crate::search::Stopped>,
+}
+
+pub(crate) fn glob_search(
+    root: &Path,
+    display_root: &str,
+    request: &GlobRequest,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<crate::Rendered<GlobOutput>, ToolError> {
+    let options = WalkOptions {
+        hidden: request.hidden,
+        limits: WalkLimits::within(SEARCH_DEADLINE),
+    };
+
+    let mut matches = Vec::new();
+    let walk_stop = visit_files(root, &options, |file: WalkedFile| {
+        if cancelled() {
+            return ControlFlow::Break(WalkStop::Cancelled);
+        }
+        if !request.glob.matches(&file.relative) {
+            return ControlFlow::Continue(());
+        }
+        matches.push(file.relative);
+        if matches.len() >= request.max_results {
+            ControlFlow::Break(WalkStop::ResultLimit)
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+
+    let reasons = stop_reasons(walk_stop, /*per_file_truncated*/ 0);
+    let data = GlobOutput {
+        paths: matches,
+        stopped: crate::search::stopped(&reasons),
+    };
+    let matches = &data.paths;
+    if matches.is_empty() {
+        // Still report why, so a walk cut short by a limit or a cancellation is
+        // never mistaken for a directory with no matching files.
+        let counts = format!(
+            "no files matching '{}' under {display_root}",
+            request.pattern_display
+        );
+        return Ok(crate::Rendered::new(
+            with_reasons(counts, &reasons, NARROW),
+            data,
+        ));
+    }
+
+    let counts = format!("{} files", matches.len());
+    Ok(crate::Rendered::new(
+        format!(
+            "{}\n\n{}",
+            matches.join("\n"),
+            with_reasons(counts, &reasons, NARROW)
+        ),
+        data,
+    ))
+}

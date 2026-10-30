@@ -1,0 +1,899 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, Mutex, MutexGuard, RwLock,
+    },
+};
+
+use crate::{
+    client::Rho,
+    event::RunOutcome,
+    model::{ContentBlock, ImageContent, Message, ToolCall},
+    orchestration::execute_run,
+    provider::ModelProvider,
+    run::Run,
+    Error, Revision, RunId, SessionId,
+};
+
+#[path = "session_checkpoint.rs"]
+mod checkpoint;
+#[path = "session_context.rs"]
+mod context;
+#[path = "session_request.rs"]
+mod request;
+pub(crate) use checkpoint::CommitMark;
+pub use request::SessionRequestPrefix;
+
+/// Validated user input accepted by a session run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UserInput {
+    content: Vec<ContentBlock>,
+}
+
+/// How a run begins.
+pub(crate) enum RunStart {
+    /// Append user input, then ask the model.
+    User(UserInput),
+    /// Append user input, then run a batch of host-requested tool calls before
+    /// the model.
+    WithToolCalls {
+        input: UserInput,
+        calls: HostToolCalls,
+    },
+    /// Keep committed history as is. Unanswered tool calls are settled first.
+    Continue,
+}
+
+impl UserInput {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            content: vec![ContentBlock::Text(text.into())],
+        }
+    }
+
+    pub fn content(content: Vec<ContentBlock>) -> Result<Self, Error> {
+        if content.is_empty() {
+            return Err(Error::InvalidConfiguration {
+                message: "user input must contain at least one content block".into(),
+            });
+        }
+        Ok(Self { content })
+    }
+
+    pub fn text_and_images(
+        text: impl Into<String>,
+        images: impl IntoIterator<Item = ImageContent>,
+    ) -> Self {
+        let mut content = vec![ContentBlock::Text(text.into())];
+        content.extend(images.into_iter().map(ContentBlock::Image));
+        Self { content }
+    }
+
+    pub fn blocks(&self) -> &[ContentBlock] {
+        &self.content
+    }
+
+    pub(crate) fn into_blocks(self) -> Vec<ContentBlock> {
+        self.content
+    }
+}
+
+/// Host-requested tool calls that one assistant message can carry, like a
+/// valid model response: nonempty, every call well formed, and IDs unique.
+pub(crate) struct HostToolCalls(Vec<ToolCall>);
+
+impl HostToolCalls {
+    fn new(calls: Vec<ToolCall>) -> Result<Self, Error> {
+        if calls.is_empty() {
+            return Err(Error::InvalidConfiguration {
+                message: "host tool call batch must contain at least one call".into(),
+            });
+        }
+        let mut ids = BTreeSet::new();
+        for (index, call) in calls.iter().enumerate() {
+            if !call.has_valid_protocol_fields() {
+                return Err(Error::InvalidConfiguration {
+                    message: format!(
+                        "host tool call {index} requires a nonempty ID and name plus object arguments"
+                    ),
+                });
+            }
+            if !ids.insert(call.id.as_str()) {
+                return Err(Error::InvalidConfiguration {
+                    message: format!("duplicate host tool call ID '{}'", call.id),
+                });
+            }
+        }
+        Ok(Self(calls))
+    }
+
+    pub(crate) fn calls(&self) -> &[ToolCall] {
+        &self.0
+    }
+
+    pub(crate) fn into_calls(self) -> Vec<ToolCall> {
+        self.0
+    }
+}
+
+/// Explicit lifecycle state for a session's active run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SessionState {
+    #[default]
+    Idle,
+    Running,
+    WaitingForHostInput,
+    Cancelling,
+    Completed,
+    Failed,
+}
+
+impl SessionState {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Running => 1,
+            Self::WaitingForHostInput => 2,
+            Self::Cancelling => 3,
+            Self::Completed => 4,
+            Self::Failed => 5,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::Idle,
+            1 => Self::Running,
+            2 => Self::WaitingForHostInput,
+            3 => Self::Cancelling,
+            4 => Self::Completed,
+            5 => Self::Failed,
+            _ => unreachable!("session state is written only through SessionState::code"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SessionData {
+    history: Vec<Message>,
+    revision: Revision,
+    compaction: crate::CompactionState,
+    metadata: BTreeMap<String, String>,
+    prompt_cache_key: Option<String>,
+    context: crate::context_estimate::ContextAccounting,
+    working_context: Option<crate::context_estimate::ContextAccounting>,
+    last_compaction_decision: Option<crate::CompactionDecision>,
+}
+
+impl SessionData {
+    fn next_revision(&self) -> Result<Revision, Error> {
+        self.revision
+            .checked_next()
+            .ok_or_else(|| Error::Persistence {
+                message: "session revision is exhausted".into(),
+            })
+    }
+}
+
+/// How a commit updates context accounting.
+enum ContextCommit {
+    /// The new history extends the committed one.
+    Append,
+    /// The new history replaces the committed one, as compaction does.
+    Replace,
+}
+
+pub(crate) struct HistoryMetrics {
+    message_count: usize,
+    estimated_tokens: u64,
+}
+
+impl HistoryMetrics {
+    pub(crate) fn from_history(history: &[Message]) -> Self {
+        Self {
+            message_count: history.len(),
+            estimated_tokens: crate::compaction::estimate_history_tokens(history),
+        }
+    }
+}
+
+pub(crate) struct SessionCore {
+    id: SessionId,
+    data: Mutex<SessionData>,
+    // Readers share snapshots; idle setters copy only while a snapshot is held.
+    runtime: RwLock<Arc<Rho>>,
+    approvals: Arc<crate::workspace::SessionApprovals>,
+    // Run ownership remains active until its guard finalizes, independently of presentation state.
+    active_run: Mutex<Option<RunId>>,
+    /// Conversation of the turn in flight, published while tool calls run.
+    ///
+    /// Committed history changes only at turn boundaries, so without this a
+    /// tool cannot see the turn that invoked it. Shared behind an `Arc` so
+    /// every call in a batch reads one snapshot.
+    in_flight: RwLock<Option<Arc<Vec<Message>>>>,
+    state: AtomicU8,
+}
+
+impl SessionCore {
+    pub(crate) fn new(
+        id: SessionId,
+        history: Vec<Message>,
+        revision: Revision,
+        compaction: crate::CompactionState,
+        metadata: BTreeMap<String, String>,
+        prompt_cache_key: Option<String>,
+        runtime: Rho,
+    ) -> Arc<Self> {
+        let approvals = runtime.approvals.clone().unwrap_or_default();
+        let context = crate::context_estimate::ContextAccounting::new(
+            &history,
+            &runtime.advertised_tool_specs(),
+        );
+        Arc::new(Self {
+            id,
+            data: Mutex::new(SessionData {
+                history,
+                revision,
+                compaction,
+                metadata,
+                prompt_cache_key,
+                context,
+                working_context: None,
+                last_compaction_decision: None,
+            }),
+            runtime: RwLock::new(Arc::new(runtime)),
+            approvals,
+            active_run: Mutex::new(None),
+            in_flight: RwLock::new(None),
+            state: AtomicU8::new(SessionState::Idle.code()),
+        })
+    }
+
+    pub(crate) fn id(&self) -> &SessionId {
+        &self.id
+    }
+
+    pub(crate) fn runtime(&self) -> Arc<Rho> {
+        let runtime = self
+            .runtime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&runtime)
+    }
+
+    pub(crate) fn approvals(&self) -> Arc<crate::workspace::SessionApprovals> {
+        Arc::clone(&self.approvals)
+    }
+
+    pub(crate) fn prompt_cache_key(&self) -> Option<String> {
+        self.lock_data().prompt_cache_key.clone()
+    }
+
+    pub(crate) fn committed_history(&self) -> Vec<Message> {
+        self.lock_data().history.clone()
+    }
+
+    pub(crate) fn revision(&self) -> Revision {
+        self.lock_data().revision
+    }
+
+    fn lock_data(&self) -> MutexGuard<'_, SessionData> {
+        self.data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Locks the session for a commit of `history`: takes the next revision,
+    /// then updates context accounting while `data.history` still holds the
+    /// previous commit. The caller writes the history and the revision.
+    fn begin_commit(
+        &self,
+        history: &[Message],
+        accounting: ContextCommit,
+    ) -> Result<(MutexGuard<'_, SessionData>, Revision), Error> {
+        let runtime = self.runtime();
+        let tools = runtime.advertised_tool_specs();
+        let identity = runtime.provider.identity();
+        let source = runtime.context_messages(self.id());
+        let mut data = self.lock_data();
+        let revision = data.next_revision()?;
+        match accounting {
+            ContextCommit::Append => {
+                context::commit_context(&mut data, history, &source, &tools, &identity);
+            }
+            ContextCommit::Replace => {
+                context::commit_replacement(&mut data, history, &source, &tools, &identity);
+            }
+        }
+        Ok((data, revision))
+    }
+
+    /// Publishes the run's working history for the duration of a tool batch.
+    ///
+    /// Publication copies the whole conversation, so it happens only when a
+    /// registered tool or approval handler declared live-history reads (or the
+    /// host forced publication).
+    pub(crate) fn publish_in_flight_history(&self, history: &[Message]) {
+        if !self
+            .runtime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .publish_live_history
+        {
+            return;
+        }
+        *self
+            .in_flight
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(history.to_vec()));
+    }
+
+    pub(crate) fn live_history(&self) -> Vec<Message> {
+        let in_flight = self
+            .in_flight
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match in_flight {
+            Some(history) => history.as_ref().clone(),
+            None => self.committed_history(),
+        }
+    }
+
+    pub(crate) fn persistence_snapshot(&self) -> crate::SessionSnapshot {
+        let (history, revision, compaction, metadata, prompt_cache_key) = {
+            let data = self.lock_data();
+            (
+                data.history.clone(),
+                data.revision,
+                data.compaction.clone(),
+                data.metadata.clone(),
+                data.prompt_cache_key.clone(),
+            )
+        };
+        let mut snapshot = crate::SessionSnapshot::new(
+            self.id.clone(),
+            revision,
+            history,
+            self.runtime().provider.identity(),
+            compaction,
+        );
+        for (key, value) in metadata {
+            snapshot = snapshot.with_metadata(key, value);
+        }
+        if let Some(prompt_cache_key) = prompt_cache_key {
+            snapshot = snapshot.with_prompt_cache_key(prompt_cache_key);
+        }
+        snapshot
+    }
+
+    pub(crate) fn commit(&self, history: Vec<Message>) -> Result<Revision, Error> {
+        let (mut data, revision) = self.begin_commit(&history, ContextCommit::Append)?;
+        data.history = history;
+        data.revision = revision;
+        Ok(revision)
+    }
+
+    pub(crate) fn commit_compaction(
+        &self,
+        previous: HistoryMetrics,
+        history: Vec<Message>,
+        usage: crate::model::ModelUsage,
+        metadata: std::collections::BTreeMap<String, String>,
+    ) -> Result<crate::CompactionOutcome, Error> {
+        // Validate the measured prefix against the replacement.
+        // An unchanged compactor output must not discard a valid provider count;
+        // rewriting the measured prefix invalidates it through that same check.
+        let (mut data, revision) = self.begin_commit(&history, ContextCommit::Replace)?;
+        // Count the history that was actually compacted. Automatic compaction
+        // may include uncommitted in-flight messages that are not yet in the
+        // persisted session history.
+        let current_messages = history.len();
+        let current_tokens = crate::compaction::estimate_history_tokens(&history);
+        data.compaction.record(
+            previous.message_count.saturating_sub(current_messages),
+            previous.estimated_tokens,
+            current_tokens,
+            usage.cost_usd_micros,
+            revision,
+        );
+        data.history = history;
+        data.metadata.extend(metadata);
+        data.revision = revision;
+        Ok(crate::CompactionOutcome::new(
+            previous.message_count,
+            current_messages,
+            previous.estimated_tokens,
+            current_tokens,
+            usage.cost_usd_micros,
+            revision,
+        ))
+    }
+
+    pub(crate) fn set_state(&self, state: SessionState) {
+        self.state.store(state.code(), Ordering::Release);
+    }
+
+    pub(crate) fn state(&self) -> SessionState {
+        SessionState::from_code(self.state.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn begin_run(&self, run_id: &RunId) -> Result<(), Error> {
+        let mut active_run = self.lock_inactive()?;
+        *active_run = Some(run_id.clone());
+        self.set_state(SessionState::Running);
+        Ok(())
+    }
+
+    fn lock_inactive(&self) -> Result<MutexGuard<'_, Option<RunId>>, Error> {
+        let active_run = self
+            .active_run
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active_run.is_some() {
+            Err(Error::SessionBusy)
+        } else {
+            Ok(active_run)
+        }
+    }
+
+    pub(crate) fn finish_run(&self, run_id: &RunId) {
+        let mut active_run = self
+            .active_run
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active_run.as_ref() != Some(run_id) {
+            return;
+        }
+        *active_run = None;
+        self.lock_data().working_context = None;
+        *self
+            .in_flight
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        if !matches!(self.state(), SessionState::Completed | SessionState::Failed) {
+            self.set_state(SessionState::Idle);
+        }
+    }
+
+    fn has_active_run(&self) -> bool {
+        self.active_run
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+}
+
+pub(crate) struct ActiveRunGuard {
+    core: Arc<SessionCore>,
+    run_id: RunId,
+    lifecycle: Arc<crate::client::RuntimeLifecycle>,
+}
+
+impl ActiveRunGuard {
+    pub(crate) fn new(
+        core: Arc<SessionCore>,
+        run_id: RunId,
+        lifecycle: Arc<crate::client::RuntimeLifecycle>,
+    ) -> Self {
+        Self {
+            core,
+            run_id,
+            lifecycle,
+        }
+    }
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        self.lifecycle.unregister(&self.run_id);
+        self.core.finish_run(&self.run_id);
+    }
+}
+
+/// Mutable conversation state owned by one SDK runtime.
+#[derive(Clone)]
+pub struct Session {
+    core: Arc<SessionCore>,
+}
+
+impl Session {
+    pub(crate) fn from_core(core: Arc<SessionCore>) -> Self {
+        Self { core }
+    }
+
+    pub fn id(&self) -> &SessionId {
+        &self.core.id
+    }
+
+    pub fn revision(&self) -> Revision {
+        self.core.revision()
+    }
+
+    pub fn history(&self) -> Vec<Message> {
+        self.core.committed_history()
+    }
+
+    /// Conversation as the run currently sees it, including the turn in flight.
+    ///
+    /// [`Self::history`] commits only at turn boundaries, so a tool reading it
+    /// cannot see the turn that invoked it. This adds the working history the
+    /// run publishes for each tool batch: the user request, assistant replies,
+    /// tool calls, and the results already returned in this turn. Results from
+    /// calls running beside the reader are not in it yet.
+    ///
+    /// The published view lasts until the run ends. Between runs, and before
+    /// the first tool batch of a run, this equals [`Self::history`].
+    ///
+    /// Publication costs a history copy per tool batch, so the run publishes
+    /// only when a registered tool declares
+    /// [`crate::tool::Tool::reads_live_history`], an approval handler declares
+    /// [`crate::ApprovalHandler::reads_live_history`], or the host forces
+    /// publication. Otherwise this equals [`Self::history`].
+    pub fn live_history(&self) -> Vec<Message> {
+        self.core.live_history()
+    }
+
+    pub fn snapshot(&self) -> crate::SessionSnapshot {
+        self.core.persistence_snapshot()
+    }
+
+    pub fn reasoning_level(&self) -> crate::ReasoningLevel {
+        self.core.runtime().reasoning_level
+    }
+
+    pub fn set_reasoning_level(&self, reasoning_level: crate::ReasoningLevel) -> Result<(), Error> {
+        let _inactive = self.core.lock_inactive()?;
+        let mut runtime = self
+            .core
+            .runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::make_mut(&mut runtime).reasoning_level = reasoning_level;
+        Ok(())
+    }
+
+    pub fn service_tier(&self) -> Option<crate::model::ServiceTier> {
+        self.core.runtime().service_tier
+    }
+
+    /// Changes the provider service class for future turns while the session is idle.
+    pub fn set_service_tier(
+        &self,
+        service_tier: Option<crate::model::ServiceTier>,
+    ) -> Result<(), Error> {
+        let _inactive = self.core.lock_inactive()?;
+        let mut runtime = self
+            .core
+            .runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::make_mut(&mut runtime).service_tier = service_tier;
+        Ok(())
+    }
+
+    /// Replaces the host-supplied compactor and automatic compaction policy while idle.
+    pub fn set_compaction(
+        &self,
+        compactor: Option<Arc<dyn crate::Compactor>>,
+        policy: Option<crate::CompactionPolicy>,
+    ) -> Result<(), Error> {
+        let _inactive = self.core.lock_inactive()?;
+        if policy.is_some() && compactor.is_none() {
+            return Err(Error::InvalidConfiguration {
+                message: "automatic compaction policy requires a compactor".into(),
+            });
+        }
+        let mut runtime = self
+            .core
+            .runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let runtime = Arc::make_mut(&mut runtime);
+        runtime.compactor = compactor;
+        runtime.compaction_policy = policy;
+        Ok(())
+    }
+
+    pub fn diagnostics(&self) -> crate::DiagnosticsSnapshot {
+        self.core.runtime().diagnostics()
+    }
+
+    pub fn state(&self) -> SessionState {
+        self.core.state()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.core.has_active_run()
+    }
+
+    pub async fn start(&self, input: UserInput) -> Result<Run, Error> {
+        self.start_run(RunStart::User(input)).await
+    }
+
+    /// Continues from committed history without appending another user message.
+    ///
+    /// Use this after restoring a snapshot saved by a checkpoint store when the
+    /// previous run stopped mid-turn. Tool calls in that history without a result
+    /// are settled first: built-in tools that declare only read capabilities run
+    /// again, and every other call gets an interrupted result instead of a second
+    /// execution, since it may already have had effects.
+    pub async fn continue_history(&self) -> Result<Run, Error> {
+        self.start_run(RunStart::Continue).await
+    }
+
+    /// Installs or removes a step checkpoint store while the session is idle.
+    ///
+    /// With a store, each run commits its working history and saves the session
+    /// snapshot before every provider request and again after each model reply
+    /// or host tool-call batch, before those calls start. Before a provider
+    /// request whose history and revision are unchanged since the last save,
+    /// the store is not called and the revision does not advance, so host
+    /// state a store adds to each snapshot waits for the next save. A process
+    /// that dies mid-run can restore the last saved snapshot and call
+    /// [`Session::continue_history`]. A failed save fails the run.
+    pub fn set_checkpoint_store(
+        &self,
+        store: Option<Arc<dyn crate::SessionStore>>,
+    ) -> Result<(), Error> {
+        let _inactive = self.core.lock_inactive()?;
+        let mut runtime = self
+            .core
+            .runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::make_mut(&mut runtime).checkpoint_store = store;
+        Ok(())
+    }
+
+    /// Installs an opt-in host checkpoint channel while the session is idle.
+    /// Service its receiver alongside run events, and use a fresh channel for
+    /// each run. See [`crate::boundary_input_channel`].
+    pub fn set_boundary_inputs(
+        &self,
+        source: Option<crate::BoundaryInputSource>,
+    ) -> Result<(), Error> {
+        let _inactive = self.core.lock_inactive()?;
+        let mut runtime = self
+            .core
+            .runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::make_mut(&mut runtime).boundary_inputs = source;
+        Ok(())
+    }
+
+    /// Starts a run by executing a host-requested tool call after the user input
+    /// and before the first model request.
+    ///
+    /// This is [`Session::start_with_tool_calls`] with a one-call batch.
+    pub async fn start_with_tool_call(
+        &self,
+        input: UserInput,
+        tool_call: ToolCall,
+    ) -> Result<Run, Error> {
+        self.start_with_tool_calls(input, vec![tool_call]).await
+    }
+
+    /// Starts a run by executing a batch of host-requested tool calls after the
+    /// user input and before the first model request.
+    ///
+    /// The batch behaves like one model response with parallel tool calls: the
+    /// calls are recorded as one assistant message, scheduled by the same
+    /// parallel and exclusive rules, and authorized individually. Their results
+    /// reach the first model request in call order, so providers see an
+    /// ordinary parallel tool-call turn. Every call is fixed before the batch
+    /// starts, so one call cannot consume another call's output; use separate
+    /// runs when a later call depends on an earlier result.
+    ///
+    /// Cancellation or failure pairs every call with a result, so history stays
+    /// replayable.
+    ///
+    /// Returns [`Error::InvalidConfiguration`] without starting a run when the
+    /// batch is empty, a call lacks a nonempty ID and name plus object
+    /// arguments, or two calls share an ID.
+    pub async fn start_with_tool_calls(
+        &self,
+        input: UserInput,
+        tool_calls: Vec<ToolCall>,
+    ) -> Result<Run, Error> {
+        self.start_run(RunStart::WithToolCalls {
+            input,
+            calls: HostToolCalls::new(tool_calls)?,
+        })
+        .await
+    }
+
+    async fn start_run(&self, start: RunStart) -> Result<Run, Error> {
+        let run_id = RunId::new();
+        self.core.begin_run(&run_id)?;
+
+        let cancellation = crate::CancellationToken::new();
+        let runtime = self.core.runtime();
+        let core = Arc::clone(&self.core);
+        let (events, receiver) = tokio::sync::mpsc::channel(runtime.event_capacity.get());
+        let (commands, command_receiver) = tokio::sync::mpsc::channel(runtime.event_capacity.get());
+        let worker_cancellation = cancellation.clone();
+        let worker_run_id = run_id.clone();
+        let guard = ActiveRunGuard::new(
+            Arc::clone(&core),
+            run_id.clone(),
+            Arc::clone(&runtime.lifecycle),
+        );
+        runtime
+            .lifecycle
+            .register(run_id.clone(), cancellation.clone())?;
+        let worker = tokio::spawn(async move {
+            let _guard = guard;
+            execute_run(
+                core,
+                runtime,
+                worker_run_id,
+                start,
+                worker_cancellation,
+                events,
+                command_receiver,
+            )
+            .await
+        });
+        Ok(Run::new(run_id, cancellation, receiver, commands, worker))
+    }
+
+    pub async fn complete(&self, input: impl Into<String>) -> Result<RunOutcome, Error> {
+        let mut run = self.start(UserInput::text(input)).await?;
+        while let Some(event) = run.next_event().await {
+            let request = match event {
+                crate::RunEvent::HostInputRequested { request }
+                | crate::RunEvent::ToolHostInputRequested { request, .. } => Some(request),
+                _ => None,
+            };
+            if let Some(request) = request {
+                run.cancel();
+                let _ = run.outcome().await;
+                return Err(Error::InvalidHostResponse {
+                    message: format!(
+                        "simple completion cannot answer host input request '{}'",
+                        request.id()
+                    ),
+                });
+            }
+        }
+        run.outcome().await
+    }
+
+    pub async fn compact(&self) -> Result<crate::CompactionOutcome, Error> {
+        self.compact_inner(/*instructions*/ None).await
+    }
+
+    /// Like [`Self::compact`], and passes `instructions` to the compactor as
+    /// guidance on what the replacement must preserve. See
+    /// [`crate::CompactionRequest::instructions`].
+    pub async fn compact_with_instructions(
+        &self,
+        instructions: impl Into<String>,
+    ) -> Result<crate::CompactionOutcome, Error> {
+        self.compact_inner(Some(instructions.into())).await
+    }
+
+    async fn compact_inner(
+        &self,
+        instructions: Option<String>,
+    ) -> Result<crate::CompactionOutcome, Error> {
+        let runtime = self.core.runtime();
+        let compactor =
+            runtime
+                .compactor
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| Error::InvalidConfiguration {
+                    message: "no compactor is configured".into(),
+                })?;
+        let run_id = RunId::new();
+        self.core.begin_run(&run_id)?;
+        let cancellation = crate::CancellationToken::new();
+        let _guard = ActiveRunGuard::new(
+            Arc::clone(&self.core),
+            run_id.clone(),
+            Arc::clone(&runtime.lifecycle),
+        );
+        runtime
+            .lifecycle
+            .register(run_id.clone(), cancellation.clone())?;
+        let history = self.history();
+        let previous = HistoryMetrics::from_history(&history);
+        let tools = runtime.advertised_tool_specs();
+        // Manual and idle compaction have no preceding provider boundary.
+        // Prepare live context before sizing or checkpointing the replacement.
+        let estimate = self.core.advance_context(&history, &tools);
+        let request = crate::CompactionRequest::new(history, cancellation)
+            .with_instructions_opt(instructions)
+            .with_context_estimate(estimate)
+            .with_request_context(
+                self.core.id().clone(),
+                runtime.usage_parent_session_id.clone(),
+                run_id,
+                None,
+                runtime
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.root().to_path_buf()),
+            )
+            .with_session_turn(runtime.service_tier, tools, self.core.prompt_cache_key());
+        let output = compactor.compact(request).await?;
+        let (replacement, usage, metadata) = output.into_parts();
+        let outcome = self
+            .core
+            .commit_compaction(previous, replacement, usage, metadata)?;
+        self.core.set_state(SessionState::Completed);
+        Ok(outcome)
+    }
+
+    /// Appends host-provided context while the session is idle.
+    pub fn append_message(&self, message: Message) -> Result<Revision, Error> {
+        let _inactive = self.core.lock_inactive()?;
+        let mut history = self.history();
+        history.push(message);
+        self.core.commit(history)
+    }
+
+    /// Replaces committed history while the session is idle.
+    ///
+    /// Hosts use this after durable persistence fails following
+    /// [`Self::append_message`], so model-visible history stays aligned with
+    /// storage instead of remaining one message ahead of a failed snapshot.
+    pub fn replace_history(&self, history: Vec<Message>) -> Result<Revision, Error> {
+        let _inactive = self.core.lock_inactive()?;
+        self.core.invalidate_context();
+        self.core.commit(history)
+    }
+
+    pub fn reset(&self) -> Result<(), Error> {
+        let _inactive = self.core.lock_inactive()?;
+        let runtime = self.core.runtime();
+        let tools = runtime.advertised_tool_specs();
+        let system_prompt = match &runtime.system_prompt {
+            crate::SystemPrompt::Custom(prompt) => Some(Message::System(prompt.clone())),
+            crate::SystemPrompt::None => None,
+        };
+        let mut data = self.core.lock_data();
+        data.history = system_prompt.into_iter().collect();
+        data.context = crate::context_estimate::ContextAccounting::new(&data.history, &tools);
+        data.working_context = None;
+        data.last_compaction_decision = None;
+        data.compaction = crate::CompactionState::default();
+        data.revision = data.next_revision()?;
+        Ok(())
+    }
+
+    pub fn replace_provider(
+        &self,
+        provider: Arc<dyn ModelProvider>,
+    ) -> Result<crate::model::handoff::HandoffReport, Error> {
+        let _inactive = self.core.lock_inactive()?;
+        let report =
+            crate::model::handoff::report_message_omissions(&self.history(), &provider.identity());
+        {
+            let mut runtime = self
+                .core
+                .runtime
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::make_mut(&mut runtime).provider = provider;
+        }
+        self.core.invalidate_context();
+        Ok(report)
+    }
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Session")
+            .field("id", self.id())
+            .field("revision", &self.revision())
+            .field("state", &self.state())
+            .finish_non_exhaustive()
+    }
+}

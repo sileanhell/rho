@@ -1,0 +1,919 @@
+use std::{num::NonZeroUsize, sync::Arc, time::Instant};
+
+use tokio::sync::mpsc;
+
+use crate::{
+    client::Rho,
+    event::{RunOutcome, StopReason},
+    model::{
+        AssistantMessage, ContentBlock, Message, ModelEvent, ModelRequest, ModelResponse,
+        ModelUsage,
+    },
+    provider::{
+        provider_event_channel, provider_steering_channel, ModelRequestOptions,
+        ProviderCancellationMode,
+    },
+    run::RunCommand,
+    session::{RunStart, SessionCore, SessionState},
+    steering::SteeringQueue,
+    CancellationToken, Error, ModelCallProfile, ProviderError, RunEvent, RunId,
+};
+
+const PROVIDER_EVENT_CAPACITY: usize = 16;
+pub(super) const INVALID_RESPONSE_ATTEMPTS: usize = 2;
+/// Maximum logical provider requests for one model turn, including malformed
+/// responses and retryable failures.
+pub(super) const PROVIDER_TURN_ATTEMPTS: usize = 4;
+/// Backoff before the first retryable-failure retry; doubles per retry.
+pub(super) const RETRYABLE_REQUEST_BASE_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(1);
+/// Upper bound when honoring provider `Retry-After` during auto-retry.
+///
+/// Keeps interactive turns from blocking on multi-hour quota resets. The full
+/// provider wait still appears on the reset event and final error.
+pub(super) const MAX_HONORED_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+mod async_jobs;
+mod boundary_input;
+mod checkpoint;
+mod compaction;
+mod compaction_limit;
+mod model_call_timer;
+mod pending_tool_outputs;
+mod provider_cancellation;
+mod provider_request;
+mod run_hooks;
+mod steering_control;
+mod stream_capture;
+mod terminal;
+mod tool_batch;
+mod tool_settlement;
+mod tool_turn;
+
+use async_jobs::{
+    await_all_jobs, await_first_job, forward_job_notice, harvest_ready_jobs, AsyncJobSet, AwaitJobs,
+};
+use compaction::{maybe_compact, recover_context_overflow, OverflowRecovery};
+use compaction_limit::CompactionLimit;
+use model_call_timer::ModelCallTimer;
+use provider_cancellation::{
+    drain_cancelled_provider_events, drain_cooperative_provider_on_cancellation,
+};
+use provider_request::{request_valid_response, ProviderRequestScope, RequestFailure};
+use run_hooks::RunHooks;
+pub(in crate::orchestration) use steering_control::{
+    accept_command as accept_non_tool_command, apply_staged as apply_staged_steering,
+    drain_commands, handle_outcome as handle_steering_outcome,
+};
+use stream_capture::{capture_provider_event, StreamCapture};
+use terminal::{commit_terminal, commit_terminal_history, send_terminal, TerminalKind};
+use tool_turn::{
+    final_assistant_content, resolve_tool_turn_result, run_staged_tool_turn, split_tool_calls,
+    StagedToolTurn,
+};
+
+/// Runs one turn loop and reports its terminal outcome to lifecycle hooks.
+///
+/// The hook dispatch lives here, around the whole loop, so every exit path
+/// reports exactly once. `run_completed` and `run_failed` fire per run, which is
+/// what "notify me when a run finishes" means inside a long interactive session.
+pub(crate) async fn execute_run(
+    core: Arc<SessionCore>,
+    runtime: Arc<Rho>,
+    run_id: RunId,
+    start: RunStart,
+    cancellation: CancellationToken,
+    events: mpsc::Sender<RunEvent>,
+    commands: mpsc::Receiver<RunCommand>,
+) -> Result<RunOutcome, Error> {
+    let hooks = RunHooks::new(&runtime, core.id().clone(), run_id.clone());
+    let result = execute_turn_loop(
+        core,
+        runtime,
+        run_id,
+        start,
+        cancellation,
+        events,
+        commands,
+        &hooks,
+    )
+    .await;
+    // Cancellation is an ordinary user-controlled stop in schema v1, which
+    // has no cancellation event. Do not misreport it as `run_failed`.
+    if !matches!(result, Err(Error::Cancelled)) {
+        hooks.run_finished(&result);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_turn_loop(
+    core: Arc<SessionCore>,
+    runtime: Arc<Rho>,
+    run_id: RunId,
+    start: RunStart,
+    cancellation: CancellationToken,
+    events: mpsc::Sender<RunEvent>,
+    mut commands: mpsc::Receiver<RunCommand>,
+    hooks: &RunHooks,
+) -> Result<RunOutcome, Error> {
+    let (mut history, committed) = core.snapshot_for_run();
+    let revision = committed.revision();
+    let mut checkpoints = checkpoint::Checkpoints::new(committed);
+    if let RunStart::User(input) | RunStart::WithToolCalls { input, .. } = &start {
+        history.push(Message::User(input.blocks().to_vec()));
+    }
+    match emit(
+        &events,
+        &cancellation,
+        RunEvent::Started {
+            run_id: run_id.clone(),
+            revision,
+        },
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(Error::Cancelled) => {
+            return commit_terminal_history(core, history, TerminalKind::Cancelled, &events).await;
+        }
+        Err(error) => return Err(error),
+    }
+
+    let mut accumulated_usage = ModelUsage::default();
+    let mut steering = SteeringQueue::new();
+    let mut async_jobs = AsyncJobSet::new(runtime.max_parallel_tools);
+    let mut pending_outputs = pending_tool_outputs::PendingToolOutputs::default();
+    let initial_turn = match start {
+        RunStart::User(_) => None,
+        RunStart::WithToolCalls { calls, .. } => {
+            // One assistant message carries the whole batch, exactly like a
+            // model's parallel tool calls. The scheduler pairs every call with
+            // a result, including on cancellation and failure.
+            history.push(Message::Assistant(
+                calls
+                    .calls()
+                    .iter()
+                    .cloned()
+                    .map(ContentBlock::ToolCall)
+                    .collect(),
+            ));
+            Some(StagedToolTurn::host_requested(calls, &runtime))
+        }
+        RunStart::Continue => checkpoint::settle_unanswered_calls(&mut history, &runtime),
+    };
+    if let Some(mut tool_turn) = initial_turn {
+        let mut control = RunControl {
+            hooks,
+            cancellation: &cancellation,
+            events: &events,
+            commands: &mut commands,
+            steering: &mut steering,
+            async_jobs: &mut async_jobs,
+            pending_outputs: &mut pending_outputs,
+        };
+        // Like a model reply, a host batch is saved before its calls start,
+        // so a restored snapshot names every call that may have started.
+        if tool_turn.is_host_requested() {
+            if let Err(error) = checkpoints.save(&core, &runtime, &history).await {
+                tool_turn.interrupt_unstarted(&mut history);
+                return control.terminate(core, history, error).await;
+            }
+        }
+        let initial_result =
+            run_staged_tool_turn(&core, &runtime, &mut tool_turn, &mut history, &mut control).await;
+        history =
+            match resolve_tool_turn_result(Arc::clone(&core), history, initial_result, &events)
+                .await
+            {
+                Ok(history) => history,
+                Err(terminal) => return *terminal,
+            };
+    }
+    // The registry is immutable for the duration of a run, so build the specs
+    // (which deep-clone every tool's JSON schema) once. The advertised subset
+    // is chosen per step below, so visibility changes reach the next request.
+    let registered_specs = runtime.tools.specs();
+    let mut preserve_from = None;
+    // End of the prefix a pending-call compaction already rewrote while the
+    // same async jobs kept running. Cleared once no job runs.
+    let mut pending_compacted_end = None;
+    for step in 1..=runtime.max_steps.get() {
+        drain_commands(&mut commands, &mut steering);
+        let mut control = RunControl {
+            hooks,
+            cancellation: &cancellation,
+            events: &events,
+            commands: &mut commands,
+            steering: &mut steering,
+            async_jobs: &mut async_jobs,
+            pending_outputs: &mut pending_outputs,
+        };
+        if let Err(error) = harvest_ready_jobs(&mut control).await {
+            return control.terminate(core, history, error).await;
+        }
+        let tool_specs = runtime.advertised_specs(&registered_specs);
+        control.pending_outputs.drain_finished(&mut history);
+        let request_scope = ProviderRequestScope {
+            runtime: &runtime,
+            session_id: core.id(),
+            run_id: &run_id,
+            step_index: step,
+        };
+        // Completion input and running async calls stay verbatim through
+        // automatic compaction and overflow recovery. Everything after the
+        // limit is a suffix that only grows, so re-address it by length.
+        let running = control.async_jobs.pending_call_ids();
+        if running.is_empty() {
+            pending_compacted_end = None;
+        }
+        let limit = CompactionLimit::for_step(
+            &history,
+            &running,
+            preserve_from.take(),
+            pending_compacted_end,
+        );
+        let len_before_compaction = history.len();
+        let mut compaction_estimate = match maybe_compact(
+            &core,
+            request_scope,
+            &tool_specs,
+            &mut history,
+            limit,
+            &cancellation,
+            &events,
+        )
+        .await
+        {
+            Ok(estimate) => estimate,
+            Err(error) => {
+                return control.terminate(core, history, error).await;
+            }
+        };
+        let mut limit = limit.shifted(len_before_compaction, history.len());
+        if compaction_estimate.is_none() {
+            if let CompactionLimit::BeforePendingCalls(end) = limit {
+                pending_compacted_end = Some(end);
+            }
+        }
+        if !control.async_jobs.has_pending() {
+            match boundary_input::collect(
+                &runtime,
+                &core,
+                &run_id,
+                crate::InputBoundary::BeforeProvider,
+                &mut history,
+                &cancellation,
+                &events,
+            )
+            .await
+            {
+                Ok(true) => compaction_estimate = None,
+                Ok(false) => {}
+                Err(error) => {
+                    return control.terminate(core, history, error).await;
+                }
+            }
+        }
+        drain_commands(control.commands, control.steering);
+        // Delivered steers stay staged so a Reuse continuation still matches the
+        // suffix the server already prepended. Undelivered steers accepted
+        // between steps (including during compact) are applied before the next
+        // request so default providers do not spend a turn just to release them.
+        if !control.steering.has_delivered() {
+            // Boundary input above and staged steering invalidate the estimate.
+            // Tools are immutable for this run; jobs were drained before compaction.
+            if control.steering.has_staged() {
+                compaction_estimate = None;
+            }
+            match apply_staged_steering(control.steering, &mut history, &events, &cancellation)
+                .await
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    return control.terminate(core, history, error).await;
+                }
+            }
+        }
+        // Emit before the provider call so quiet hosts still show context fill
+        // while thinking and tool-call JSON stream (usage often arrives only at
+        // the end of the OpenAI-compatible stream).
+        let context_estimate =
+            compaction_estimate.unwrap_or_else(|| core.advance_context(&history, &tool_specs));
+        let estimated_context_tokens = context_estimate.estimated_tokens();
+        match emit(
+            &events,
+            &cancellation,
+            RunEvent::StepStarted {
+                step,
+                estimated_context_tokens,
+            },
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error) => {
+                return control.terminate(core, history, error).await;
+            }
+        }
+
+        if let Err(error) = checkpoints.save(&core, &runtime, &history).await {
+            return control.terminate(core, history, error).await;
+        }
+        let mut overflow_recovered = false;
+        let (response, mut capture, request_context, request_estimate) = loop {
+            // Late boundary input, staged steering, and overflow recovery may
+            // have changed history since the automatic compaction policy check.
+            let messages = core.project_request(&runtime, &history, &tool_specs);
+            let estimate = core.advance_request_context(&history, &messages.context, &tool_specs);
+            let error = match request_valid_response(
+                request_scope,
+                &messages.messages,
+                &tool_specs,
+                &accumulated_usage,
+                runtime.reasoning_level,
+                core.prompt_cache_key().as_deref(),
+                &mut control,
+            )
+            .await
+            {
+                Ok((response, capture)) => {
+                    break (response, capture, messages.context, estimate);
+                }
+                Err(error) => error,
+            };
+            drop(messages);
+            // One compaction per step, within the step's limit. Provider-accepted
+            // steering ties the request to state compaction must not rewrite.
+            let recover = !overflow_recovered && !control.steering.has_delivered();
+            if recover {
+                overflow_recovered = true;
+                let len_before_recovery = history.len();
+                let recovery = recover_context_overflow(
+                    &core,
+                    request_scope,
+                    &tool_specs,
+                    &mut history,
+                    limit,
+                    &error.error,
+                    &cancellation,
+                    &events,
+                )
+                .await;
+                limit = limit.shifted(len_before_recovery, history.len());
+                match recovery {
+                    Ok(OverflowRecovery::Retry) => {
+                        if let CompactionLimit::BeforePendingCalls(end) = limit {
+                            pending_compacted_end = Some(end);
+                        }
+                        core.advance_context(&history, &tool_specs);
+                        continue;
+                    }
+                    Ok(OverflowRecovery::GiveUp) => {}
+                    Err(recovery_error) => {
+                        tracing::warn!(
+                            error = %recovery_error,
+                            "context overflow compaction failed"
+                        );
+                        if matches!(recovery_error, Error::Cancelled | Error::Interrupted { .. }) {
+                            return control.terminate(core, history, recovery_error).await;
+                        }
+                    }
+                }
+            }
+            let kind = if cancellation.is_cancelled() {
+                TerminalKind::Cancelled
+            } else {
+                TerminalKind::Failed(Error::from(error.error))
+            };
+            control
+                .async_jobs
+                .interrupt(control.pending_outputs, &mut history, hooks, &events)
+                .await;
+            return commit_terminal(core, history, error.capture, kind, &events).await;
+        };
+        accumulated_usage = accumulated_usage.saturating_add(capture.usage());
+        // Delivered steering can change the physical request outside this
+        // immutable history slice. Never attach that report to the wrong prefix.
+        if control.steering.has_delivered() {
+            core.invalidate_working_context();
+        } else {
+            // Associate usage with the estimate of this exact immutable request,
+            // not whichever context snapshot was published most recently.
+            core.record_context_usage(
+                &history,
+                &request_context,
+                &tool_specs,
+                capture.usage(),
+                request_estimate,
+            );
+        }
+
+        let ModelResponse::Assistant(content) = response;
+        let tool_calls = content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall(call) => Some(call.clone()),
+                ContentBlock::Text(_) | ContentBlock::Image(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let async_ids = capture.async_call_ids();
+        let model_stop_reason = capture.stop_reason();
+        let (reasoning_summary, provider_context) = capture.take_assistant_context();
+        let assistant = AssistantMessage {
+            content,
+            provenance: Some(runtime.provider.identity()),
+            reasoning_summary,
+            provider_context,
+        };
+        history.push(Message::assistant(assistant));
+        core.append_context_estimate(history.last().expect("assistant was appended"));
+        if let Err(error) = checkpoints.save(&core, &runtime, &history).await {
+            history.extend(
+                tool_calls
+                    .iter()
+                    .map(|call| Message::ToolResult(tool_settlement::interrupted_result(call))),
+            );
+            return control.terminate(core, history, error).await;
+        }
+        drain_commands(control.commands, control.steering);
+        let was_steered = control.steering.has_staged();
+        let (async_calls, sync_calls) =
+            split_tool_calls(tool_calls, &async_ids, &runtime, &tool_specs);
+        let spawned_async = !async_calls.is_empty();
+        core.publish_in_flight_history(&history);
+        if let Err(error) = async {
+            control.spawn_async(async_calls, &core, &runtime).await?;
+
+            // Detached jobs may keep using shared resources for their lifetime.
+            // Wait before entering the synchronous scheduler, which may run an
+            // exclusive plan and must not overlap that work.
+            if !sync_calls.is_empty() && control.async_jobs.has_pending() {
+                await_all_jobs(&mut control).await?;
+            }
+            Ok(())
+        }
+        .await
+        {
+            tool_turn::interrupt_unstarted_calls(sync_calls, &mut history);
+            return control.terminate(core, history, error).await;
+        }
+
+        if !sync_calls.is_empty() || (!spawned_async && was_steered) {
+            let mut tool_turn = StagedToolTurn::model_requested(sync_calls);
+            let model_tool_result =
+                run_staged_tool_turn(&core, &runtime, &mut tool_turn, &mut history, &mut control)
+                    .await;
+            let should_interrupt_jobs = match &model_tool_result {
+                Ok(status) => status.is_cancelled(),
+                Err(_) => true,
+            };
+            if should_interrupt_jobs {
+                control
+                    .async_jobs
+                    .interrupt(control.pending_outputs, &mut history, hooks, &events)
+                    .await;
+            }
+            history = match resolve_tool_turn_result(
+                Arc::clone(&core),
+                history,
+                model_tool_result,
+                &events,
+            )
+            .await
+            {
+                Ok(history) => history,
+                Err(terminal) => return *terminal,
+            };
+            continue;
+        }
+        if spawned_async {
+            if let Err(error) = apply_staged_steering(
+                control.steering,
+                &mut history,
+                control.events,
+                control.cancellation,
+            )
+            .await
+            {
+                return control.terminate(core, history, error).await;
+            }
+            continue;
+        }
+
+        if let Err(error) = harvest_ready_jobs(&mut control).await {
+            return control.terminate(core, history, error).await;
+        }
+        if control.pending_outputs.drain_finished(&mut history) > 0 {
+            continue;
+        }
+        if control.async_jobs.has_pending() {
+            match await_first_job(&mut control).await {
+                Ok(AwaitJobs::Continue) => {
+                    if let Err(error) = harvest_ready_jobs(&mut control).await {
+                        return control.terminate(core, history, error).await;
+                    }
+                    control.pending_outputs.drain_finished(&mut history);
+                    if let Err(error) = apply_staged_steering(
+                        control.steering,
+                        &mut history,
+                        control.events,
+                        control.cancellation,
+                    )
+                    .await
+                    {
+                        return control.terminate(core, history, error).await;
+                    }
+                    continue;
+                }
+                Ok(AwaitJobs::Cancelled) => {
+                    return control.terminate(core, history, Error::Cancelled).await;
+                }
+                Err(error) => {
+                    return control.terminate(core, history, error).await;
+                }
+            }
+        }
+
+        // Leave notices with the host if there is no provider step to consume them.
+        if step < runtime.max_steps.get() {
+            let input_start = history.len();
+            match boundary_input::collect(
+                &runtime,
+                &core,
+                &run_id,
+                crate::InputBoundary::BeforeCompletion,
+                &mut history,
+                &cancellation,
+                &events,
+            )
+            .await
+            {
+                Ok(true) => {
+                    preserve_from = Some(input_start);
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    return control.terminate(core, history, error).await;
+                }
+            }
+        }
+        let content = final_assistant_content(&history);
+        let revision = core.commit(history)?;
+        let outcome = RunOutcome::new(
+            content,
+            accumulated_usage,
+            StopReason::from_final_turn(model_stop_reason),
+            revision,
+        );
+        core.set_state(SessionState::Completed);
+        send_terminal(
+            &events,
+            RunEvent::Completed {
+                outcome: outcome.clone(),
+            },
+        )
+        .await;
+        return Ok(outcome);
+    }
+
+    async_jobs
+        .interrupt(&mut pending_outputs, &mut history, hooks, &events)
+        .await;
+    let last_content = final_assistant_content(&history);
+    let revision = core.commit(history)?;
+    let outcome = RunOutcome::new(
+        last_content,
+        accumulated_usage,
+        StopReason::MaxSteps,
+        revision,
+    );
+    core.set_state(SessionState::Completed);
+    send_terminal(
+        &events,
+        RunEvent::Completed {
+            outcome: outcome.clone(),
+        },
+    )
+    .await;
+    Ok(outcome)
+}
+
+pub(super) struct RunControl<'a> {
+    hooks: &'a RunHooks,
+    cancellation: &'a CancellationToken,
+    events: &'a mpsc::Sender<RunEvent>,
+    commands: &'a mut mpsc::Receiver<RunCommand>,
+    steering: &'a mut SteeringQueue,
+    async_jobs: &'a mut AsyncJobSet,
+    pending_outputs: &'a mut pending_tool_outputs::PendingToolOutputs,
+}
+
+impl RunControl<'_> {
+    /// Settle detached jobs before committing a terminal error. Event-consumer
+    /// interrupts stay uncommitted; cancellation and failures preserve text pairing.
+    async fn terminate(
+        &mut self,
+        core: Arc<SessionCore>,
+        mut history: Vec<Message>,
+        error: Error,
+    ) -> Result<RunOutcome, Error> {
+        self.async_jobs
+            .interrupt(self.pending_outputs, &mut history, self.hooks, self.events)
+            .await;
+        match error {
+            Error::Cancelled => {
+                commit_terminal_history(core, history, TerminalKind::Cancelled, self.events).await
+            }
+            Error::Interrupted { .. } => Err(error),
+            error => {
+                commit_terminal(
+                    core,
+                    history,
+                    StreamCapture::default(),
+                    TerminalKind::Failed(error),
+                    self.events,
+                )
+                .await
+            }
+        }
+    }
+}
+
+async fn provider_turn(
+    runtime: &Rho,
+    history: &[Message],
+    tools: &[crate::model::ToolSpec],
+    accumulated_usage: &ModelUsage,
+    reasoning_level: crate::ReasoningLevel,
+    prompt_cache_key: Option<&str>,
+    control: &mut RunControl<'_>,
+) -> Result<(ModelResponse, StreamCapture), Box<RequestFailure>> {
+    let provider = runtime.provider.as_ref();
+    let (provider_events, mut receiver) =
+        provider_event_channel(NonZeroUsize::new(PROVIDER_EVENT_CAPACITY).unwrap());
+    let request = ModelRequest {
+        messages: history,
+        tools,
+        cancellation: control.cancellation.clone(),
+        reasoning_level,
+        prompt_cache_key,
+    };
+    let request_options = runtime
+        .service_tier
+        .map(|tier| ModelRequestOptions::default().with_service_tier(tier))
+        .unwrap_or_default();
+    let cancellation_mode = provider.cancellation_mode();
+    let identity = provider.identity();
+    let profile = ModelCallProfile {
+        provider: identity.provider.clone(),
+        model: identity.model.clone(),
+        reasoning: reasoning_level,
+        service_tier: request_options.service_tier(),
+    };
+    let (offer_tx, steering_rx) = provider_steering_channel();
+    let mut offer_tx = Some(offer_tx);
+    let (outcomes_tx, mut outcomes_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut future =
+        provider.send_turn_stream_steerable(request, request_options, provider_events, steering_rx);
+    control.steering.offer_into(&mut offer_tx, &outcomes_tx);
+    let mut capture = StreamCapture::default();
+    let mut timer = ModelCallTimer::start(Instant::now());
+    let mut stream_open = true;
+    let mut commands_open = true;
+    let mut outcomes_open = true;
+    let result = loop {
+        tokio::select! {
+            result = &mut future => break (result, Instant::now()),
+            event = receiver.recv_timed_stream_event(), if stream_open => {
+                match event {
+                    Some(event) => {
+                        if let Err(error) = handle_timed_provider_stream_event(
+                            event,
+                            &mut timer,
+                            &identity,
+                            accumulated_usage,
+                            &mut capture,
+                            control.events,
+                            control.cancellation,
+                        ).await {
+                            if control.cancellation.is_cancelled() {
+                                drop(future);
+                                drain_cancelled_provider_events(
+                                    &mut receiver,
+                                    &identity,
+                                    &mut capture,
+                                );
+                            }
+                            control.steering.reset_delivery();
+                            return Err(RequestFailure::boxed(error, capture));
+                        }
+                    }
+                    None => stream_open = false,
+                }
+            }
+            command = control.commands.recv(), if commands_open => {
+                match command {
+                    Some(command) => {
+                        accept_non_tool_command(command, control.steering);
+                        control.steering.offer_into(&mut offer_tx, &outcomes_tx);
+                    }
+                    None => commands_open = false,
+                }
+            }
+            outcome = outcomes_rx.recv(), if outcomes_open => {
+                match outcome {
+                    Some(outcome) => {
+                        if let Err(error) = handle_steering_outcome(
+                            outcome,
+                            control.steering,
+                            control.events,
+                            control.cancellation,
+                        ).await {
+                            drop(future);
+                            control.steering.reset_delivery();
+                            return Err(RequestFailure::boxed(
+                                ProviderError::interrupted(error.to_string()),
+                                capture,
+                            ));
+                        }
+                    }
+                    None => outcomes_open = false,
+                }
+            }
+            notice = control.async_jobs.poll_event() => {
+                if let Err(error) = forward_job_notice(
+                    notice,
+                    control.pending_outputs,
+                    control.hooks,
+                    control.events,
+                    control.cancellation,
+                ).await {
+                    drop(future);
+                    control.steering.reset_delivery();
+                    return Err(RequestFailure::boxed(
+                        ProviderError::interrupted(error.to_string()),
+                        capture,
+                    ));
+                }
+            }
+            () = control.cancellation.cancelled() => {
+                if cancellation_mode == ProviderCancellationMode::Cooperative {
+                    drain_cooperative_provider_on_cancellation(
+                        &mut future,
+                        &mut receiver,
+                        &identity,
+                        &mut capture,
+                    )
+                    .await;
+                }
+                drop(future);
+                drain_cancelled_provider_events(&mut receiver, &identity, &mut capture);
+                control.steering.reset_delivery();
+                return Err(RequestFailure::boxed(
+                    ProviderError::interrupted("provider request cancelled"),
+                    capture,
+                ));
+            }
+        }
+    };
+    let (result, completed_at) = result;
+    drop(offer_tx);
+    drop(outcomes_tx);
+    while let Some(event) = receiver.try_recv_timed_stream_event() {
+        if let Err(error) = handle_timed_provider_stream_event(
+            event,
+            &mut timer,
+            &identity,
+            accumulated_usage,
+            &mut capture,
+            control.events,
+            control.cancellation,
+        )
+        .await
+        {
+            if control.cancellation.is_cancelled() {
+                drain_cancelled_provider_events(&mut receiver, &identity, &mut capture);
+            }
+            control.steering.reset_delivery();
+            return Err(RequestFailure::boxed(error, capture));
+        }
+    }
+    while let Ok(outcome) = outcomes_rx.try_recv() {
+        if let Err(error) = handle_steering_outcome(
+            outcome,
+            control.steering,
+            control.events,
+            control.cancellation,
+        )
+        .await
+        {
+            control.steering.reset_delivery();
+            return Err(RequestFailure::boxed(
+                ProviderError::interrupted(error.to_string()),
+                capture,
+            ));
+        }
+    }
+    match result {
+        Ok(response) => {
+            let metrics = timer.finish(completed_at, capture.usage().output_tokens);
+            if let Err(error) = emit(
+                control.events,
+                control.cancellation,
+                RunEvent::ModelCallCompleted { profile, metrics },
+            )
+            .await
+            {
+                control.steering.reset_delivery();
+                return Err(RequestFailure::boxed(
+                    ProviderError::interrupted(error.to_string()),
+                    capture,
+                ));
+            }
+            Ok((response, capture))
+        }
+        Err(error) => {
+            control.steering.reset_delivery();
+            Err(RequestFailure::boxed(error, capture))
+        }
+    }
+}
+
+async fn handle_timed_provider_stream_event(
+    (event, observed_at): (crate::provider::ProviderStreamEvent, Option<Instant>),
+    timer: &mut ModelCallTimer,
+    identity: &crate::model::ModelIdentity,
+    accumulated_usage: &ModelUsage,
+    capture: &mut StreamCapture,
+    events: &mpsc::Sender<RunEvent>,
+    cancellation: &CancellationToken,
+) -> Result<(), ProviderError> {
+    match event {
+        crate::provider::ProviderStreamEvent::Model(event) => {
+            if let ModelEvent::GenerationOutputTokens(tokens) = event {
+                timer.observe_generation_output_tokens(tokens);
+                return Ok(());
+            }
+            timer.observe(&event, observed_at);
+            handle_provider_event(
+                event,
+                identity,
+                accumulated_usage,
+                capture,
+                events,
+                cancellation,
+            )
+            .await
+        }
+        crate::provider::ProviderStreamEvent::Request(event) => {
+            timer.discard_attempt_output(observed_at);
+            handle_provider_request_event(event, capture, events, cancellation).await
+        }
+    }
+}
+
+async fn handle_provider_request_event(
+    event: crate::provider::ProviderRequestEvent,
+    capture: &mut StreamCapture,
+    events: &mpsc::Sender<RunEvent>,
+    cancellation: &CancellationToken,
+) -> Result<(), ProviderError> {
+    let crate::provider::ProviderRequestEvent::RequestAttemptFailed { kind, usage } = event;
+    capture.record_request_attempt_failure(kind, usage);
+    emit(events, cancellation, RunEvent::ProviderRequestRetry)
+        .await
+        .map_err(|error| ProviderError::interrupted(error.to_string()))
+}
+
+async fn handle_provider_event(
+    event: ModelEvent,
+    identity: &crate::model::ModelIdentity,
+    accumulated_usage: &ModelUsage,
+    capture: &mut StreamCapture,
+    events: &mpsc::Sender<RunEvent>,
+    cancellation: &CancellationToken,
+) -> Result<(), ProviderError> {
+    let Some(run_event) = capture_provider_event(event, identity, accumulated_usage, capture)
+    else {
+        return Ok(());
+    };
+    emit(events, cancellation, run_event)
+        .await
+        .map_err(|error| ProviderError::interrupted(error.to_string()))
+}
+
+pub(super) async fn emit(
+    events: &mpsc::Sender<RunEvent>,
+    cancellation: &CancellationToken,
+    event: RunEvent,
+) -> Result<(), Error> {
+    tokio::select! {
+        biased;
+        result = events.send(event) => result.map_err(|_| Error::Interrupted {
+            message: "run event consumer was dropped".into(),
+        }),
+        () = cancellation.cancelled() => Err(Error::Cancelled),
+    }
+}

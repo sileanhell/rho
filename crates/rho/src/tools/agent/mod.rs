@@ -1,0 +1,559 @@
+//! Delegated agent tools backed by native SDK runtimes or an ACP host.
+
+mod host_orchestrator;
+mod host_tools;
+pub(crate) mod message_receipt;
+
+pub(crate) use host_tools::install_host_delegation;
+
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+};
+
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use {
+    crate::agent::{AdvertisedAgents, AgentCatalog},
+    crate::app::subagent_manager::ValidatedMessage,
+    rho_sdk::tool::{
+        OperationKind, PreparedToolInvocation, Tool, ToolError, ToolErrorKind, ToolInvocation,
+        ToolMetadata, ToolOutput, ToolPreparationContext, ToolPrepareFuture, ToolResource,
+        ToolResourceAccess, ToolSecurity,
+    },
+};
+
+use super::agent_output::{
+    format_background_start, format_list_entry, format_snapshot, AgentRunView, SnapshotFormat,
+};
+
+const SUBAGENT_MANAGER: &str = "subagents";
+const AGENT_TOOL: &str = "agent";
+const AGENTS_TOOL: &str = "agents";
+
+pub use crate::app::subagent_manager::{SubagentManager, SubagentNotification, SubagentSnapshot};
+
+pub(crate) use super::agent_output::merge_notification_context;
+pub(crate) use super::agent_output::notification_prompt;
+
+pub struct AgentTool {
+    manager: SubagentManager,
+    max_output_bytes: usize,
+    /// Directory definitions are rediscovered from at each launch.
+    cwd: PathBuf,
+    /// Fixed at construction so the spec never rewrites what the caller was
+    /// told; later corrections are appended to the conversation instead.
+    advertised: AdvertisedAgents,
+    mutation_observer: Arc<dyn rho_tools::WorkspaceMutationObserver>,
+}
+
+impl AgentTool {
+    pub(super) fn new(
+        manager: SubagentManager,
+        cwd: &Path,
+        catalog: Option<Arc<AgentCatalog>>,
+    ) -> Self {
+        let catalog = catalog.unwrap_or_else(|| {
+            Arc::new(AgentCatalog::discover(cwd).expect("agent catalog was validated at startup"))
+        });
+        Self {
+            manager,
+            cwd: cwd.to_path_buf(),
+            advertised: AdvertisedAgents::from_catalog(&catalog),
+            mutation_observer: Arc::new(()),
+            max_output_bytes: rho_tools::DEFAULT_MAX_OUTPUT_BYTES,
+        }
+    }
+
+    fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
+        self.max_output_bytes = max_output_bytes;
+        self
+    }
+
+    fn with_mutation_observer(
+        mut self,
+        mutation_observer: Arc<dyn rho_tools::WorkspaceMutationObserver>,
+    ) -> Self {
+        self.mutation_observer = mutation_observer;
+        self
+    }
+
+    async fn execute(
+        &self,
+        args: AgentArgs,
+        context: &rho_sdk::tool::AuthorizedToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        // Resolve from disk, not the startup snapshot: the user may have
+        // deleted or edited the definition (for example in `/agents`) since
+        // the session began. The spec's agent list stays stable on purpose.
+        let catalog = AgentCatalog::discover(&self.cwd).map_err(|error| {
+            ToolError::new(
+                ToolErrorKind::Execution,
+                format!("could not reload agent definitions: {error}"),
+            )
+        })?;
+        let definition = catalog
+            .find(&args.agent_id)
+            .map_err(|error| ToolError::new(ToolErrorKind::InvalidArguments, error.to_string()))?
+            .definition
+            .clone();
+        let definition_id = definition.id.to_string();
+        self.mutation_observer
+            .mark_untracked_effect(rho_tools::UntrackedWorkspaceEffect::MutatingTool, "agent");
+        let cwd = context
+            .workspace_root()
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+
+        let spawn = self
+            .manager
+            .spawn(&definition, &args.prompt, &cwd, args.model.as_deref());
+        tokio::pin!(spawn);
+        let (run_id, _log_file) = tokio::select! {
+            result = &mut spawn => result.map_err(|error| {
+                ToolError::new(
+                    ToolErrorKind::Execution,
+                    format!("failed to start delegated agent: {error}"),
+                )
+            })?,
+            () = context.cancellation().cancelled() => {
+                // Finish registration so the manager retains ownership and
+                // host shutdown can cancel the delegated task.
+                let _ = spawn.await;
+                return Err(ToolError::cancelled());
+            }
+        };
+
+        // Registration is the start receipt; instant failures still reach
+        // the parent through automatic completion delivery.
+        let snapshot = self
+            .manager
+            .status(&run_id)
+            .expect("newly registered delegated run");
+        rho_tools::Rendered::new(
+            format_background_start(&run_id, &definition_id),
+            AgentRunView::started_with_identity(&snapshot),
+        )
+        .limit_data(self.max_output_bytes)?
+        .into_tool_output(agent_metadata())
+    }
+}
+
+#[derive(Deserialize)]
+struct AgentArgs {
+    agent_id: String,
+    prompt: String,
+    model: Option<String>,
+}
+
+impl Tool for AgentTool {
+    fn spec(&self) -> rho_sdk::model::ToolSpec {
+        let background_guidance = " Every call starts a background run and returns its id immediately. Completions arrive automatically at safe provider boundaries and wake an idle parent. Continue independent work, or end your turn to wait for required results. Never sleep or poll for results, and do not declare the task complete before required agents finish.";
+        agent_spec(&self.advertised, background_guidance)
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        Some(rho_tools::output_schema::<AgentRunView>())
+    }
+
+    fn security(&self) -> ToolSecurity {
+        ToolSecurity::built_in([])
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        invocation: ToolInvocation,
+        _context: ToolPreparationContext,
+    ) -> ToolPrepareFuture<'a> {
+        let args = parse_agent_args(invocation.into_arguments());
+        Box::pin(async move {
+            let args = args?;
+            // Registry ops are mutex-protected and short. Shared access lets
+            // several launches in one batch overlap.
+            Ok(PreparedToolInvocation::resource_aware(
+                [ToolResourceAccess::shared(ToolResource::manager_state(
+                    SUBAGENT_MANAGER,
+                ))],
+                [],
+                agent_metadata(),
+                move |context| Box::pin(async move { self.execute(args, &context).await }),
+            ))
+        })
+    }
+}
+
+pub struct AgentsTool {
+    manager: SubagentManager,
+    max_output_bytes: usize,
+}
+
+impl AgentsTool {
+    pub fn new(manager: SubagentManager) -> Self {
+        Self {
+            manager,
+            max_output_bytes: rho_tools::DEFAULT_MAX_OUTPUT_BYTES,
+        }
+    }
+
+    pub(super) fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
+        self.max_output_bytes = max_output_bytes;
+        self
+    }
+
+    async fn execute(&self, args: AgentsArgs) -> Result<ToolOutput, ToolError> {
+        let (content, data) = match args.action.as_str() {
+            "list" => {
+                let agents = self.manager.list();
+                let content = if agents.is_empty() {
+                    "no delegated agents".to_string()
+                } else {
+                    agents
+                        .iter()
+                        .map(format_list_entry)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                (
+                    content,
+                    AgentsOutput::List {
+                        runs: agents.iter().map(AgentRunView::from).collect(),
+                    },
+                )
+            }
+            "status" => {
+                let id = required_id(&args)?;
+                let snapshot = self.manager.observe(id).ok_or_else(|| {
+                    ToolError::new(
+                        ToolErrorKind::InvalidArguments,
+                        format!("unknown delegated run '{id}'"),
+                    )
+                })?;
+                // A finished run hands over its full result here and counts
+                // as delivered; a running run reports progress only.
+                let format = if snapshot.done {
+                    SnapshotFormat::Completion
+                } else {
+                    SnapshotFormat::Status
+                };
+                (
+                    format_snapshot(&snapshot, format),
+                    AgentsOutput::Status {
+                        run: AgentRunView::from(&snapshot),
+                    },
+                )
+            }
+            "stop" => {
+                let id = required_id(&args)?;
+                let snapshot =
+                    self.manager.stop(id).await.map_err(|error| {
+                        ToolError::new(ToolErrorKind::Execution, error.to_string())
+                    })?;
+                (
+                    format_snapshot(&snapshot, SnapshotFormat::Completion),
+                    AgentsOutput::Stop {
+                        run: AgentRunView::from(&snapshot),
+                    },
+                )
+            }
+            "message" => {
+                let id = required_id(&args)?;
+                let text = args.message.as_deref().ok_or_else(|| {
+                    ToolError::new(
+                        ToolErrorKind::InvalidArguments,
+                        "message action requires message text",
+                    )
+                })?;
+                // Parse at this argument boundary so an empty or over-budget
+                // body reads as invalid arguments, not an execution failure.
+                let message = ValidatedMessage::parse(text).map_err(|error| {
+                    ToolError::new(ToolErrorKind::InvalidArguments, error.to_string())
+                })?;
+                self.manager
+                    .message(id, &message)
+                    .await
+                    .map_err(|error| ToolError::new(ToolErrorKind::Execution, error.to_string()))?;
+                let content = match self.manager.task_identity(id) {
+                    Some(identity) => message_receipt::MessageReceipt {
+                        run_id: identity.run_id,
+                        agent_id: identity.agent_id,
+                        task: identity.task,
+                    }
+                    .content(),
+                    None => format!("queued parent message for delegated run '{id}'"),
+                };
+                (content, AgentsOutput::Message { id: id.to_owned() })
+            }
+            other => {
+                return Err(ToolError::new(
+                    ToolErrorKind::InvalidArguments,
+                    format!("unknown action '{other}': expected list, status, stop, or message"),
+                ))
+            }
+        };
+        rho_tools::Rendered::new(content, data)
+            .limit_data(self.max_output_bytes)?
+            .into_tool_output(agents_metadata())
+    }
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum AgentsOutput {
+    List { runs: Vec<AgentRunView> },
+    Status { run: AgentRunView },
+    Stop { run: AgentRunView },
+    Message { id: String },
+}
+
+#[derive(Deserialize)]
+struct AgentsArgs {
+    action: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+impl Tool for AgentsTool {
+    fn spec(&self) -> rho_sdk::model::ToolSpec {
+        rho_sdk::model::ToolSpec {
+            name: AGENTS_TOOL.into(),
+            description: "Check on, stop, or message a delegated background run. Completions and child notices are delivered automatically at safe provider boundaries during work and before final completion. Completions and requests for parent action can wake an idle parent; informational child notices cannot. Waiting for a result means ending your turn, not polling status. While a run is in progress, status reports progress only and never partial output - do not act on a run's result before it finishes. Once a run has finished, status or stop returns its final result with pending notices as earlier context and counts as delivery, so it will not be redelivered automatically. Use action=message to steer a running child with plain text: Rho-runtime children apply it at the next provider turn; claude-cli, cursor, and antigravity children receive it as their next queued user turn.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "status", "stop", "message"],
+                        "description": "Operation to perform"
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "Delegated run ID (required for status, stop, and message)"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Plain-text parent message (required for message). Rho children apply it at the next provider turn; Claude-cli, Cursor, and Antigravity children queue it as their next user turn."
+                    }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        Some(rho_tools::output_schema::<AgentsOutput>())
+    }
+
+    fn security(&self) -> ToolSecurity {
+        ToolSecurity::built_in([])
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        invocation: ToolInvocation,
+        _context: ToolPreparationContext,
+    ) -> ToolPrepareFuture<'a> {
+        let args = parse_agents_args(invocation.into_arguments());
+        Box::pin(async move {
+            let args = args?;
+            // list/status/stop all touch the mutex-backed registry briefly.
+            // Shared access keeps lifecycle ops from serializing launches.
+            Ok(PreparedToolInvocation::resource_aware(
+                [ToolResourceAccess::shared(ToolResource::manager_state(
+                    SUBAGENT_MANAGER,
+                ))],
+                [],
+                agents_metadata(),
+                move |_context| Box::pin(async move { self.execute(args).await }),
+            ))
+        })
+    }
+}
+
+/// Shared launch contract; each backend supplies its completion guidance.
+fn agent_spec(
+    advertised: &AdvertisedAgents,
+    background_guidance: &str,
+) -> rho_sdk::model::ToolSpec {
+    let names: Vec<&str> = advertised.iter().map(|(name, _)| name).collect();
+    // Deliberately model-free: policy is reloaded at launch, while the spec
+    // preserves the catalog the caller was originally told about.
+    let summaries = advertised
+        .iter()
+        .map(|(name, description)| format!("{name}: {description}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let parallel_guidance =
+        " Independent agent calls in the same batch run together - issue them in one turn for parallel work.";
+    rho_sdk::model::ToolSpec {
+        name: AGENT_TOOL.into(),
+        description: format!(
+            "Delegate a substantial, self-contained task to a fresh agent.{parallel_guidance}{background_guidance}\n\nAgents:\n{summaries}"
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "enum": names,
+                    "description": "Agent ID"
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Self-contained task and all context the agent needs"
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional per-call Rho model reference (provider/model, catalog model ID, or @alias). Replaces the definition's model/provider/auth pins for this call only; omitted preserves its policy. Unsupported for external runtimes. Unavailable models or credentials fail without fallback."
+                }
+            },
+            "required": ["agent_id", "prompt"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn parse_agent_args(arguments: Value) -> Result<AgentArgs, ToolError> {
+    let args: AgentArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::new(ToolErrorKind::InvalidArguments, error.to_string()))?;
+    if args
+        .model
+        .as_deref()
+        .is_some_and(|model| model.is_empty() || model.contains(char::is_whitespace))
+    {
+        return Err(ToolError::new(
+            ToolErrorKind::InvalidArguments,
+            "model override must be a non-empty model reference without whitespace",
+        ));
+    }
+    Ok(args)
+}
+
+fn parse_agents_args(arguments: Value) -> Result<AgentsArgs, ToolError> {
+    serde_json::from_value(arguments)
+        .map_err(|error| ToolError::new(ToolErrorKind::InvalidArguments, error.to_string()))
+}
+
+fn agent_metadata() -> ToolMetadata {
+    ToolMetadata::new().operation(OperationKind::Other(AGENT_TOOL.into()))
+}
+
+fn agents_metadata() -> ToolMetadata {
+    ToolMetadata::new().operation(OperationKind::Other(AGENTS_TOOL.into()))
+}
+
+fn required_id(args: &AgentsArgs) -> Result<&str, ToolError> {
+    args.id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            ToolError::new(
+                ToolErrorKind::InvalidArguments,
+                "this action requires a delegated run id",
+            )
+        })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DelegationToolSelection {
+    Launch,
+    Manage,
+    LaunchAndManage,
+}
+
+impl DelegationToolSelection {
+    pub(super) fn from_capabilities(
+        capabilities: &crate::agent::AgentCapabilities,
+    ) -> Option<Self> {
+        use crate::agent::ToolCapability;
+
+        match (
+            capabilities.contains(&ToolCapability::Agent),
+            capabilities.contains(&ToolCapability::Agents),
+        ) {
+            (true, true) => Some(Self::LaunchAndManage),
+            (true, false) => Some(Self::Launch),
+            (false, true) => Some(Self::Manage),
+            (false, false) => None,
+        }
+    }
+
+    fn launches(self) -> bool {
+        matches!(self, Self::Launch | Self::LaunchAndManage)
+    }
+
+    fn manages(self) -> bool {
+        matches!(self, Self::Manage | Self::LaunchAndManage)
+    }
+}
+
+pub(super) struct DelegationBundleOptions {
+    pub cwd: PathBuf,
+    pub tools: DelegationToolSelection,
+    pub config_path: PathBuf,
+    /// Catalog already discovered for `cwd`; rediscovered when absent.
+    pub catalog: Option<Arc<AgentCatalog>>,
+    /// The parent's host I/O, which delegated Rho agents share.
+    pub host_io: crate::tools::host_io::HostIo,
+}
+
+pub(super) struct SdkDelegationBundle {
+    tools: Vec<Arc<dyn rho_sdk::tool::Tool>>,
+    manager: SubagentManager,
+    advertised: Option<AdvertisedAgents>,
+}
+
+impl SdkDelegationBundle {
+    pub(super) fn manager_handle(&self) -> SubagentManager {
+        self.manager.clone()
+    }
+
+    /// The catalog the `agent` tool spec advertises; `None` without that tool.
+    pub(super) fn take_advertised_agents(&mut self) -> Option<AdvertisedAgents> {
+        self.advertised.take()
+    }
+}
+
+impl super::sdk_registry::ToolBundle for SdkDelegationBundle {
+    fn tools(&self) -> &[Arc<dyn rho_sdk::tool::Tool>] {
+        &self.tools
+    }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.manager.shutdown())
+    }
+}
+
+pub(super) fn sdk_bundle(
+    config: &crate::config::Config,
+    options: DelegationBundleOptions,
+    mutation_observer: Arc<dyn rho_tools::WorkspaceMutationObserver>,
+) -> SdkDelegationBundle {
+    let manager = SubagentManager::new(config.clone(), options.config_path, options.cwd.clone())
+        .with_host_io(options.host_io);
+    let mut tools = Vec::<Arc<dyn rho_sdk::tool::Tool>>::new();
+    let mut advertised = None;
+    if options.tools.launches() {
+        let tool = AgentTool::new(manager.clone(), &options.cwd, options.catalog)
+            .with_max_output_bytes(config.max_output_bytes)
+            .with_mutation_observer(mutation_observer);
+        advertised = Some(tool.advertised.clone());
+        tools.push(Arc::new(tool));
+    }
+    if options.tools.manages() {
+        tools.push(Arc::new(
+            AgentsTool::new(manager.clone()).with_max_output_bytes(config.max_output_bytes),
+        ));
+    }
+    SdkDelegationBundle {
+        tools,
+        manager,
+        advertised,
+    }
+}

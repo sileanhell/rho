@@ -1,0 +1,864 @@
+//! Picker widget: filtering, input, overlay layout, and shared rendering.
+//!
+//! Feature modules supply rows, labels, and a named constructor. This module
+//! owns opening, closing, filtering, cursor movement, key handling, parent
+//! stack, and overlay paint. Feature confirm/escape lives in
+//! `crate::tui::picker_actions`.
+
+use regex::{Regex, RegexBuilder};
+use std::{
+    cell::{Ref, RefCell},
+    ops::Deref,
+};
+
+mod action;
+mod detail;
+mod filter;
+mod input;
+mod lifecycle;
+mod overlay;
+mod overlay_layout;
+mod overlay_state;
+mod rows;
+pub(in crate::tui) mod runner;
+pub(in crate::tui) mod standalone;
+
+use action::PickerFilterMode;
+pub(in crate::tui) use action::{ConfigParentRow, DuringTurnSelect, PickerAction, PickerTurn};
+pub(in crate::tui) use detail::{
+    DetailBlock, DetailField, DetailSheet, DetailTone, DiffDetail, ExcerptAnchor, PickerDetail,
+};
+pub(super) use filter::{fuzzy_match_score, fuzzy_picker_matching_indices};
+use filter::{literal_matching_indices, picker_matching_indices_with_regex};
+pub(in crate::tui) use input::{
+    apply_picker_key, overlay_scroll_targets, PickerKeyEffect, PickerMouseEvent,
+};
+use overlay::{detail_content_line_count, overlay_detail_lines};
+pub(in crate::tui) use overlay::{picker_overlay_frame, OverlayChrome};
+use overlay_layout::DetailViewport;
+pub(in crate::tui) use overlay_layout::{
+    clamp_overlay_scroll, OverlayScrollbarState, OverlayShape,
+};
+pub(in crate::tui) use overlay_state::{OverlayFocus, OverlayScrollbarDrag};
+pub(in crate::tui) use rows::{
+    label_column_width, picker_item_rows, LabelOverflow, RowLayout, RowWidthMode,
+};
+
+#[derive(Debug)]
+pub(super) struct PickerMatches<'a>(Ref<'a, Vec<usize>>);
+
+impl Deref for PickerMatches<'_> {
+    type Target = Vec<usize>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl PartialEq<Vec<usize>> for PickerMatches<'_> {
+    fn eq(&self, other: &Vec<usize>) -> bool {
+        self.0.as_slice() == other.as_slice()
+    }
+}
+
+/// Optional key bindings advertised in footers and honored by picker input.
+///
+/// Renderers and input both read these fields so hints cannot drift from keys.
+/// Model-list labels come from the live keybindings; flags stay for the
+/// remaining hardcoded shortcuts (Tab, d/Delete).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct PickerKeyHints {
+    /// Bound key that pins or unpins the selected model, when shown.
+    pub(super) pin_toggle: Option<String>,
+    /// Bound key that switches the model list between all and pinned.
+    pub(super) scope_toggle: Option<String>,
+    /// What Tab does. Shift+Tab mirrors [`TabKey::CycleItems`].
+    pub(super) tab: TabKey,
+    /// Keys that remove the selected row.
+    pub(super) row_delete: RowDeleteKeys,
+}
+
+/// Keys that remove the selected picker row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::tui) enum RowDeleteKeys {
+    #[default]
+    Disabled,
+    /// `d` or Delete (sessions, workflows).
+    DOrDelete,
+    /// Delete only, so `d` still types into the filter (agents, whose ids
+    /// are commonly filtered by name).
+    DeleteOnly,
+}
+
+impl RowDeleteKeys {
+    /// Whether an unmodified `code` removes the selected row.
+    pub(in crate::tui) fn deletes(self, code: crossterm::event::KeyCode) -> bool {
+        use crossterm::event::KeyCode;
+        match self {
+            Self::Disabled => false,
+            Self::DOrDelete => matches!(code, KeyCode::Char('d') | KeyCode::Delete),
+            Self::DeleteOnly => code == KeyCode::Delete,
+        }
+    }
+
+    /// Footer hint for the bound keys.
+    fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::Disabled => None,
+            Self::DOrDelete => Some("d delete"),
+            Self::DeleteOnly => Some("Del delete"),
+        }
+    }
+}
+
+/// Picker behaviour bound to Tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::tui) enum TabKey {
+    #[default]
+    None,
+    /// Fill the filter from the selected row.
+    CompleteFilter,
+    /// Tab / Shift+Tab step to the next / previous item from either pane.
+    CycleItems,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PickerMatchCache {
+    initialized: bool,
+    filter: String,
+    _regex: Option<Regex>,
+    invalid_regex: bool,
+    indices: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DetailWrapCache {
+    width: usize,
+    /// The detail `lines` were built from. Compared by value, so edited or
+    /// reordered items can never serve stale rows.
+    detail: Option<PickerDetail>,
+    lines: Vec<ratatui::text::Line<'static>>,
+}
+
+/// Filter text and match-list index used to restore a refreshed picker.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct PickerCursor {
+    pub(super) filter: String,
+    /// Index into the filtered match list when the cursor was captured.
+    pub(super) match_index: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct UiPicker {
+    pub(super) title: String,
+    pub(super) key_hints: PickerKeyHints,
+    pub(super) items: Vec<PickerItem>,
+    pub(super) selected: usize,
+    pub(super) filter: String,
+    pub(in crate::tui::picker) action: PickerAction,
+    pub(super) layout: PickerLayout,
+    pub(super) badge_placement: PickerBadgePlacement,
+    /// Top visible detail line for overlay pickers.
+    pub(super) detail_scroll: usize,
+    /// Pane that keyboard scrolling targets in overlay pickers.
+    pub(super) overlay_focus: OverlayFocus,
+    /// Manual nav viewport offset (row space). Only used while
+    /// `nav_follows_selection` is false.
+    nav_scroll: usize,
+    /// Whether the nav viewport tracks the selection (keyboard mode) or holds
+    /// a manual wheel-scrolled offset.
+    nav_follows_selection: bool,
+    /// Active drag on an overlay scrollbar, if any.
+    overlay_scrollbar_drag: Option<OverlayScrollbarDrag>,
+    /// Nav row under the mouse pointer, in row space.
+    hovered_nav_row: Option<usize>,
+    pub(super) confirm_verb: Option<String>,
+    /// Inventory-empty copy when the filter is blank. Filter misses stay
+    /// "no matches".
+    empty_message: Option<String>,
+    /// Status set when this picker is restored as a parent.
+    restore_status: &'static str,
+    /// When set, overrides [`PickerAction::filter_mode`] with fuzzy matching.
+    pub(super) force_fuzzy_filter: bool,
+    /// When set, Space confirms the row like Enter (toggle-style pickers).
+    space_confirms: bool,
+    /// Boxed: few pickers set it, and `ComposerMode::Picker` holds this
+    /// struct inline, so its size counts against clippy's variant budget.
+    pub(super) overlay_chrome: Option<Box<OverlayChrome>>,
+    pub(super) overlay_shape: OverlayShape,
+    pub(super) label_overflow: LabelOverflow,
+    /// Config page this picker shows. Returning to it from a child rebuilds
+    /// its rows from saved config; see [`crate::tui::App::pop_picker_level`].
+    config_page: Option<crate::tui::config_picker::ConfigPage>,
+    parent: Option<Box<UiPicker>>,
+    matches: RefCell<PickerMatchCache>,
+    detail_wrap_cache: RefCell<DetailWrapCache>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PickerItem {
+    pub(super) label: String,
+    pub(super) section: Option<String>,
+    pub(super) detail: Option<PickerDetail>,
+    pub(super) preview: Option<String>,
+    pub(super) badge: Option<PickerBadge>,
+    pub(super) value: String,
+    /// Optional Enter verb for this row. Overrides action defaults and badge heuristics.
+    pub(super) selection_verb: Option<&'static str>,
+    /// When false, Tab does not copy this row into the filter.
+    pub(super) allow_filter_completion: bool,
+    /// Hidden terms the filter also matches, such as the labels and values of
+    /// choices nested under this row. Never rendered.
+    pub(super) search_terms: Vec<String>,
+}
+
+impl PickerItem {
+    /// A plain row: no section, detail, preview, badge, selection verb, or
+    /// search terms, and Tab may complete the filter from it. Set anything
+    /// else with struct-update syntax, so a new field only touches the rows
+    /// that use it:
+    ///
+    /// ```ignore
+    /// PickerItem {
+    ///     detail: Some(detail.into()),
+    ///     ..PickerItem::new(label, value)
+    /// }
+    /// ```
+    pub(super) fn new(label: String, value: String) -> Self {
+        Self {
+            label,
+            section: None,
+            detail: None,
+            preview: None,
+            badge: None,
+            value,
+            selection_verb: None,
+            allow_filter_completion: true,
+            search_terms: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PickerBadge {
+    pub(super) text: String,
+    pub(super) tone: PickerBadgeTone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PickerBadgeTone {
+    Internal,
+    Editable,
+    Selected,
+    Favorite,
+    Healthy,
+    Warning,
+    /// Failed state; the strongest alarm tone.
+    Error,
+    /// Present but secondary; recedes next to other tones.
+    Muted,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum PickerBadgePlacement {
+    #[default]
+    Navigation,
+    Detail,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum PickerLayout {
+    #[default]
+    List,
+    /// Large popup shell. Detail pane appears when items carry detail text.
+    Overlay,
+}
+
+impl PickerLayout {
+    pub(super) fn is_overlay(self) -> bool {
+        matches!(self, Self::Overlay)
+    }
+}
+
+pub(super) fn cmp_ascii_ignore_case(left: &str, right: &str) -> std::cmp::Ordering {
+    left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
+}
+
+/// Sort picker rows by label (case-insensitive), breaking ties on value.
+pub(super) fn sort_items_by_ascii_label(items: &mut [PickerItem]) {
+    items.sort_by(|left, right| {
+        cmp_ascii_ignore_case(&left.label, &right.label).then_with(|| left.value.cmp(&right.value))
+    });
+}
+
+macro_rules! picker_ctors {
+    ($($name:ident => $action:ident),+ $(,)?) => {
+        $(
+            pub(in crate::tui) fn $name(title: impl Into<String>, items: Vec<PickerItem>) -> Self {
+                Self::new(title, items, PickerAction::$action)
+            }
+        )+
+    };
+}
+
+macro_rules! picker_is {
+    ($($name:ident => $action:ident),+ $(,)?) => {
+        $(
+            pub(in crate::tui) fn $name(&self) -> bool {
+                self.action == PickerAction::$action
+            }
+        )+
+    };
+}
+
+impl UiPicker {
+    pub(in crate::tui) fn login_flow(
+        title: impl Into<String>,
+        items: Vec<PickerItem>,
+        target: crate::tui::login_flow::LoginFlowTarget,
+    ) -> Self {
+        Self::new(title, items, PickerAction::LoginFlow(Box::new(target)))
+    }
+
+    pub(in crate::tui::picker) fn new(
+        title: impl Into<String>,
+        items: Vec<PickerItem>,
+        action: PickerAction,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            key_hints: PickerKeyHints::default(),
+            items,
+            selected: 0,
+            filter: String::new(),
+            action,
+            layout: PickerLayout::List,
+            badge_placement: PickerBadgePlacement::Navigation,
+            detail_scroll: 0,
+            overlay_focus: OverlayFocus::default(),
+            nav_scroll: 0,
+            nav_follows_selection: true,
+            overlay_scrollbar_drag: None,
+            hovered_nav_row: None,
+            confirm_verb: None,
+            empty_message: None,
+            restore_status: "ready",
+            force_fuzzy_filter: false,
+            space_confirms: false,
+            overlay_chrome: None,
+            overlay_shape: OverlayShape::Compact,
+            label_overflow: LabelOverflow::KeepStart,
+            config_page: None,
+            parent: None,
+            matches: RefCell::default(),
+            detail_wrap_cache: RefCell::default(),
+        }
+    }
+
+    picker_ctors! {
+        models => SelectModel,
+        internal_agent_models => SelectInternalAgentModel,
+        advisor_reasoning => SelectAdvisorReasoning,
+        login_group => LoginGroup,
+        login_provider => LoginProvider,
+        logout_provider => LogoutProvider,
+        switch_auth_mode => SwitchAuthMode,
+        refresh_model_list => RefreshModelList,
+        insert_skill => InsertSkillCommand,
+        prompt_history => RecallPrompt,
+        view_agent => ViewAgent,
+        view_mcp => ViewMcpServers,
+        resume_session => ResumeSession,
+        manage_sessions => ManageSessions,
+        tree => SelectTreeNode,
+        copy_output => CopyOutput,
+        rewind_checkpoint => SelectRewindCheckpoint,
+        confirm_rewind => ConfirmRewindCheckpoint,
+        config => Config,
+        theme => SelectTheme,
+        edit_agent => EditAgent,
+        workflow => Workflow,
+        attach_subagent => AttachSubagent,
+        view_diff => ViewDiff,
+        dismiss => Dismiss,
+    }
+
+    picker_is! {
+        is_config => Config,
+        is_theme => SelectTheme,
+        is_mcp_inventory => ViewMcpServers,
+        is_edit_agent => EditAgent,
+        is_view_agent => ViewAgent,
+        is_attach_subagent => AttachSubagent,
+        is_conversation_model => SelectModel,
+        is_internal_agent_model => SelectInternalAgentModel,
+        is_advisor_reasoning => SelectAdvisorReasoning,
+        is_manage_sessions => ManageSessions,
+        is_resume_session => ResumeSession,
+        is_workflow => Workflow,
+        is_view_diff => ViewDiff,
+    }
+
+    pub(in crate::tui) fn is_model_list(&self) -> bool {
+        self.action.is_model_list()
+    }
+
+    pub(in crate::tui) fn space_confirms_selection(&self) -> bool {
+        self.space_confirms || self.action.space_confirms_selection()
+    }
+
+    pub(in crate::tui) fn restore_status(&self) -> &'static str {
+        self.restore_status
+    }
+
+    pub(super) fn with_layout(mut self, layout: PickerLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    pub(super) fn with_key_hints(mut self, key_hints: PickerKeyHints) -> Self {
+        self.key_hints = key_hints;
+        self
+    }
+
+    pub(super) fn with_fuzzy_filter(mut self) -> Self {
+        self.force_fuzzy_filter = true;
+        self
+    }
+
+    pub(super) fn with_space_confirm(mut self) -> Self {
+        self.space_confirms = true;
+        self
+    }
+
+    pub(super) fn filter_mode(&self) -> PickerFilterMode {
+        if self.force_fuzzy_filter {
+            PickerFilterMode::Fuzzy
+        } else {
+            self.action.filter_mode()
+        }
+    }
+
+    pub(super) fn with_badge_placement(mut self, placement: PickerBadgePlacement) -> Self {
+        self.badge_placement = placement;
+        self
+    }
+
+    pub(super) fn with_overlay_chrome(mut self, chrome: OverlayChrome) -> Self {
+        self.overlay_chrome = Some(Box::new(chrome));
+        self
+    }
+
+    pub(super) fn with_overlay_shape(mut self, shape: OverlayShape) -> Self {
+        self.overlay_shape = shape;
+        self
+    }
+
+    pub(super) fn with_label_overflow(mut self, overflow: LabelOverflow) -> Self {
+        self.label_overflow = overflow;
+        self
+    }
+
+    pub(super) fn is_overlay(&self) -> bool {
+        self.layout.is_overlay()
+    }
+
+    /// Whether any item carries detail text. Shared by inline and overlay pickers.
+    pub(super) fn has_item_details(&self) -> bool {
+        self.items.iter().any(|item| item.detail.is_some())
+    }
+
+    /// Selection changed: show it, and return the nav viewport to it.
+    fn on_selection_changed(&mut self) {
+        self.reset_detail_scroll();
+        self.nav_follows_selection = true;
+    }
+
+    /// Filter + match index for reopening this picker near the same place.
+    pub(super) fn cursor(&self) -> super::PickerCursor {
+        let match_index = self
+            .matching_indices()
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        super::PickerCursor {
+            filter: self.filter.clone(),
+            match_index,
+        }
+    }
+
+    /// Restore filter and select the match nearest to `cursor.match_index`.
+    pub(super) fn restore_cursor(&mut self, cursor: &super::PickerCursor) {
+        self.filter = cursor.filter.clone();
+        let selected = {
+            let matches = self.matching_indices();
+            matches
+                .get(cursor.match_index.min(matches.len().saturating_sub(1)))
+                .copied()
+                .unwrap_or(0)
+        };
+        self.selected = selected;
+        self.on_selection_changed();
+    }
+
+    pub(super) fn select_by_offset(&mut self, delta: isize) {
+        let next = {
+            let matches = self.matching_indices();
+            if matches.is_empty() || delta == 0 {
+                return;
+            }
+            let position = matches
+                .iter()
+                .position(|index| *index == self.selected)
+                .unwrap_or(0);
+            let next_position = if delta < 0 {
+                position.saturating_sub(delta.unsigned_abs())
+            } else {
+                position
+                    .saturating_add(delta as usize)
+                    .min(matches.len().saturating_sub(1))
+            };
+            matches[next_position]
+        };
+        if next != self.selected {
+            self.selected = next;
+            self.on_selection_changed();
+        }
+    }
+
+    pub(super) fn reset_detail_scroll(&mut self) {
+        self.detail_scroll = 0;
+    }
+
+    pub(super) fn scroll_detail_by(&mut self, delta: isize, viewport: DetailViewport) {
+        if !self.has_scrollable_detail() {
+            return;
+        }
+        self.detail_scroll = if delta < 0 {
+            self.detail_scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.detail_scroll.saturating_add(delta as usize)
+        };
+        self.clamp_detail_scroll(viewport);
+    }
+
+    pub(super) fn scroll_detail_home(&mut self) {
+        if !self.has_scrollable_detail() {
+            return;
+        }
+        self.reset_detail_scroll();
+    }
+
+    pub(super) fn scroll_detail_end(&mut self, viewport: DetailViewport) {
+        if !self.has_scrollable_detail() {
+            return;
+        }
+        let line_count = self.detail_line_count(viewport.width);
+        self.detail_scroll = line_count.saturating_sub(viewport.rows.max(1));
+    }
+
+    pub(super) fn scroll_detail_page(&mut self, delta_pages: isize, viewport: DetailViewport) {
+        if !self.has_scrollable_detail() {
+            return;
+        }
+        let rows = viewport.rows.max(1) as isize;
+        self.scroll_detail_by(delta_pages.saturating_mul(rows), viewport);
+    }
+
+    pub(super) fn clamp_detail_scroll(&mut self, viewport: DetailViewport) {
+        if !self.has_scrollable_detail() {
+            return;
+        }
+        let line_count = self.detail_line_count(viewport.width);
+        self.detail_scroll =
+            overlay::clamp_detail_scroll(self.detail_scroll, line_count, viewport.rows);
+    }
+
+    pub(super) fn detail_line_count(&self, detail_width: usize) -> usize {
+        detail_content_line_count(
+            self.wrapped_detail_lines(detail_width).len(),
+            self.selected_detail_badge().is_some(),
+        )
+    }
+
+    pub(super) fn wrapped_detail_lines(
+        &self,
+        detail_width: usize,
+    ) -> Ref<'_, Vec<ratatui::text::Line<'static>>> {
+        let detail = self.selected_detail();
+        let width = detail_width.max(1);
+        let stale = {
+            let cache = self.detail_wrap_cache.borrow();
+            cache.width != width || cache.detail.as_ref() != detail || cache.lines.is_empty()
+        };
+        if stale {
+            *self.detail_wrap_cache.borrow_mut() = DetailWrapCache {
+                width,
+                detail: detail.cloned(),
+                lines: overlay_detail_lines(detail, width),
+            };
+        }
+        Ref::map(self.detail_wrap_cache.borrow(), |cache| &cache.lines)
+    }
+
+    pub(super) fn selected_detail_badge(&self) -> Option<&PickerBadge> {
+        if self.badge_placement != PickerBadgePlacement::Detail {
+            return None;
+        }
+        self.selected_item()?.badge.as_ref()
+    }
+
+    pub(super) fn selected_detail(&self) -> Option<&PickerDetail> {
+        self.selected_item().and_then(|item| item.detail.as_ref())
+    }
+
+    pub(super) fn confirm_action_label(&self) -> &str {
+        if let Some(verb) = self.selected_item().and_then(|item| item.selection_verb) {
+            return verb;
+        }
+        if let Some(verb) = self.confirm_verb.as_deref() {
+            return verb;
+        }
+        self.action.default_confirm_verb()
+    }
+
+    pub(super) fn action_footer(&self) -> String {
+        super::composer_chrome::join_footer_parts(
+            self.action_footer_parts()
+                .iter()
+                .map(std::string::String::as_str),
+        )
+    }
+
+    /// Key-hint segments for overlay and inline footers (no title prefix).
+    pub(super) fn action_footer_parts(&self) -> Vec<String> {
+        let confirm = self.confirm_action_label();
+        let escape = self.escape_verb();
+        let mut parts = Vec::new();
+        // Dismiss overlays use Enter and Esc for the same exit.
+        if confirm == escape {
+            parts.push(format!("Enter/Esc {confirm}"));
+        } else {
+            parts.push(format!("Enter {confirm}"));
+        }
+        if self.space_confirms {
+            parts.push(format!("Space {confirm}"));
+        } else if self.action.space_confirms_selection() {
+            parts.push("Space confirm".into());
+        }
+        if let Some(key) = &self.key_hints.pin_toggle {
+            parts.push(format!("{key} pin/unpin"));
+        }
+        if let Some(key) = &self.key_hints.scope_toggle {
+            parts.push(format!("{key} all/pinned"));
+        }
+        match self.key_hints.tab {
+            TabKey::None => {}
+            TabKey::CompleteFilter => parts.push("Tab complete".into()),
+            TabKey::CycleItems => parts.push("Tab next".into()),
+        }
+        if let Some(hint) = self.key_hints.row_delete.hint() {
+            parts.push(hint.into());
+        }
+        if confirm != escape {
+            parts.push(format!("Esc {escape}"));
+        }
+        parts
+    }
+
+    /// Inline list footer: title plus shared action hints and search cue.
+    pub(super) fn list_footer_parts(&self) -> Vec<String> {
+        let mut parts = vec![self.title.clone(), "Type to search".into()];
+        parts.extend(self.action_footer_parts());
+        parts
+    }
+
+    fn escape_verb(&self) -> &'static str {
+        if self.has_parent() {
+            return "back";
+        }
+        match self.confirm_action_label() {
+            "close" => "close",
+            _ => "cancel",
+        }
+    }
+
+    /// Empty-match message when the filter yields no rows.
+    pub(super) fn empty_match_message(&self) -> &str {
+        if self.filter_is_invalid_regex() {
+            "invalid regex"
+        } else if self.filter.is_empty() {
+            self.empty_message.as_deref().unwrap_or("no matches")
+        } else {
+            "no matches"
+        }
+    }
+
+    pub(super) fn filter_is_invalid_regex(&self) -> bool {
+        // Ensure the match cache is current before reading the flag.
+        let _ = self.matching_indices();
+        self.matches.borrow().invalid_regex
+    }
+
+    pub(super) fn with_confirm_verb(mut self, verb: impl Into<String>) -> Self {
+        self.confirm_verb = Some(verb.into());
+        self
+    }
+
+    pub(super) fn with_empty_message(mut self, message: impl Into<String>) -> Self {
+        self.empty_message = Some(message.into());
+        self
+    }
+
+    pub(super) fn with_restore_status(mut self, status: &'static str) -> Self {
+        self.restore_status = status;
+        self
+    }
+
+    pub(super) fn with_parent(mut self, parent: UiPicker) -> Self {
+        self.parent = Some(Box::new(parent));
+        self
+    }
+
+    pub(super) fn with_config_page(mut self, page: crate::tui::config_picker::ConfigPage) -> Self {
+        self.config_page = Some(page);
+        self
+    }
+
+    pub(super) fn config_page(&self) -> Option<crate::tui::config_picker::ConfigPage> {
+        self.config_page
+    }
+
+    pub(super) fn has_parent(&self) -> bool {
+        self.parent.is_some()
+    }
+
+    pub(super) fn take_parent(&mut self) -> Option<UiPicker> {
+        self.parent.take().map(|parent| *parent)
+    }
+
+    pub(super) fn select_previous(&mut self) {
+        let next = {
+            let matches = self.matching_indices();
+            if matches.is_empty() {
+                return;
+            }
+            let position = matches
+                .iter()
+                .position(|index| *index == self.selected)
+                .unwrap_or(0);
+            if position == 0 {
+                *matches.last().unwrap()
+            } else {
+                matches[position - 1]
+            }
+        };
+        self.selected = next;
+        self.on_selection_changed();
+    }
+
+    pub(super) fn select_next(&mut self) {
+        let next = {
+            let matches = self.matching_indices();
+            if matches.is_empty() {
+                return;
+            }
+            let position = matches
+                .iter()
+                .position(|index| *index == self.selected)
+                .unwrap_or(0);
+            matches[(position + 1) % matches.len()]
+        };
+        self.selected = next;
+        self.on_selection_changed();
+    }
+
+    pub(super) fn push_filter_char(&mut self, ch: char) {
+        self.filter.push(ch);
+        self.select_first_match();
+    }
+
+    pub(super) fn pop_filter_char(&mut self) {
+        self.filter.pop();
+        self.select_first_match();
+    }
+
+    pub(super) fn complete_filter(&mut self) {
+        let Some(item) = self.selected_item() else {
+            return;
+        };
+        if !Self::row_allows_filter_completion(item) {
+            return;
+        }
+        self.filter = match self.filter_mode() {
+            PickerFilterMode::Regex => regex::escape(&item.value),
+            PickerFilterMode::Fuzzy | PickerFilterMode::Literal => item.value.clone(),
+        };
+    }
+
+    fn row_allows_filter_completion(item: &PickerItem) -> bool {
+        item.allow_filter_completion
+    }
+
+    pub(super) fn select_first_match(&mut self) {
+        let first = self.matching_indices().first().copied();
+        if let Some(index) = first {
+            self.selected = index;
+            self.on_selection_changed();
+        }
+    }
+
+    pub(super) fn select_last_match(&mut self) {
+        let last = self.matching_indices().last().copied();
+        if let Some(index) = last {
+            self.selected = index;
+            self.on_selection_changed();
+        }
+    }
+
+    pub(super) fn matching_indices(&self) -> PickerMatches<'_> {
+        let stale = {
+            let cache = self.matches.borrow();
+            !cache.initialized || cache.filter != self.filter
+        };
+        if stale {
+            let filter = self.filter.trim();
+            let mode = self.filter_mode();
+            let (regex, invalid_regex) = if mode == PickerFilterMode::Regex && !filter.is_empty() {
+                match RegexBuilder::new(filter).case_insensitive(true).build() {
+                    Ok(regex) => (Some(regex), false),
+                    Err(_) => (None, true),
+                }
+            } else {
+                (None, false)
+            };
+            let indices = match mode {
+                PickerFilterMode::Regex => {
+                    picker_matching_indices_with_regex(&self.items, filter, regex.as_ref())
+                }
+                PickerFilterMode::Fuzzy => fuzzy_picker_matching_indices(&self.items, filter),
+                PickerFilterMode::Literal => literal_matching_indices(&self.items, filter),
+            };
+            *self.matches.borrow_mut() = PickerMatchCache {
+                initialized: true,
+                filter: self.filter.clone(),
+                _regex: regex,
+                invalid_regex,
+                indices,
+            };
+        }
+        PickerMatches(Ref::map(self.matches.borrow(), |cache| &cache.indices))
+    }
+
+    /// Index into `items` of the selected row, when it passes the filter.
+    pub(super) fn selected_index(&self) -> Option<usize> {
+        self.selected_item().map(|_| self.selected)
+    }
+
+    pub(super) fn selected_item(&self) -> Option<&PickerItem> {
+        self.matching_indices()
+            .contains(&self.selected)
+            .then(|| self.items.get(self.selected))
+            .flatten()
+    }
+}

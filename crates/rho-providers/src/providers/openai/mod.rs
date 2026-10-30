@@ -1,0 +1,685 @@
+use std::collections::BTreeSet;
+
+use serde_json::Value;
+
+pub mod auth;
+pub mod cache;
+mod codex_continuation;
+mod codex_request;
+mod codex_steer;
+mod codex_ws;
+mod configuration_update;
+mod reasoning;
+mod remote_compaction;
+pub(crate) mod responses_post;
+
+pub use cache::prompt_cache_key_from_session_id;
+
+/// Returns whether a Codex model offers OpenAI's faster priority tier.
+///
+/// GPT-5.5+ and GPT-6 bill fast mode at 2x; older Codex models ignore
+/// `service_tier`, so Rho omits it for them.
+pub fn supports_fast_mode(provider: &str, model: &str) -> bool {
+    provider == "openai-codex"
+        && (matches!(
+            model,
+            "gpt-5.5"
+                | "gpt-5.6"
+                | "gpt-6-astra"
+                | "gpt-6.1-sol"
+                | "gpt-6.1-terra"
+                | "gpt-6-sol"
+                | "gpt-6-luna"
+        ) || model
+            .strip_prefix("gpt-5.6-")
+            .is_some_and(|suffix| !suffix.is_empty()))
+}
+
+/// Returns whether a Responses model accepts `"async": true` on function tools.
+///
+/// OpenAI documents this for `gpt-6-astra` and later. Rho gates on the GPT-6
+/// family for first-party OpenAI and Codex hosts; Codex rejects the flag on
+/// GPT-5.6 with a 400.
+pub fn supports_async_tools(provider: &str, model: &str) -> bool {
+    matches!(provider, "openai" | "openai-codex") && is_gpt6_family(model)
+}
+
+/// Returns whether changing reasoning effort keeps the cached prompt prefix
+/// for the provider bound to `identity`.
+///
+/// Every OpenAI Responses provider, first-party or custom host, carries
+/// GPT-6 family effort changes as `configuration_update` input items instead
+/// of rewriting request-level effort, so the cached prefix stays valid.
+/// Everywhere else effort is part of the prefix.
+pub fn reasoning_change_preserves_prefix(identity: &ModelIdentity) -> bool {
+    identity.api == codex_request::RESPONSES_API
+        && configuration_update::preserves_prefix_for(&identity.model)
+}
+
+/// Whether `response.steer` is forwarded over the Codex websocket. Verified
+/// live only on Astra.
+fn supports_mid_turn_steering(model: &str) -> bool {
+    model == "gpt-6-astra"
+}
+
+/// GPT-6 family ids: `gpt-6-<tier>` and point releases such as `gpt-6.1-<tier>`.
+///
+/// Gates wire-protocol capabilities only. Billing tiers such as fast mode stay
+/// per-model allowlists.
+pub(super) fn is_gpt6_family(model: &str) -> bool {
+    model
+        .strip_prefix("gpt-6")
+        .is_some_and(|rest| rest.starts_with(['-', '.']))
+}
+
+use crate::protocol::openai_responses::collect_codex_sse_response;
+use crate::providers::responses_http::{
+    ResponsesEndpoint, ResponsesHttpResult, ResponsesHttpTransport,
+};
+use auth::Auth;
+use codex_request::{build_responses_create_body, ResponsesCreateBody, ResponsesProfile};
+use codex_ws::{CodexWsTransport, CodexWsTurn};
+use reasoning::OpenAiReasoningProfile;
+
+use rho_sdk::provider::{ModelRequestOptions, ProviderSteeringReceiver};
+
+use crate::model::{
+    ModelError, ModelEvent, ModelIdentity, ModelRequest, ModelResponse, ModelUsage,
+};
+
+#[cfg(test)]
+use crate::provider_backend::stream_timeout::provider_client;
+
+pub struct OpenAiProvider {
+    client: reqwest::Client,
+    auth: Option<Auth>,
+    api_base: String,
+    profile: ResponsesProfile,
+    reasoning: OpenAiReasoningProfile,
+    codex_ws: CodexWsTransport,
+    hosted_web_search: bool,
+    async_tools: BTreeSet<String>,
+    session_headers: super::opencode::SessionHeaders,
+    compression: super::request_body::EndpointCompression,
+}
+
+impl OpenAiProvider {
+    #[cfg(test)]
+    pub(crate) fn new_with_auth(model: String, auth: Auth) -> Self {
+        Self::new_with_transport(
+            model,
+            auth,
+            provider_client(),
+            None,
+            /*hosted_web_search*/ true,
+            BTreeSet::new(),
+        )
+    }
+
+    pub(crate) fn new_with_transport(
+        model: String,
+        auth: Auth,
+        client: reqwest::Client,
+        api_base_override: Option<String>,
+        hosted_web_search: bool,
+        async_tools: BTreeSet<String>,
+    ) -> Self {
+        let profile = ResponsesProfile::from_auth(&auth, model);
+        Self::from_profile(
+            profile,
+            Some(auth),
+            client,
+            api_base_override,
+            hosted_web_search,
+            async_tools,
+        )
+    }
+
+    /// Responses transport branded with a catalog or custom-host identity.
+    ///
+    /// `auth` is `None` for keyless custom Responses hosts (no Authorization).
+    /// API-key and keyless paths are storeless.
+    pub(crate) fn new_with_identity(
+        model: String,
+        auth: Option<Auth>,
+        client: reqwest::Client,
+        api_base_override: Option<String>,
+        hosted_web_search: bool,
+        async_tools: BTreeSet<String>,
+        identity_provider: &'static str,
+    ) -> Self {
+        let profile = ResponsesProfile::from_optional_auth(auth.as_ref(), model, identity_provider);
+        Self::from_profile(
+            profile,
+            auth,
+            client,
+            api_base_override,
+            hosted_web_search,
+            async_tools,
+        )
+    }
+
+    fn from_profile(
+        profile: ResponsesProfile,
+        auth: Option<Auth>,
+        client: reqwest::Client,
+        api_base_override: Option<String>,
+        hosted_web_search: bool,
+        async_tools: BTreeSet<String>,
+    ) -> Self {
+        let api_base = api_base_override.unwrap_or_else(|| profile.default_api_base().to_string());
+        let reasoning = OpenAiReasoningProfile::from_metadata(
+            crate::model::models_dev::current_model_metadata(profile.provider(), profile.model()),
+        );
+        let codex_ws = CodexWsTransport::new(&api_base);
+        let session_headers = super::opencode::SessionHeaders::new(profile.provider());
+        Self {
+            client,
+            auth,
+            api_base,
+            profile,
+            reasoning,
+            codex_ws,
+            session_headers,
+            hosted_web_search,
+            async_tools,
+            compression: super::request_body::EndpointCompression::Verified,
+        }
+    }
+
+    /// Replaces the built-in endpoint allowlist for HTTP Responses bodies.
+    /// Codex WebSocket frames are not HTTP bodies and stay unchanged.
+    pub(crate) fn with_request_compression(
+        mut self,
+        compression: super::request_body::EndpointCompression,
+    ) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    fn http(&self) -> ResponsesHttpTransport<'_> {
+        ResponsesHttpTransport::new(&self.client, &self.api_base)
+            .with_request_compression(self.compression)
+    }
+
+    async fn post_responses(
+        &self,
+        endpoint: ResponsesEndpoint,
+        body: &Value,
+        cancellation: Option<&rho_sdk::CancellationToken>,
+    ) -> ResponsesHttpResult {
+        responses_post::post(
+            &self.http().with_headers(
+                self.session_headers
+                    .headers(body.get("prompt_cache_key").and_then(Value::as_str)),
+            ),
+            &self.client,
+            self.auth.as_ref(),
+            responses_post::DEFAULT_CODEX_REFRESH_URL,
+            endpoint,
+            body,
+            cancellation,
+        )
+        .await
+    }
+
+    fn create_body(
+        &self,
+        request: ModelRequest<'_>,
+        options: ModelRequestOptions,
+    ) -> Result<ResponsesCreateBody, ModelError> {
+        build_responses_create_body(
+            &self.profile,
+            &self.reasoning,
+            request,
+            &options,
+            self.hosted_web_search,
+            &self.async_tools,
+        )
+    }
+
+    /// Plain HTTP Responses hosts take `max_output_tokens` per request. The
+    /// Codex WebSocket transport is excluded: it chains each request onto the
+    /// previous response, so a capped side request would become the base the
+    /// next real turn continues from.
+    pub(crate) fn applies_max_output_tokens(&self) -> bool {
+        !self.profile.contract().uses_codex_websocket()
+    }
+
+    #[cfg(test)]
+    async fn openai_api_responses_body(
+        &self,
+        request: ModelRequest<'_>,
+    ) -> Result<Value, ModelError> {
+        Ok(self
+            .create_body(request, ModelRequestOptions::default())?
+            .body)
+    }
+}
+
+impl OpenAiProvider {
+    pub(crate) fn model_identity(&self) -> ModelIdentity {
+        self.profile.identity().clone()
+    }
+
+    /// Completes one turn using a `Send` future suitable for the public SDK trait.
+    pub(crate) async fn complete_turn(
+        &self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ModelError> {
+        if self.profile.contract().uses_codex_websocket() {
+            self.send_codex_responses_complete(request).await
+        } else {
+            self.send_openai_api_responses_complete(request).await
+        }
+    }
+
+    /// Streams one turn through a `Send` callback for the public SDK adapter.
+    pub(crate) async fn stream_turn(
+        &self,
+        request: ModelRequest<'_>,
+        on_event: &mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send),
+        on_request_event: &mut (dyn FnMut(rho_sdk::provider::ProviderRequestEvent) -> Result<(), ModelError>
+                  + Send),
+    ) -> Result<ModelResponse, ModelError> {
+        self.stream_turn_with_options(
+            request,
+            ModelRequestOptions::default(),
+            on_event,
+            on_request_event,
+        )
+        .await
+    }
+
+    pub(crate) async fn stream_turn_with_options(
+        &self,
+        request: ModelRequest<'_>,
+        options: ModelRequestOptions,
+        on_event: &mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send),
+        on_request_event: &mut (dyn FnMut(rho_sdk::provider::ProviderRequestEvent) -> Result<(), ModelError>
+                  + Send),
+    ) -> Result<ModelResponse, ModelError> {
+        if self.profile.contract().uses_codex_websocket() {
+            self.send_codex_responses_stream(request, options, on_event, on_request_event)
+                .await
+        } else {
+            self.send_openai_api_responses_stream(request, options, on_event)
+                .await
+        }
+    }
+
+    fn forward_turn_event(
+        &self,
+        event: ModelEvent,
+        in_force_effort: Option<&str>,
+        reasoning_effort_emitted: &mut bool,
+        on_event: &mut Option<&mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send)>,
+    ) -> Result<(), ModelError> {
+        if configuration_update::preserves_prefix_for(self.profile.model()) {
+            configuration_update::forward_with_reasoning_effort(
+                event,
+                in_force_effort,
+                reasoning_effort_emitted,
+                on_event,
+            )
+        } else if let Some(on_event) = on_event.as_mut() {
+            on_event(event)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) async fn stream_turn_steerable(
+        &self,
+        request: ModelRequest<'_>,
+        options: ModelRequestOptions,
+        steering: ProviderSteeringReceiver,
+        on_event: &mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send),
+        on_request_event: &mut (dyn FnMut(rho_sdk::provider::ProviderRequestEvent) -> Result<(), ModelError>
+                  + Send),
+    ) -> Result<ModelResponse, ModelError> {
+        if self.profile.contract().uses_codex_websocket()
+            && supports_mid_turn_steering(self.profile.model())
+        {
+            self.send_codex_responses_inner(
+                request,
+                options,
+                Some(on_event),
+                on_request_event,
+                Some(steering),
+            )
+            .await
+        } else {
+            drop(steering);
+            self.stream_turn_with_options(request, options, on_event, on_request_event)
+                .await
+        }
+    }
+
+    fn emit_turn_reasoning_effort(
+        &self,
+        in_force_effort: Option<&str>,
+        on_event: &mut Option<&mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send)>,
+    ) -> Result<(), ModelError> {
+        if !configuration_update::preserves_prefix_for(self.profile.model()) {
+            return Ok(());
+        }
+        configuration_update::emit_reasoning_effort(in_force_effort, on_event)
+    }
+}
+
+crate::impl_sdk_model_provider!(
+    OpenAiProvider,
+    native_compact,
+    request_options(max_output_tokens = Self::applies_max_output_tokens),
+    steerable
+);
+
+impl OpenAiProvider {
+    async fn send_codex_responses_complete(
+        &self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ModelError> {
+        let body = self
+            .create_body(request, ModelRequestOptions::default())?
+            .body;
+        let tokens = Auth::codex_tokens_for_auth(self.auth.as_ref())?;
+        let body = match self
+            .codex_ws
+            .send_responses_turn_silent(body, &tokens)
+            .await?
+        {
+            CodexWsTurn::Completed(response) => return Ok(response.response),
+            CodexWsTurn::FullSseFallback { body, .. } => body,
+        };
+
+        let http_result = self
+            .post_responses(ResponsesEndpoint::Create, &body, /*cancellation*/ None)
+            .await;
+        let response = match http_result.response {
+            Ok(response) => response,
+            Err(err) => {
+                self.codex_ws.reset().await;
+                return Err(err);
+            }
+        };
+        if !response.status().is_success() {
+            self.codex_ws.reset().await;
+            return Err(crate::provider_backend::http_error::from_response(response).await);
+        }
+        self.collect_codex_sse_response_silent(response, &body)
+            .await
+    }
+
+    async fn send_codex_responses_stream(
+        &self,
+        request: ModelRequest<'_>,
+        options: ModelRequestOptions,
+        on_event: &mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send),
+        on_request_event: &mut (dyn FnMut(rho_sdk::provider::ProviderRequestEvent) -> Result<(), ModelError>
+                  + Send),
+    ) -> Result<ModelResponse, ModelError> {
+        self.send_codex_responses_inner(request, options, Some(on_event), on_request_event, None)
+            .await
+    }
+
+    async fn send_codex_responses_inner(
+        &self,
+        request: ModelRequest<'_>,
+        options: ModelRequestOptions,
+        mut on_event: Option<&mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send)>,
+        on_request_event: &mut (dyn FnMut(rho_sdk::provider::ProviderRequestEvent) -> Result<(), ModelError>
+                  + Send),
+        mut steering: Option<ProviderSteeringReceiver>,
+    ) -> Result<ModelResponse, ModelError> {
+        let ResponsesCreateBody {
+            body,
+            in_force_effort,
+        } = self.create_body(request, options)?;
+        let tokens = Auth::codex_tokens_for_auth(self.auth.as_ref())?;
+        let mut reasoning_effort_emitted = false;
+        let has_event_sink = on_event.is_some();
+        let ws_turn = {
+            let mut forward = |event| {
+                self.forward_turn_event(
+                    event,
+                    in_force_effort.as_deref(),
+                    &mut reasoning_effort_emitted,
+                    &mut on_event,
+                )
+            };
+            let mut ws_events = has_event_sink.then_some(
+                &mut forward as &mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send),
+            );
+            self.codex_ws
+                .send_responses_turn_steerable(body, &tokens, &mut ws_events, &mut steering)
+                .await?
+        };
+        let body = match ws_turn {
+            CodexWsTurn::Completed(response) => {
+                report_service_tier_fallback(
+                    options.service_tier(),
+                    response.service_tier.as_deref(),
+                    &mut on_event,
+                )?;
+                if !reasoning_effort_emitted {
+                    self.emit_turn_reasoning_effort(in_force_effort.as_deref(), &mut on_event)?;
+                }
+                return Ok(response.response);
+            }
+            CodexWsTurn::FullSseFallback {
+                request_submitted,
+                body,
+            } => {
+                if request_submitted {
+                    // The submitted WebSocket request may have reached the model
+                    // before the transport failed, so account for it separately.
+                    on_request_event(
+                        rho_sdk::provider::ProviderRequestEvent::RequestAttemptFailed {
+                            kind: rho_sdk::ProviderErrorKind::Unavailable,
+                            usage: ModelUsage::default(),
+                        },
+                    )?;
+                }
+                body
+            }
+        };
+
+        let http_result = self
+            .post_responses(ResponsesEndpoint::Create, &body, /*cancellation*/ None)
+            .await;
+        for attempt in &http_result.failed_attempts {
+            on_request_event(
+                rho_sdk::provider::ProviderRequestEvent::RequestAttemptFailed {
+                    kind: attempt.kind.provider_error_kind(),
+                    usage: ModelUsage::default(),
+                },
+            )?;
+        }
+        let response = match http_result.response {
+            Ok(response) => response,
+            Err(err) => {
+                self.codex_ws.reset().await;
+                return Err(err);
+            }
+        };
+        if !response.status().is_success() {
+            self.codex_ws.reset().await;
+            return Err(crate::provider_backend::http_error::from_response(response).await);
+        }
+        self.collect_codex_sse_response(
+            response,
+            options.service_tier(),
+            in_force_effort.as_deref(),
+            &mut reasoning_effort_emitted,
+            &mut on_event,
+            &body,
+        )
+        .await
+    }
+
+    async fn collect_codex_sse_response(
+        &self,
+        response: reqwest::Response,
+        requested_service_tier: Option<rho_sdk::model::ServiceTier>,
+        in_force_effort: Option<&str>,
+        reasoning_effort_emitted: &mut bool,
+        on_event: &mut Option<&mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send)>,
+        body: &Value,
+    ) -> Result<ModelResponse, ModelError> {
+        let has_event_sink = on_event.is_some();
+        let collected = {
+            let mut forward = |event| {
+                self.forward_turn_event(event, in_force_effort, reasoning_effort_emitted, on_event)
+            };
+            let mut response_events = has_event_sink.then_some(
+                &mut forward as &mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send),
+            );
+            collect_codex_sse_response(response, &mut response_events).await
+        };
+        match collected {
+            Ok(output) => {
+                report_service_tier_fallback(
+                    requested_service_tier,
+                    output.service_tier.as_deref(),
+                    on_event,
+                )?;
+                if !*reasoning_effort_emitted {
+                    self.emit_turn_reasoning_effort(in_force_effort, on_event)?;
+                }
+                self.codex_ws
+                    .record_full_request_success(body, &output)
+                    .await?;
+                Ok(output.response)
+            }
+            Err(err) => {
+                self.codex_ws.reset().await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn collect_codex_sse_response_silent(
+        &self,
+        response: reqwest::Response,
+        body: &Value,
+    ) -> Result<ModelResponse, ModelError> {
+        match crate::providers::send_stream::collect_codex_sse_silent(response).await {
+            Ok(output) => {
+                self.codex_ws
+                    .record_full_request_success(body, &output)
+                    .await?;
+                Ok(output.response)
+            }
+            Err(err) => {
+                self.codex_ws.reset().await;
+                Err(err)
+            }
+        }
+    }
+
+    /// `POST /responses/compact` exists only on first-party OpenAI hosts.
+    /// Catalog Responses gateways (opencode-go, custom hosts) reuse this
+    /// transport but do not serve the endpoint, so skip straight to portable
+    /// summary compaction instead of paying a failed round trip.
+    fn native_compact_available(&self) -> bool {
+        matches!(self.profile.provider(), "openai" | "openai-codex")
+    }
+
+    async fn native_compact_turn(
+        &self,
+        request: ModelRequest<'_>,
+    ) -> Result<rho_sdk::provider::NativeCompactionResponse, ModelError> {
+        let http = self.http();
+        Ok(remote_compaction::compact_with_http(
+            remote_compaction::CompactHttp {
+                auth: self.auth.as_ref(),
+                profile: &self.profile,
+                reasoning_profile: &self.reasoning,
+                http: &http,
+                client: &self.client,
+                refresh_url: responses_post::DEFAULT_CODEX_REFRESH_URL,
+                codex_ws: &self.codex_ws,
+            },
+            request,
+        )
+        .await)
+    }
+
+    async fn send_openai_api_responses_complete(
+        &self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ModelError> {
+        let cancellation = request.cancellation.clone();
+        let body = self
+            .create_body(request, ModelRequestOptions::default())?
+            .body;
+        let http_result = self
+            .post_responses(ResponsesEndpoint::Create, &body, Some(&cancellation))
+            .await;
+        let response = http_result.response?;
+        if !response.status().is_success() {
+            return Err(crate::provider_backend::http_error::from_response(response).await);
+        }
+        crate::providers::send_stream::collect_codex_model_response_silent(response).await
+    }
+
+    async fn send_openai_api_responses_stream(
+        &self,
+        request: ModelRequest<'_>,
+        options: ModelRequestOptions,
+        on_event: &mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send),
+    ) -> Result<ModelResponse, ModelError> {
+        let cancellation = request.cancellation.clone();
+        let ResponsesCreateBody {
+            body,
+            in_force_effort,
+        } = self.create_body(request, options)?;
+        let http_result = self
+            .post_responses(ResponsesEndpoint::Create, &body, Some(&cancellation))
+            .await;
+        let response = http_result.response?;
+        if !response.status().is_success() {
+            return Err(crate::provider_backend::http_error::from_response(response).await);
+        }
+        let mut on_event = Some(on_event);
+        let mut reasoning_effort_emitted = false;
+        let output = {
+            let mut forward = |event| {
+                self.forward_turn_event(
+                    event,
+                    in_force_effort.as_deref(),
+                    &mut reasoning_effort_emitted,
+                    &mut on_event,
+                )
+            };
+            let mut response_events =
+                Some(&mut forward as &mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send));
+            collect_codex_sse_response(response, &mut response_events).await?
+        };
+        if !reasoning_effort_emitted {
+            self.emit_turn_reasoning_effort(in_force_effort.as_deref(), &mut on_event)?;
+        }
+        Ok(output.response)
+    }
+}
+
+fn report_service_tier_fallback(
+    requested: Option<rho_sdk::model::ServiceTier>,
+    reported: Option<&str>,
+    on_event: &mut Option<&mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send)>,
+) -> Result<(), ModelError> {
+    let (Some(rho_sdk::model::ServiceTier::Priority), Some(used)) = (requested, reported) else {
+        return Ok(());
+    };
+    if used == "priority" {
+        return Ok(());
+    }
+    let Some(on_event) = on_event.as_mut() else {
+        return Ok(());
+    };
+    on_event(ModelEvent::ServiceTierFallback {
+        requested: rho_sdk::model::ServiceTier::Priority,
+        used: used.to_owned(),
+    })
+}

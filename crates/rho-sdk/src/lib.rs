@@ -1,0 +1,228 @@
+#![cfg_attr(test, allow(dead_code))]
+//! Embeddable, headless agent runtime for Rho.
+//!
+//! `rho-sdk` is the stable embeddable runtime used by the Rho coding agent. Its
+//! default feature set is intentionally empty: constructing the SDK does not
+//! grant filesystem, process, network, credential-store, or persistence access.
+//! Those capabilities stay on explicit host adapters (and future opt-in features
+//! if any move into this crate).
+//!
+//! The application crate remains the owner of CLI parsing, terminal behavior,
+//! interactive rendering, keybindings, updates, and application configuration.
+//!
+//! # Runtime ownership
+//!
+//! - [`Rho`] is the process-scoped runtime built from explicit providers, tools,
+//!   policies, and optional adapters.
+//! - [`Session`] owns one conversation history and permits a single active
+//!   [`Run`].
+//! - [`Run`] exposes ordered [`RunEvent`]s, cooperative cancellation, host input
+//!   responses, and a typed [`RunOutcome`].
+//! - [`ToolHost`] runs registered tools through SDK authorization and hooks
+//!   without a model provider. Its clones share one approval-memory session.
+//!
+//! Construction is side-effect-free by default: no automatic writes to `~/.rho`,
+//! no implicit environment reads, no credential-store access, and no terminal or
+//! logger setup.
+//!
+//! # Completion
+//!
+//! ```
+//! use rho_sdk::{
+//!     model::{ContentBlock, ModelIdentity, ModelResponse},
+//!     provider::{ScriptedProvider, ScriptedTurn},
+//!     Rho, SessionOptions,
+//! };
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), rho_sdk::Error> {
+//! let provider = ScriptedProvider::new(
+//!     ModelIdentity::new("scripted", "test", "model"),
+//!     [ScriptedTurn::completed(ModelResponse::Assistant(vec![
+//!         ContentBlock::Text("hello".into()),
+//!     ]))],
+//! );
+//! let rho = Rho::builder().provider(provider).build()?;
+//! let session = rho.session(SessionOptions::default()).await?;
+//! let outcome = session.complete("say hello").await?;
+//! assert_eq!(outcome.text(), "hello");
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Streaming
+//!
+//! [`Session::start`](crate::Session::start) provides ordered semantic events,
+//! bounded backpressure, a cancellation handle, and a typed final outcome. A
+//! dropped [`Run`](crate::Run) cancels and aborts its provider or tool future so
+//! one session never retains abandoned work.
+//!
+//! ```
+//! use rho_sdk::{
+//!     model::{ContentBlock, ModelEvent, ModelIdentity, ModelResponse},
+//!     provider::{ScriptedProvider, ScriptedTurn},
+//!     Rho, RunEvent, SessionOptions, UserInput,
+//! };
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), rho_sdk::Error> {
+//! let provider = ScriptedProvider::new(
+//!     ModelIdentity::new("scripted", "test", "model"),
+//!     [ScriptedTurn::streaming(
+//!         vec![ModelEvent::OutputDelta("hi".into())],
+//!         ModelResponse::Assistant(vec![ContentBlock::Text("hi".into())]),
+//!     )],
+//! );
+//! let rho = Rho::builder().provider(provider).build()?;
+//! let session = rho.session(SessionOptions::default()).await?;
+//! let mut run = session.start(UserInput::text("stream")).await?;
+//! while let Some(event) = run.next_event().await {
+//!     if let RunEvent::AssistantTextDelta { text } = event {
+//!         assert_eq!(text, "hi");
+//!     }
+//! }
+//! assert_eq!(run.outcome().await?.text(), "hi");
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Extension points
+//!
+//! Hosts can supply custom [`ModelProvider`](crate::provider::ModelProvider)
+//! and [`Tool`](crate::tool::Tool) implementations. Both return explicit `Send`
+//! futures suitable for trait objects. Legacy tools use capabilities supplied
+//! through [`ToolContext`](crate::tool::ToolContext). Resource-aware prepared
+//! tools receive [`AuthorizedToolContext`](crate::tool::AuthorizedToolContext),
+//! which cannot request capabilities beyond their prepared declaration.
+//!
+//! A [`DecisionModel`](crate::decision::DecisionModel) answers typed questions
+//! about a state, either from a decision model over a decision API or from
+//! any `ModelProvider` through
+//! [`TextDecisionModel`](crate::decision::text::TextDecisionModel).
+//!
+//! # Session snapshots
+//!
+//! [`Session::snapshot`](crate::Session::snapshot) produces a versioned,
+//! JSON-serializable [`SessionSnapshot`] restored through
+//! [`SessionOptions::from_snapshot`](crate::SessionOptions::from_snapshot).
+//! [`InMemorySessionStore`] is a concrete atomic adapter for tests and simple
+//! hosts. Snapshots never include credentials or raw reasoning.
+//!
+//! # Cancellation and host interaction
+//!
+//! - Cancel a run with [`Run::cancel`](crate::Run::cancel) or
+//!   [`Run::cancellation_handle`](crate::Run::cancellation_handle).
+//! - Retract staged steering with [`Run::steer_retractable`] and
+//!   [`Run::retract_steering`] before it is appended to conversation history.
+//! - Answer questionnaires with [`Run::respond`](crate::Run::respond) after
+//!   [`RunEvent::ToolHostInputRequested`].
+//! - Gate sensitive work with [`WorkspacePolicy`] and [`ApprovalHandler`].
+//! - Observe or deny tool use with [`hooks`](crate::hooks).
+//! - Use [`ToolHost::start`] for provider-free tools that report progress or ask
+//!   for host input, or [`ToolHost::invoke`] for non-interactive calls.
+//!
+//! The compiling examples under `examples/` cover simple completion, streaming,
+//! custom providers, custom tools, snapshot restore, image/history input,
+//! cancellation, and questionnaire/approval flows.
+//!
+//! # Security defaults
+//!
+//! The default feature set is empty. Creating an SDK runtime does not
+//! implicitly read environment variables, access an OS credential store, write
+//! to `~/.rho`, initialize a terminal or logger, check for updates, or grant
+//! tools filesystem, process, or network access.
+
+#![forbid(unsafe_code)]
+
+mod boundary_input;
+mod cancellation;
+mod client;
+mod compaction;
+mod compaction_decision;
+mod context_breakdown;
+mod context_estimate;
+pub mod decision;
+mod diagnostics;
+mod error;
+mod event;
+pub mod hooks;
+mod host_input;
+mod id;
+pub mod model;
+mod orchestration;
+mod persistence;
+pub mod provider;
+mod provider_steering;
+mod reasoning;
+mod request_context;
+mod run;
+mod secret;
+mod session;
+mod steering;
+pub mod text;
+pub mod tool;
+mod tool_host;
+mod usage;
+mod workspace;
+
+pub use boundary_input::{
+    boundary_input_channel, BoundaryInputRequest, BoundaryInputSource, InputBoundary,
+};
+pub use cancellation::CancellationToken;
+pub use client::{Rho, RhoBuilder, SessionOptions, ShutdownOutcome, SystemPrompt};
+pub use compaction::{
+    CompactionFuture, CompactionOutcome, CompactionOutput, CompactionPolicy, CompactionRequest,
+    CompactionState, CompactionThreshold, CompactionTrigger, Compactor, CompactorCancellationMode,
+    ScriptedCompactor,
+};
+pub use compaction_decision::{CompactionDecision, CompactionExtent, CompactionSkipReason};
+pub use context_breakdown::{ContextBreakdown, ContextItem, ContextPart};
+pub use context_estimate::ContextEstimate;
+pub use diagnostics::{DiagnosticsSnapshot, PromptSource, PromptSourceKind, ToolDiagnostic};
+pub use error::{
+    format_retry_after, Error, ProviderDiagnostic, ProviderError, ProviderErrorKind, Retryability,
+};
+pub use event::{
+    ModelCallMetrics, ModelCallProfile, ProviderStreamResetReason, RunEvent, RunOutcome,
+    StopReason, ToolCompletion, ToolFailure,
+};
+pub use host_input::{
+    DefaultSelection, HostChoice, HostInputRefusal, HostInputRequest, HostInputResponse,
+    HostInputSource, HostQuestion, SelectionMode,
+};
+pub use id::{
+    HookEventId, HostInputId, InvalidId, Revision, RunId, SessionId, SteeringId, ToolCallId,
+};
+pub use persistence::{
+    InMemorySessionStore, SessionSnapshot, SessionStore, SessionStoreFuture,
+    MIN_SESSION_SNAPSHOT_SCHEMA_VERSION, SESSION_SNAPSHOT_SCHEMA_VERSION,
+};
+pub use reasoning::{ParseReasoningLevelError, ReasoningLevel};
+pub use request_context::RequestContext;
+pub use run::{Run, SteeringHandle};
+pub use secret::SecretString;
+pub use session::{Session, SessionRequestPrefix, SessionState, UserInput};
+pub use steering::SteeringRetraction;
+pub use text::{
+    ceil_char_boundary, floor_char_boundary, ASCII_ELLIPSIS, DIAGNOSTIC_TRUNCATION_MARKER,
+    ELLIPSIS, TRUNCATION_MARKER,
+};
+pub use tool_host::{
+    ChildToolHostBuilder, PendingToolHostInput, ToolHost, ToolHostBuilder, ToolHostCall,
+    ToolHostEvent, ToolHostFuture, ToolHostRun,
+};
+pub use usage::{
+    ProviderRequestOutcome, ProviderRequestUsageContext, ProviderRequestUsageEvent,
+    ProviderRequestUsageRecorder, ProviderRequestUsageRecorderError,
+    ProviderRequestUsageRecorderFuture, ProviderRequestUsageRecording, UsageRecorderDiagnostic,
+};
+pub use workspace::{
+    approval_channel, ApprovalAuditDecision, ApprovalAuditRecord, ApprovalConcurrency,
+    ApprovalContext, ApprovalDecision, ApprovalFuture, ApprovalHandler, ApprovalRequest,
+    ApprovalRequestReceiver, ApprovalSession, AuthorizationDenialKind, AuthorizationError,
+    AuthorizationOutcome, CapabilityKind, CapabilityOperation, CapabilityRequest, CapabilitySource,
+    ChannelApprovalHandler, DenyAllPolicy, DenyApprovals, ExecutableSelection, NetworkTarget,
+    PathScope, PendingApproval, PolicyDecision, ProcessEnvironment, ProcessExecution,
+    ProcessInvocation, ProcessOutputLimits, ResolvedWorkspacePath, ScopedWorkspacePolicy,
+    Workspace, WorkspacePathError, WorkspacePathErrorKind, WorkspacePathState, WorkspacePolicy,
+};

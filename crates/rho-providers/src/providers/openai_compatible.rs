@@ -1,0 +1,287 @@
+#[path = "openai_compatible/reasoning.rs"]
+mod reasoning;
+
+use std::future::Future;
+
+pub(crate) use crate::openai_compatible_dialect::OpenAiCompatibleDialect;
+
+use crate::{
+    auth::kimi_token::KimiAuthManager,
+    auth::meta_token::MetaAuthManager,
+    auth::ollama_device::OllamaDeviceKey,
+    model::{ModelError, ModelEvent, ModelIdentity, ModelRequest, ModelResponse, ModelUsage},
+    protocol::openai_chat::{
+        convert_openai_response, invalid_stream_utf8, response_without_stream_context,
+        to_openai_messages_for_target, to_openai_tool, ChatRequest, ChatResponse,
+        ChatStreamAccumulator, ChatStreamOptions, HiddenReasoningRisk,
+    },
+    provider_backend::line_stream::collect_line_stream,
+    providers::responses_http::post_with_optional_refresh,
+};
+
+pub enum CompatibleAuth {
+    None,
+    ApiKey(String),
+    KimiOAuth(KimiAuthManager),
+    MetaOAuth(MetaAuthManager),
+    OllamaDevice(OllamaDeviceKey),
+}
+
+pub(crate) struct OpenAiCompatibleProvider {
+    client: reqwest::Client,
+    provider: &'static str,
+    model: String,
+    dialect: OpenAiCompatibleDialect,
+    auth: CompatibleAuth,
+    api_base: String,
+    reasoning: reasoning::DialectReasoning,
+    session_headers: super::opencode::SessionHeaders,
+    compression: super::request_body::EndpointCompression,
+}
+
+/// The request and its accounting policy share one resolved reasoning decision.
+struct PreparedChatRequest<'a> {
+    body: ChatRequest<'a>,
+    hidden_reasoning_risk: HiddenReasoningRisk,
+}
+
+impl OpenAiCompatibleProvider {
+    pub(crate) fn new(
+        client: reqwest::Client,
+        provider: &'static str,
+        model: String,
+        dialect: OpenAiCompatibleDialect,
+        auth: CompatibleAuth,
+        api_base: String,
+    ) -> Self {
+        let reasoning = reasoning::DialectReasoning::new(dialect, provider, &model);
+        Self {
+            client,
+            provider,
+            model,
+            dialect,
+            auth,
+            api_base,
+            reasoning,
+            session_headers: super::opencode::SessionHeaders::new(provider),
+            compression: super::request_body::EndpointCompression::Verified,
+        }
+    }
+
+    /// Replaces the built-in endpoint allowlist for chat request bodies.
+    pub(crate) fn with_request_compression(
+        mut self,
+        compression: super::request_body::EndpointCompression,
+    ) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    pub(crate) fn model_identity(&self) -> ModelIdentity {
+        ModelIdentity::new(self.provider, "openai-chat-completions", &self.model)
+    }
+
+    pub(crate) async fn complete_turn(
+        &self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ModelError> {
+        let PreparedChatRequest { body, .. } = self.request_body(request, false)?;
+        let response = self.send(&body, None).await?;
+        let response = crate::provider_backend::http_error::error_for_status(response).await?;
+        // `ModelResponse` cannot carry ProviderContext. Reasoning replay for
+        // Qwen-style tool loops requires `stream_turn` (Rho orchestration always
+        // streams). See `response_without_stream_context`.
+        Ok(response_without_stream_context(convert_openai_response(
+            response.json::<ChatResponse>().await?,
+            self.dialect.chat_tool_call_policy(),
+        )?))
+    }
+
+    pub(crate) async fn stream_turn(
+        &self,
+        request: ModelRequest<'_>,
+        on_event: &mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send),
+        on_request_event: &mut (dyn FnMut(rho_sdk::provider::ProviderRequestEvent) -> Result<(), ModelError>
+                  + Send),
+    ) -> Result<ModelResponse, ModelError> {
+        self.stream_inner(request, on_event, on_request_event).await
+    }
+
+    async fn stream_inner(
+        &self,
+        request: ModelRequest<'_>,
+        on_event: &mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send),
+        on_request_event: &mut (dyn FnMut(rho_sdk::provider::ProviderRequestEvent) -> Result<(), ModelError>
+                  + Send),
+    ) -> Result<ModelResponse, ModelError> {
+        let PreparedChatRequest {
+            body,
+            hidden_reasoning_risk,
+        } = self.request_body(request, true)?;
+        let response = self.send(&body, Some(on_request_event)).await?;
+        let response = crate::provider_backend::http_error::error_for_status(response).await?;
+        let mut chat_stream =
+            ChatStreamAccumulator::new(self.dialect.chat_tool_call_policy(), hidden_reasoning_risk);
+        collect_line_stream(response, invalid_stream_utf8, |line| {
+            chat_stream.handle_line(line, on_event)
+        })
+        .await?;
+        chat_stream.finish(on_event)
+    }
+
+    fn request_body<'a>(
+        &self,
+        request: ModelRequest<'a>,
+        stream: bool,
+    ) -> Result<PreparedChatRequest<'a>, ModelError> {
+        let target = self.model_identity();
+        let messages = to_openai_messages_for_target(request.messages, Some(&target))?;
+        let tools = request
+            .tools
+            .iter()
+            .map(to_openai_tool)
+            .map(|tool| self.dialect.normalize_tool(tool))
+            .collect::<Vec<_>>();
+        let has_tools = !tools.is_empty();
+        let decision = self.reasoning.resolve(&self.model, request.reasoning_level);
+        let wire_model = crate::provider::provider_descriptor(self.provider)
+            .map(|descriptor| descriptor.wire_model_id(&self.model))
+            .unwrap_or_else(|| self.model.clone());
+        let body = ChatRequest {
+            model: wire_model,
+            messages,
+            tools: has_tools.then_some(tools),
+            tool_choice: has_tools.then_some("auto"),
+            parallel_tool_calls: has_tools.then_some(true),
+            stream,
+            stream_options: stream.then_some(ChatStreamOptions {
+                include_usage: true,
+            }),
+            prompt_cache_key: request.prompt_cache_key.map(str::to_owned),
+            reasoning: decision.reasoning,
+            reasoning_effort: decision.reasoning_effort,
+            thinking: decision.thinking,
+            chat_template_kwargs: decision.chat_template_kwargs,
+        };
+        Ok(PreparedChatRequest {
+            body,
+            hidden_reasoning_risk: decision.hidden_reasoning_risk,
+        })
+    }
+
+    async fn send(
+        &self,
+        body: &ChatRequest<'_>,
+        on_request_event: Option<
+            &mut (dyn FnMut(rho_sdk::provider::ProviderRequestEvent) -> Result<(), ModelError>
+                      + Send),
+        >,
+    ) -> Result<reqwest::Response, ModelError> {
+        match &self.auth {
+            CompatibleAuth::None => self.send_request(body, RequestAuth::None).await,
+            CompatibleAuth::ApiKey(key) => self.send_request(body, RequestAuth::Bearer(key)).await,
+            CompatibleAuth::KimiOAuth(auth) => {
+                let token = auth.access_token().await?;
+                self.send_refreshing(body, on_request_event, &token, || {
+                    auth.force_refresh(&token)
+                })
+                .await
+            }
+            CompatibleAuth::MetaOAuth(auth) => {
+                let token = auth.access_token().await?;
+                self.send_refreshing(body, on_request_event, &token, || {
+                    auth.force_refresh(&token)
+                })
+                .await
+            }
+            CompatibleAuth::OllamaDevice(key) => {
+                self.send_request(body, RequestAuth::OllamaDevice(key))
+                    .await
+            }
+        }
+    }
+
+    async fn send_refreshing<F, Fut>(
+        &self,
+        body: &ChatRequest<'_>,
+        on_request_event: Option<
+            &mut (dyn FnMut(rho_sdk::provider::ProviderRequestEvent) -> Result<(), ModelError>
+                      + Send),
+        >,
+        token: &str,
+        refresh: F,
+    ) -> Result<reqwest::Response, ModelError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Option<String>, ModelError>> + Send,
+    {
+        let response = self.send_request(body, RequestAuth::Bearer(token)).await?;
+        post_with_optional_refresh(
+            response,
+            refresh,
+            || {
+                if let Some(on_request_event) = on_request_event {
+                    on_request_event(
+                        rho_sdk::provider::ProviderRequestEvent::RequestAttemptFailed {
+                            kind: rho_sdk::ProviderErrorKind::Authentication,
+                            usage: ModelUsage::default(),
+                        },
+                    )?;
+                }
+                Ok(())
+            },
+            |refreshed| async move {
+                self.send_request(body, RequestAuth::Bearer(&refreshed))
+                    .await
+            },
+            None,
+        )
+        .await
+        .response
+    }
+
+    async fn send_request(
+        &self,
+        body: &ChatRequest<'_>,
+        auth: RequestAuth<'_>,
+    ) -> Result<reqwest::Response, ModelError> {
+        let endpoint = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
+        let (url, authorization) = match &auth {
+            RequestAuth::None | RequestAuth::Bearer(_) => (endpoint, None),
+            RequestAuth::OllamaDevice(key) => {
+                let url = url::Url::parse(&endpoint).map_err(|error| {
+                    ModelError::InvalidResponse(format!("invalid chat completions URL: {error}"))
+                })?;
+                let (url, authorization) = key
+                    .authorize_request("POST", url)
+                    .map_err(|error| ModelError::InvalidResponse(error.to_string()))?;
+                (url.to_string(), Some(authorization))
+            }
+        };
+        let mut request = self.client.post(url).json(body).headers(
+            self.session_headers
+                .headers(body.prompt_cache_key.as_deref()),
+        );
+        match auth {
+            RequestAuth::None => {}
+            RequestAuth::Bearer(token) => {
+                request = request.bearer_auth(token);
+            }
+            RequestAuth::OllamaDevice(_) => {
+                request = request.header(
+                    reqwest::header::AUTHORIZATION,
+                    authorization.expect("Ollama device auth resolves an Authorization header"),
+                );
+            }
+        }
+        super::request_body::send(request, self.compression).await
+    }
+}
+
+enum RequestAuth<'a> {
+    None,
+    Bearer(&'a str),
+    OllamaDevice(&'a OllamaDeviceKey),
+}
+
+crate::impl_sdk_model_provider!(OpenAiCompatibleProvider);

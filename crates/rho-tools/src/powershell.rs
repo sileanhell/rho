@@ -1,0 +1,118 @@
+use crate::cancellation::RunCancellation;
+use crate::shell_process::{self, ShellArgs};
+use crate::tool::*;
+use rho_sdk::{ProcessEnvironment, ProcessExecution, ProcessInvocation, ProcessOutputLimits};
+
+pub struct PowerShell {
+    rtk_enabled: bool,
+}
+
+impl PowerShell {
+    pub const fn new(rtk_enabled: bool) -> Self {
+        Self { rtk_enabled }
+    }
+}
+
+impl Tool for PowerShell {
+    fn spec(&self) -> ToolSpec {
+        shell_process::shell_tool_spec(
+            "powershell",
+            "Runs a PowerShell command with `powershell.exe -NoProfile -NonInteractive -Command`",
+        )
+    }
+
+    fn call<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: ToolContext,
+        id: String,
+    ) -> AppToolFuture<'a> {
+        Box::pin(async move { self.call_with_updates(args, ctx, id, &mut |_| {}).await })
+    }
+
+    fn call_with_updates<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: ToolContext,
+        id: String,
+        on_update: &'a mut (dyn FnMut(Vec<String>) + Send),
+    ) -> AppToolFuture<'a> {
+        Box::pin(async move {
+            self.call_with_updates_and_cancellation(
+                args,
+                ctx,
+                id,
+                RunCancellation::default(),
+                on_update,
+            )
+            .await
+        })
+    }
+
+    fn call_with_updates_and_cancellation<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: ToolContext,
+        id: String,
+        cancellation: RunCancellation,
+        on_update: &'a mut (dyn FnMut(Vec<String>) + Send),
+    ) -> AppToolFuture<'a> {
+        Box::pin(async move {
+            let mut args = ShellArgs::parse(args)?;
+            // Validate before RTK rewrite so invalid timeouts never launch `rtk`.
+            let timeout = args.timeout()?;
+            if self.rtk_enabled {
+                if let Some(command) = super::rtk::rewrite(&args.command).await {
+                    args.command = command;
+                }
+            }
+            let execution = ProcessExecution::new(
+                &ctx.cwd,
+                ProcessInvocation::shell_from_path(
+                    "powershell.exe",
+                    vec![
+                        "-NoProfile".into(),
+                        "-NonInteractive".into(),
+                        "-Command".into(),
+                    ],
+                    wrapped_command(&args.command),
+                ),
+                ProcessEnvironment::InheritAll,
+                ProcessOutputLimits::new(ctx.max_output_bytes, timeout),
+            );
+            let result = execute_process(execution, cancellation, on_update)
+                .await?
+                .into_result(id);
+            if self.rtk_enabled {
+                super::rtk::log_execution(&ctx.cwd, &args.command, &result).await;
+            }
+            Ok(result)
+        })
+    }
+}
+
+pub(super) async fn execute_process(
+    execution: ProcessExecution,
+    cancellation: RunCancellation,
+    on_update: &mut (dyn FnMut(Vec<String>) + Send),
+) -> Result<crate::Rendered<shell_process::ShellOutcome>, ToolError> {
+    shell_process::run::<shell_process::PlatformSupervisor>(
+        execution,
+        "PowerShell",
+        cancellation,
+        on_update,
+    )
+    .await
+}
+
+/// Wrap a PowerShell command with UTF-8 output and reliable exit-code handling.
+pub fn wrapped_command(command: &str) -> String {
+    format!(
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); \
+         $OutputEncoding = [Console]::OutputEncoding; \
+         & {{ {command} }}; \
+         if ($null -ne $LASTEXITCODE) {{ exit $LASTEXITCODE }}; \
+         if (-not $?) {{ exit 1 }}; \
+         exit 0"
+    )
+}

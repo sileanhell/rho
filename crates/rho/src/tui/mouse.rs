@@ -1,0 +1,789 @@
+use std::time::Instant;
+
+use crossterm::event::{MouseButton, MouseEventKind};
+use ratatui::{
+    backend::Backend,
+    layout::{Position, Rect},
+    Terminal,
+};
+
+use super::{
+    copy_interaction::{selection_position, selection_position_clamped, CopyHit},
+    frame_context::FrameContext,
+    picker::PickerMouseEvent,
+    render::TRANSCRIPT_LEADING_GUTTER,
+    text_selection::{screen_lines, CopyNotice, TextSelection},
+    tool_card_hover::{ToolCardHit, ToolCardTarget},
+    tool_output_ui::expandable_tool_entry,
+    view::LiveHistory,
+    App, ComposerMode,
+};
+
+impl App {
+    /// Drops both the history-anchored and screen-space text selections.
+    pub(super) fn clear_selections(&mut self) {
+        self.history.clear_text_selection();
+        self.screen_selection = None;
+        self.input_ui.cancel_pointer_click_sequence();
+    }
+
+    pub(super) fn clear_hovered_copy_buttons(&mut self) {
+        self.history.set_hovered_code_block_copy(None);
+        self.input_ui.set_hovered_composer_copy(false);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionRailPointer {
+    Subagent(super::subagent_panel::SubagentPointerTarget),
+    Process(super::process_panel::ProcessPeekTarget),
+    Workflow(String),
+}
+
+impl SessionRailPointer {
+    fn pointer_id(&self) -> &str {
+        match self {
+            Self::Subagent(target) => target.pointer_id(),
+            Self::Process(target) => target.process_id.as_str(),
+            Self::Workflow(run_id) => run_id,
+        }
+    }
+}
+
+impl App {
+    fn mouse_history_view(&self, history_content: Rect, history_len: usize) -> (Rect, usize) {
+        let (history_start, _) =
+            self.visible_history_window(history_len, history_content.height as usize);
+        (history_content, history_start)
+    }
+
+    /// Routes one pointer event to the surface that owns it.
+    ///
+    /// The composer mode decides the owner, matched exhaustively so a new mode
+    /// has to choose its pointer behavior instead of silently inheriting the
+    /// transcript's. Surfaces that do not consume an event fall through to the
+    /// screen handler: transcript scroll, selection, copy, rails, and composer
+    /// editing.
+    pub(super) fn handle_mouse_event<B: Backend>(
+        &mut self,
+        kind: MouseEventKind,
+        column: u16,
+        row: u16,
+        terminal: &mut Terminal<B>,
+    ) -> Result<(), B::Error> {
+        let size = terminal.size()?;
+        let screen = Rect::new(0, 0, size.width, size.height);
+        let now = Instant::now();
+        // Every surface resolves hover from this cell at paint time, so record
+        // it for every event, including ones an overlay consumes; otherwise
+        // hover behind a closed overlay stays pinned to a stale cell.
+        let moved_cell = self.last_mouse_position != Some((column, row));
+        self.last_mouse_position = Some((column, row));
+        // A move within the same cell changes nothing any surface paints.
+        if kind == MouseEventKind::Moved && !moved_cell {
+            return Ok(());
+        }
+        let composer_owns_choices = match self.input_ui.composer() {
+            // Overlays own pointer input; nothing behind them reacts.
+            ComposerMode::Panel(_) => {
+                self.handle_panel_overlay_mouse(kind, screen, column, row, now);
+                return Ok(());
+            }
+            ComposerMode::Side => {
+                self.handle_side_overlay_mouse(kind, screen, column, row, now);
+                return Ok(());
+            }
+            ComposerMode::Questionnaire(_)
+            | ComposerMode::Approval(_)
+            | ComposerMode::InlineChoice(_) => true,
+            // Inline list rows are composer choices. Overlay pickers and the
+            // wheel route inside the screen handler: an inline list shares
+            // the wheel with the transcript around it.
+            ComposerMode::Picker(picker) => !picker.is_overlay(),
+            ComposerMode::Input
+            | ComposerMode::SecretInput(_)
+            | ComposerMode::ConfigNumberInput(_)
+            | ComposerMode::TextInput(_)
+            | ComposerMode::TranscriptSearch(_)
+            | ComposerMode::InteractivePending(_) => false,
+        };
+        // One layout snapshot serves both the choice hit test and the screen
+        // handler it may fall through to.
+        let ctx = self.frame_context(screen);
+        if composer_owns_choices && self.handle_choice_composer_mouse(kind, &ctx, column, row, now)
+        {
+            return Ok(());
+        }
+        self.handle_screen_mouse(kind, column, row, screen, now, ctx, terminal)
+    }
+
+    /// Pointer handling for the transcript screen and the composer beneath it.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_screen_mouse<B: Backend>(
+        &mut self,
+        kind: MouseEventKind,
+        column: u16,
+        row: u16,
+        screen: Rect,
+        now: Instant,
+        mut ctx: FrameContext,
+        terminal: &mut Terminal<B>,
+    ) -> Result<(), B::Error> {
+        let size = screen.as_size();
+        let composer_copy_hit = self.composer_copy_hit(screen, &mut ctx);
+        let width = ctx.width;
+        let settings = ctx.settings;
+        let live_history = ctx.live_history;
+        let layout = ctx.layout;
+        let palette_hits = ctx.palette.hits;
+        let composer_copy = composer_copy_hit
+            .as_ref()
+            .and_then(|(origin, start, hit)| hit.text_at(*origin, *start, column, row));
+        match kind {
+            MouseEventKind::ScrollUp => {
+                self.input_ui.cancel_pointer_click_sequence();
+                if self.route_picker_mouse(
+                    PickerMouseEvent::Wheel(-1),
+                    column,
+                    row,
+                    size.width,
+                    size.height,
+                ) {
+                    return Ok(());
+                }
+                if self.handle_palette_mouse(kind, &palette_hits, layout.commands, column, row, now)
+                {
+                    return Ok(());
+                }
+                self.screen_selection = None;
+                self.clear_hovered_copy_buttons();
+                self.clear_rail_pointer_state();
+                self.reveal_history_scrollbar(now);
+                self.history.set_scrollbar_drag(None);
+                self.scroll_history_lines(
+                    &layout,
+                    settings,
+                    -(super::HISTORY_MOUSE_SCROLL_LINES as isize),
+                );
+            }
+            MouseEventKind::ScrollDown => {
+                self.input_ui.cancel_pointer_click_sequence();
+                if self.route_picker_mouse(
+                    PickerMouseEvent::Wheel(1),
+                    column,
+                    row,
+                    size.width,
+                    size.height,
+                ) {
+                    return Ok(());
+                }
+                if self.handle_palette_mouse(kind, &palette_hits, layout.commands, column, row, now)
+                {
+                    return Ok(());
+                }
+                self.screen_selection = None;
+                self.clear_hovered_copy_buttons();
+                self.clear_rail_pointer_state();
+                self.reveal_history_scrollbar(now);
+                self.history.set_scrollbar_drag(None);
+                self.scroll_history_lines(
+                    &layout,
+                    settings,
+                    super::HISTORY_MOUSE_SCROLL_LINES as isize,
+                );
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // The picker tracks its own click sequence for double clicks.
+                if self.route_picker_mouse(
+                    PickerMouseEvent::Click(now),
+                    column,
+                    row,
+                    size.width,
+                    size.height,
+                ) {
+                    self.input_ui.clear_selection();
+                    return Ok(());
+                }
+                if self.handle_palette_mouse(kind, &palette_hits, layout.commands, column, row, now)
+                {
+                    return Ok(());
+                }
+                if self.handle_chrome_click(&layout, screen, column, row, now) {
+                    return Ok(());
+                }
+                self.screen_selection = None;
+                let (history, history_start) =
+                    self.mouse_history_view(layout.history_content, layout.history_len);
+                let code_target = self.code_block_copy_target_at_position(
+                    width,
+                    settings,
+                    history,
+                    history_start,
+                    Position { x: column, y: row },
+                );
+                let scrollbar = layout
+                    .history_scrollbar
+                    .filter(|scrollbar| scrollbar.contains(column, row))
+                    .filter(|_| self.should_render_history_scrollbar(now));
+                self.update_history_scrollbar_hover(layout.history_scrollbar, column, row);
+                self.history
+                    .set_hovered_code_block_copy(code_target.as_ref().map(|target| target.line));
+                self.input_ui
+                    .set_hovered_composer_copy(composer_copy.is_some());
+                let rail_target = self.session_rail_pointer(
+                    layout.subagents,
+                    layout.processes,
+                    layout.workflows,
+                    column,
+                    row,
+                );
+                if let Some(target) = rail_target {
+                    self.input_ui.clear_selection();
+                    self.input_ui.cancel_pointer_click_sequence();
+                    self.history.clear_text_selection();
+                    self.history.set_scrollbar_drag(None);
+                    self.set_rail_pressed(Some(&target));
+                    self.set_rail_hover(Some(&target));
+                } else if let Some(scrollbar) = scrollbar {
+                    self.input_ui.clear_selection();
+                    self.input_ui.cancel_pointer_click_sequence();
+                    self.clear_rail_pointer_state();
+                    self.history.clear_text_selection();
+                    self.history.scroll_chrome_mut().begin_scrollbar_drag(
+                        scrollbar,
+                        row,
+                        now,
+                        super::HISTORY_SCROLLBAR_REVEAL_DURATION,
+                    );
+                    self.reveal_unmeasured_history_at_scrollbar_top(&layout, settings);
+                } else if layout.jump_to_bottom.is_some_and(|rect| {
+                    rect.contains(ratatui::layout::Position { x: column, y: row })
+                }) {
+                    self.input_ui.clear_selection();
+                    self.input_ui.cancel_pointer_click_sequence();
+                    self.clear_rail_pointer_state();
+                    self.history.clear_text_selection();
+                    self.history.set_scrollbar_drag(None);
+                    self.scroll_history_to_bottom();
+                } else if let Some(target) = code_target {
+                    self.input_ui.clear_selection();
+                    self.input_ui.cancel_pointer_click_sequence();
+                    self.clear_rail_pointer_state();
+                    self.history.clear_text_selection();
+                    self.copy_text(&target.text, now);
+                } else if let Some(text) = composer_copy {
+                    self.input_ui.clear_selection();
+                    self.input_ui.cancel_pointer_click_sequence();
+                    self.clear_rail_pointer_state();
+                    self.history.clear_text_selection();
+                    self.copy_text(text, now);
+                } else if self.pointer_in_composer(&layout, column, row) {
+                    // Composer owns the pointer: place the caret / start an
+                    // editable selection instead of screen-copy drag.
+                    self.clear_rail_pointer_state();
+                    self.history.clear_text_selection();
+                    self.history.set_scrollbar_drag(None);
+                    // Placing the caret keeps a recalled prompt recalled, so
+                    // Down still restores the stashed draft; edits exit.
+                    self.input_ui.clear_transient_edit_state();
+                    if let Some(index) =
+                        self.composer_text_char_index_at(&layout, column, row, /*clamp*/ false)
+                    {
+                        let index = self.input_ui.buffer().caret_index(index);
+                        let double_click = self
+                            .input_ui
+                            .register_pointer_click(now, column, row, index);
+                        self.input_ui
+                            .buffer_mut()
+                            .pointer_press(index, double_click);
+                    } else {
+                        self.input_ui.clear_selection();
+                        self.input_ui.cancel_pointer_click_sequence();
+                    }
+                } else if let Some(position) =
+                    selection_position(history, history_start, column, row)
+                {
+                    self.input_ui.clear_selection();
+                    self.input_ui.cancel_pointer_click_sequence();
+                    self.clear_rail_pointer_state();
+                    self.history.set_scrollbar_drag(None);
+                    // Keep the transcript gutter out of the highlight and the
+                    // copied text; trailing gutter spaces are trimmed on copy.
+                    *self.history.text_selection_mut() = Some(TextSelection::with_leading_gutter(
+                        position,
+                        TRANSCRIPT_LEADING_GUTTER,
+                    ));
+                } else {
+                    self.input_ui.clear_selection();
+                    self.input_ui.cancel_pointer_click_sequence();
+                    self.clear_rail_pointer_state();
+                    self.history.clear_text_selection();
+                    self.screen_selection =
+                        selection_position_clamped(screen, 0, column, row).map(TextSelection::new);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.input_ui.cancel_pointer_click_sequence();
+                if self.route_picker_mouse(
+                    PickerMouseEvent::Drag,
+                    column,
+                    row,
+                    size.width,
+                    size.height,
+                ) {
+                    return Ok(());
+                }
+                self.update_history_scrollbar_hover(layout.history_scrollbar, column, row);
+                self.clear_rail_pressed();
+                if self.history.scrollbar_drag().is_some() {
+                    self.history.clear_text_selection();
+                    self.clear_hovered_copy_buttons();
+                    if let Some(scrollbar) = layout.history_scrollbar {
+                        self.history.scroll_chrome_mut().drag_to(scrollbar, row);
+                        self.reveal_unmeasured_history_at_scrollbar_top(&layout, settings);
+                    }
+                } else if self.input_ui.selection_dragging() {
+                    if let Some(index) =
+                        self.composer_text_char_index_at(&layout, column, row, /*clamp*/ true)
+                    {
+                        self.input_ui.buffer_mut().pointer_drag(index);
+                    }
+                } else if self.screen_selection.is_some() {
+                    if let (Some(selection), Some(position)) = (
+                        self.screen_selection.as_mut(),
+                        selection_position_clamped(screen, 0, column, row),
+                    ) {
+                        selection.update(position);
+                    }
+                } else {
+                    let (history, history_start) =
+                        self.mouse_history_view(layout.history_content, layout.history_len);
+                    let hovered = self
+                        .code_block_copy_target_at_position(
+                            width,
+                            settings,
+                            history,
+                            history_start,
+                            Position { x: column, y: row },
+                        )
+                        .map(|target| target.line);
+                    self.history.set_hovered_code_block_copy(hovered);
+                    self.input_ui
+                        .set_hovered_composer_copy(composer_copy.is_some());
+                    if let (Some(selection), Some(position)) = (
+                        self.history.text_selection_mut().as_mut(),
+                        selection_position_clamped(history, history_start, column, row),
+                    ) {
+                        selection.update(position);
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.route_picker_mouse(
+                    PickerMouseEvent::Release,
+                    column,
+                    row,
+                    size.width,
+                    size.height,
+                ) {
+                    return Ok(());
+                }
+                let pressed_rail_id = self
+                    .subagent_panel
+                    .pressed_run_id()
+                    .or_else(|| self.process_panel.pressed_process_id())
+                    .or_else(|| self.workflow_panel.pressed_run_id())
+                    .map(str::to_owned);
+                let was_scrollbar_drag = self.history.scrollbar_drag().is_some();
+                let composer_selecting = self.input_ui.selection_dragging();
+                self.history.set_scrollbar_drag(None);
+                self.update_history_scrollbar_hover(layout.history_scrollbar, column, row);
+                let released_rail = self.session_rail_pointer(
+                    layout.subagents,
+                    layout.processes,
+                    layout.workflows,
+                    column,
+                    row,
+                );
+                self.subagent_panel.set_pressed(None);
+                self.process_panel.set_pressed(None);
+                self.workflow_panel.set_pressed(None);
+                self.set_rail_hover(released_rail.as_ref());
+                let activate_rail = released_rail
+                    .filter(|target| pressed_rail_id.as_deref() == Some(target.pointer_id()));
+                let (history, history_start) =
+                    self.mouse_history_view(layout.history_content, layout.history_len);
+                let hovered = self
+                    .code_block_copy_target_at_position(
+                        width,
+                        settings,
+                        history,
+                        history_start,
+                        Position { x: column, y: row },
+                    )
+                    .map(|target| target.line);
+                self.history.set_hovered_code_block_copy(hovered);
+                self.input_ui
+                    .set_hovered_composer_copy(composer_copy.is_some());
+                if let Some(target) = activate_rail {
+                    self.input_ui.clear_selection();
+                    self.history.clear_text_selection();
+                    match target {
+                        SessionRailPointer::Subagent(
+                            super::subagent_panel::SubagentPointerTarget::Run(target),
+                        ) => {
+                            self.activate_subagent_row(&target);
+                        }
+                        SessionRailPointer::Subagent(
+                            super::subagent_panel::SubagentPointerTarget::OpenAttachPicker,
+                        ) => {
+                            let _ = self.execute_attach_command();
+                        }
+                        SessionRailPointer::Process(target) => {
+                            self.activate_process_row(&target);
+                        }
+                        SessionRailPointer::Workflow(run_id) => {
+                            self.workflow_panel.request_watch(run_id);
+                        }
+                    }
+                } else if was_scrollbar_drag {
+                    self.input_ui.clear_selection();
+                    self.history.clear_text_selection();
+                } else if composer_selecting {
+                    let index =
+                        self.composer_text_char_index_at(&layout, column, row, /*clamp*/ true);
+                    self.input_ui.buffer_mut().pointer_release(index);
+                } else if let Some(mut selection) = self.history.text_selection_mut().take() {
+                    let release_position =
+                        selection_position_clamped(history, history_start, column, row);
+                    if let Some(position) = release_position {
+                        selection.update(position);
+                    }
+                    if selection.has_moved() {
+                        let selected_lines = selection.selected_line_range();
+                        let lines = self.visible_history_lines_with_live(
+                            width,
+                            settings,
+                            selected_lines.start,
+                            selected_lines.len(),
+                            &live_history.lines,
+                        );
+                        if let Some(text) = selection.selected_text(&lines, selected_lines.start) {
+                            self.copy_text(&text, now);
+                            *self.history.text_selection_mut() = Some(selection);
+                        }
+                    } else if release_position.is_some() {
+                        let line =
+                            history_start.saturating_add(row.saturating_sub(history.y) as usize);
+                        self.toggle_tool_output_at_history_line(
+                            line,
+                            width,
+                            settings,
+                            &live_history,
+                            terminal,
+                        )?;
+                    }
+                } else if let Some(mut selection) = self.screen_selection.take() {
+                    if let Some(position) = selection_position_clamped(screen, 0, column, row) {
+                        selection.update(position);
+                    }
+                    if selection.has_moved() {
+                        // Redraw so the completed frame holds the text the
+                        // selection was made over; the terminal's current
+                        // buffer is the cleared back buffer after a draw.
+                        // The selection is still taken here, so this frame
+                        // renders without the REVERSED highlight; the put-back
+                        // below restores the highlight for the next frame.
+                        let completed = terminal.draw(|frame| self.draw(frame))?;
+                        let lines = screen_lines(completed.buffer, screen);
+                        if let Some(text) = selection.selected_text(&lines, 0) {
+                            self.copy_text(&text, now);
+                            self.screen_selection = Some(selection);
+                        }
+                    }
+                }
+            }
+            MouseEventKind::Moved => {
+                self.input_ui.cancel_pointer_click_sequence();
+                if self.route_picker_mouse(
+                    PickerMouseEvent::Move,
+                    column,
+                    row,
+                    size.width,
+                    size.height,
+                ) {
+                    return Ok(());
+                }
+                self.update_history_scrollbar_hover(layout.history_scrollbar, column, row);
+                let (history, history_start) =
+                    self.mouse_history_view(layout.history_content, layout.history_len);
+                let hovered = self
+                    .code_block_copy_target_at_position(
+                        width,
+                        settings,
+                        history,
+                        history_start,
+                        Position { x: column, y: row },
+                    )
+                    .map(|target| target.line);
+                self.history.set_hovered_code_block_copy(hovered);
+                self.input_ui
+                    .set_hovered_composer_copy(composer_copy.is_some());
+                let rail_hover = self.session_rail_pointer(
+                    layout.subagents,
+                    layout.processes,
+                    layout.workflows,
+                    column,
+                    row,
+                );
+                self.set_rail_hover(rail_hover.as_ref());
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.input_ui.cancel_pointer_click_sequence();
+                self.paste_clipboard_text();
+            }
+            MouseEventKind::Down(MouseButton::Middle)
+            | MouseEventKind::Up(MouseButton::Right)
+            | MouseEventKind::Up(MouseButton::Middle)
+            | MouseEventKind::Drag(MouseButton::Right)
+            | MouseEventKind::Drag(MouseButton::Middle)
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => {
+                self.input_ui.cancel_pointer_click_sequence();
+            }
+        }
+        Ok(())
+    }
+
+    fn session_rail_pointer(
+        &self,
+        subagents: Rect,
+        processes: Rect,
+        workflows: Rect,
+        column: u16,
+        row: u16,
+    ) -> Option<SessionRailPointer> {
+        if !matches!(self.input_ui.composer(), ComposerMode::Input) {
+            return None;
+        }
+        if let Some(target) = self.subagent_panel.attach_target_at(subagents, column, row) {
+            return Some(SessionRailPointer::Subagent(target));
+        }
+        self.process_panel
+            .peek_target_at(processes, column, row)
+            .map(SessionRailPointer::Process)
+            .or_else(|| {
+                self.workflow_panel
+                    .watch_target_at(workflows, column, row)
+                    .filter(|_| self.can_open_workflow_watch_from_rail())
+                    .map(SessionRailPointer::Workflow)
+            })
+    }
+
+    pub(super) fn clear_rail_pointer_state(&mut self) {
+        self.subagent_panel.clear_pointer_state();
+        self.process_panel.clear_pointer_state();
+        self.workflow_panel.clear_pointer_state();
+    }
+
+    fn clear_rail_pressed(&mut self) {
+        self.subagent_panel.clear_pressed();
+        self.process_panel.clear_pressed();
+        self.workflow_panel.clear_pressed();
+    }
+
+    fn set_rail_hover(&mut self, target: Option<&SessionRailPointer>) {
+        self.workflow_panel.set_hovered(match target {
+            Some(SessionRailPointer::Workflow(run_id)) => Some(run_id),
+            Some(SessionRailPointer::Subagent(_) | SessionRailPointer::Process(_)) | None => None,
+        });
+        match target {
+            Some(SessionRailPointer::Subagent(target)) => {
+                self.subagent_panel.set_hovered(Some(target.pointer_id()));
+                self.process_panel.set_hovered(None);
+            }
+            Some(SessionRailPointer::Process(target)) => {
+                self.process_panel
+                    .set_hovered(Some(target.process_id.as_str()));
+                self.subagent_panel.set_hovered(None);
+            }
+            Some(SessionRailPointer::Workflow(_)) | None => {
+                self.subagent_panel.set_hovered(None);
+                self.process_panel.set_hovered(None);
+            }
+        }
+    }
+
+    fn set_rail_pressed(&mut self, target: Option<&SessionRailPointer>) {
+        self.workflow_panel.set_pressed(match target {
+            Some(SessionRailPointer::Workflow(run_id)) => Some(run_id),
+            Some(SessionRailPointer::Subagent(_) | SessionRailPointer::Process(_)) | None => None,
+        });
+        match target {
+            Some(SessionRailPointer::Subagent(target)) => {
+                self.subagent_panel.set_pressed(Some(target.pointer_id()));
+                self.process_panel.set_pressed(None);
+            }
+            Some(SessionRailPointer::Process(target)) => {
+                self.process_panel
+                    .set_pressed(Some(target.process_id.as_str()));
+                self.subagent_panel.set_pressed(None);
+            }
+            Some(SessionRailPointer::Workflow(_)) | None => {
+                self.subagent_panel.set_pressed(None);
+                self.process_panel.set_pressed(None);
+            }
+        }
+    }
+
+    fn toggle_tool_output_at_history_line<B: Backend>(
+        &mut self,
+        line: usize,
+        width: usize,
+        settings: super::history_cache::HistoryRenderSettings,
+        live_history: &LiveHistory,
+        terminal: &mut Terminal<B>,
+    ) -> Result<bool, B::Error> {
+        let Some(hit) = self.tool_card_hit_at_history_line(line, width, settings, live_history)
+        else {
+            return Ok(false);
+        };
+        match hit.target {
+            ToolCardTarget::Transcript(index) => {
+                self.toggle_transcript_tool_output(index);
+            }
+            ToolCardTarget::Preview(index) => {
+                let expanded = self
+                    .turn
+                    .tool_calls_mut()
+                    .previews
+                    .get_mut(&index)
+                    .is_some_and(|pending| {
+                        pending.expanded = !pending.expanded;
+                        pending.expanded
+                    });
+                self.set_tool_expand_status(expanded);
+            }
+            ToolCardTarget::Running(call_id) => {
+                let expanded = self
+                    .turn
+                    .tool_calls_mut()
+                    .running
+                    .get_mut(&call_id)
+                    .is_some_and(|pending| {
+                        pending.expanded = !pending.expanded;
+                        pending.expanded
+                    });
+                self.set_tool_expand_status(expanded);
+            }
+        }
+        self.clamp_history_scroll_for_terminal(terminal)?;
+        Ok(true)
+    }
+
+    fn set_tool_expand_status(&mut self, expanded: bool) {
+        self.set_status(if expanded {
+            "tool output expanded"
+        } else {
+            "tool output collapsed"
+        });
+    }
+
+    /// The toggleable tool card covering absolute history `line`, if any.
+    ///
+    /// Shared by click toggling and the draw-time hover lift so both agree on
+    /// the clickable card span. Transcript cards resolve through the history
+    /// cache; pending live cards walk the same paint order as
+    /// `history_live_lines`.
+    pub(super) fn tool_card_hit_at_history_line(
+        &mut self,
+        line: usize,
+        width: usize,
+        settings: super::history_cache::HistoryRenderSettings,
+        live: &LiveHistory,
+    ) -> Option<ToolCardHit> {
+        if !self.info.runtime.shows_work_chrome() {
+            return None;
+        }
+        let max_tool_output_lines = self.info.runtime.max_tool_output_lines;
+        let header_len = self.visible_session_header_len(width);
+        if let Some(transcript_line) = line.checked_sub(header_len) {
+            self.sync_open_stream_tail();
+            let cwd = &self.info.runtime.cwd;
+            let hit = self.history.with_lines_and_images_mut(
+                |history_lines, entries, markdown_images| {
+                    let index = history_lines.entry_index_at_line(
+                        entries,
+                        settings,
+                        transcript_line,
+                        &|entry_index, sources| {
+                            markdown_images.ready_images(entry_index, sources, cwd)
+                        },
+                    )?;
+                    entries
+                        .get(index)
+                        .filter(|entry| expandable_tool_entry(entry, max_tool_output_lines, width))
+                        .map(|_| index)
+                        .and_then(|index| history_lines.entry_line_range(index))
+                        .map(|range| (index, range))
+                },
+            );
+            if let Some((index, range)) = hit {
+                return Some(ToolCardHit {
+                    target: ToolCardTarget::Transcript(index),
+                    lines: (header_len + range.start)..(header_len + range.end),
+                });
+            }
+        }
+
+        let static_len = self.history_static_len(width, settings);
+        live.card_hit_at(line.checked_sub(static_len)?)
+            .map(|(target, range)| ToolCardHit {
+                target,
+                lines: (static_len + range.start)..(static_len + range.end),
+            })
+    }
+
+    /// Hit-test the composer copy button using the same origin the current screen painted.
+    #[cfg(test)]
+    pub(super) fn composer_copy_text_at(
+        &mut self,
+        area: Rect,
+        column: u16,
+        row: u16,
+    ) -> Option<String> {
+        let mut ctx = self.frame_context(area);
+        let (origin, start, hit) = self.composer_copy_hit(area, &mut ctx)?;
+        hit.text_at(origin, start, column, row).map(str::to_string)
+    }
+
+    /// Painted origin, composer-line start, and copy target for the current composer.
+    fn composer_copy_hit(
+        &mut self,
+        area: Rect,
+        ctx: &mut FrameContext,
+    ) -> Option<(Rect, usize, CopyHit)> {
+        if let Some(step) = self.setup_step() {
+            let origin = super::setup_screen::setup_composer_origin(area, step);
+            let hit = self
+                .composer_frame(origin.width as usize, origin.height as usize)
+                .copy_hit?;
+            return Some((origin, /*start*/ 0, hit));
+        }
+        Some((
+            ctx.layout.composer,
+            ctx.layout.composer_start,
+            ctx.composer.copy_hit.take()?,
+        ))
+    }
+
+    pub(super) fn copy_text(&mut self, text: &str, now: Instant) {
+        let character_count = text.chars().count();
+        self.history
+            .set_copy_notice(Some(CopyNotice::from_copy_result(
+                self.clipboard.copy(text),
+                character_count,
+                now,
+            )));
+    }
+}

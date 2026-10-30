@@ -1,0 +1,713 @@
+//! Draft mutation and validated save for user-defined agent files.
+//!
+//! Mutators live on [`AgentDefinition`] so the TUI editor does not re-encode
+//! runtime-axis invariants. Save serializes, re-parses, and replaces the file
+//! only when the on-disk contents still match the edit session baseline.
+
+use std::{fs, io, path::Path, str::FromStr};
+
+use crate::config_writer::edit_lock::{acquire_edit_lock, EditFileLock};
+
+use super::{
+    parse_definition, parse_tools_list_text, serialize_definition, AgentDefinition, AgentRuntime,
+    AgentRuntimeSpec, AntigravityAgentConfig, CursorAgentConfig, ModelPolicy, ModelSelection,
+    PromptPolicy, ReasoningLevel, ToolCapability, ToolCapabilitySet, ToolPolicy,
+    BUILTIN_TOOL_CAPABILITIES,
+};
+
+/// Outcome of [`AgentDefinition::toggle_tools_all`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ToolsAllToggle {
+    /// Policy is now `all`; `replaced` is the explicit set it overwrote.
+    TurnedOn { replaced: ToolCapabilitySet },
+    /// Policy is now the explicit set passed as `restore`.
+    TurnedOff,
+    /// Runtime has no open allow list; nothing changed.
+    Unsupported,
+}
+
+impl AgentDefinition {
+    /// Switches prompt policy while preserving the existing body.
+    pub(crate) fn set_prompt_policy_kind(&mut self, value: &str) -> bool {
+        let body = match &self.prompt {
+            PromptPolicy::Extend(text) | PromptPolicy::Replace(text) => text.clone(),
+        };
+        self.prompt = match value {
+            "extend" => PromptPolicy::Extend(body),
+            "replace" => PromptPolicy::Replace(body),
+            _ => return false,
+        };
+        true
+    }
+
+    /// Replaces the prompt body while preserving extend/replace.
+    pub(crate) fn set_prompt_body(&mut self, body: String) {
+        self.prompt = match &self.prompt {
+            PromptPolicy::Extend(_) => PromptPolicy::Extend(body),
+            PromptPolicy::Replace(_) => PromptPolicy::Replace(body),
+        };
+    }
+
+    /// Switches runtime, carrying compatible model/reasoning and resetting the rest.
+    ///
+    /// Switching to an ACP runtime (Cursor, Antigravity) forces `prompt: extend`
+    /// because ACP cannot replace the system prompt.
+    pub(crate) fn switch_runtime_kind(&mut self, value: &str) -> bool {
+        let Ok(next) = value.parse::<AgentRuntime>() else {
+            return false;
+        };
+        if self.runtime.runtime() == next {
+            return true;
+        }
+        let reasoning = self.reasoning();
+        let model_policy = self.model_policy().into_owned();
+        self.runtime = build_runtime_spec(next, &model_policy, reasoning);
+        match next {
+            AgentRuntime::Cursor | AgentRuntime::Antigravity => {
+                let _ = self.set_prompt_policy_kind("extend");
+            }
+            AgentRuntime::Rho => {}
+        }
+        true
+    }
+
+    /// Applies a model-policy keyword for the current runtime.
+    pub(crate) fn set_model_policy_kind(&mut self, value: &str) -> bool {
+        let runtime = self.runtime.runtime();
+        let policy = match (runtime, value) {
+            (_, "inherit") => ModelPolicy::Inherit,
+            (AgentRuntime::Rho, "prefer") => ModelPolicy::Prefer(self.current_selection()),
+            (AgentRuntime::Rho, "require") => ModelPolicy::Require(self.current_selection()),
+            (_, "select") if runtime == AgentRuntime::Rho || runtime.is_external_cli() => {
+                ModelPolicy::Select(self.current_selection())
+            }
+            _ => return false,
+        };
+        self.set_model_policy(policy);
+        true
+    }
+
+    pub(crate) fn current_selection(&self) -> ModelSelection {
+        self.model_policy()
+            .selection()
+            .cloned()
+            .unwrap_or(ModelSelection {
+                provider: None,
+                model: String::new(),
+                auth: None,
+                fast: false,
+            })
+    }
+
+    pub(crate) fn set_reasoning_kind(&mut self, value: &str) -> bool {
+        let level = if value == "inherit" {
+            None
+        } else {
+            match value.parse::<ReasoningLevel>() {
+                Ok(level) => Some(level),
+                Err(_) => return false,
+            }
+        };
+        self.set_reasoning(level);
+        true
+    }
+
+    /// Sets `fast` from an `on`/`off` choice on a pinned Rho selection.
+    pub(crate) fn set_fast_kind(&mut self, value: &str) -> bool {
+        let enabled = match value {
+            "on" => true,
+            "off" => false,
+            _ => return false,
+        };
+        match &mut self.runtime {
+            AgentRuntimeSpec::Rho { model, .. } => match model.selection_mut() {
+                Some(selection) => {
+                    selection.fast = enabled;
+                    true
+                }
+                None => !enabled,
+            },
+            AgentRuntimeSpec::Cursor(_) | AgentRuntimeSpec::Antigravity(_) => !enabled,
+        }
+    }
+
+    /// Whether the pinned Rho selection can run in fast mode.
+    ///
+    /// Needs an explicit provider. With an auth pin that exact profile must
+    /// support it; without one, every login for the provider must, since bind
+    /// may pick any of them (xAI needs `auth: xai-oauth`).
+    pub(crate) fn fast_mode_available(&self) -> bool {
+        let AgentRuntimeSpec::Rho { model, .. } = &self.runtime else {
+            return false;
+        };
+        let Some(selection) = model.selection() else {
+            return false;
+        };
+        let Some(provider) = selection.provider.as_deref() else {
+            return false;
+        };
+        let supports = |auth: &str| {
+            rho_providers::providers::fast_mode::supports_fast_mode(
+                provider,
+                &selection.model,
+                auth,
+            )
+        };
+        match selection.auth.as_deref() {
+            Some(auth) => supports(auth),
+            None => rho_providers::provider::provider_descriptor(provider)
+                .is_some_and(|descriptor| descriptor.auth_modes().all(|mode| supports(mode.id))),
+        }
+    }
+
+    pub(crate) fn set_description_text(&mut self, value: String) {
+        self.description = value;
+    }
+
+    pub(crate) fn set_model_text(&mut self, value: String) {
+        let trimmed = value.trim().to_string();
+        if let Some(model) = self.runtime.pass_through_model_mut() {
+            *model = (!trimmed.is_empty()).then_some(trimmed);
+            return;
+        }
+        if trimmed.is_empty() {
+            self.set_model_policy(ModelPolicy::Inherit);
+            return;
+        }
+        let policy = self
+            .model_policy()
+            .into_owned()
+            .map_selection(|mut selection| {
+                selection.model = trimmed.clone();
+                selection
+            })
+            .unwrap_or(ModelPolicy::Select(ModelSelection {
+                provider: None,
+                model: trimmed,
+                auth: None,
+                fast: false,
+            }));
+        self.set_model_policy(policy);
+    }
+
+    pub(crate) fn set_provider_text(&mut self, value: String) {
+        let trimmed = value.trim().to_string();
+        let provider = (!trimmed.is_empty()).then_some(trimmed);
+        let Some(policy) = self
+            .model_policy()
+            .into_owned()
+            .map_selection(|mut selection| {
+                if let Some(provider) = provider.as_deref() {
+                    selection.auth = selection.auth.filter(|auth| {
+                        rho_providers::provider::provider_accepts_auth(provider, auth)
+                    });
+                }
+                selection.provider = provider;
+                selection
+            })
+        else {
+            return;
+        };
+        self.set_model_policy(policy);
+    }
+
+    /// Pins or clears the auth profile for a non-inherit model policy.
+    ///
+    /// When setting an auth profile and provider is empty or incompatible, the
+    /// provider is updated from the auth profile's provider.
+    pub(crate) fn set_auth_selection(&mut self, auth: Option<String>) -> bool {
+        if self.runtime.runtime().is_external_cli() {
+            return auth.is_none();
+        }
+        let resolved = match auth {
+            None => None,
+            Some(auth) => {
+                let Some((descriptor, mode)) = rho_providers::provider::resolve_auth_mode(&auth)
+                else {
+                    return false;
+                };
+                Some((descriptor.name, mode.id))
+            }
+        };
+        let Some(policy) = self
+            .model_policy()
+            .into_owned()
+            .map_selection(|mut selection| {
+                match resolved {
+                    None => selection.auth = None,
+                    Some((provider_name, auth_id)) => {
+                        let keep_provider = selection.provider.as_deref().is_some_and(|provider| {
+                            rho_providers::provider::provider_accepts_auth(provider, auth_id)
+                        });
+                        if !keep_provider {
+                            selection.provider = Some(provider_name.to_string());
+                        }
+                        selection.auth = Some(auth_id.to_string());
+                    }
+                }
+                selection
+            })
+        else {
+            return false;
+        };
+        self.set_model_policy(policy);
+        true
+    }
+
+    pub(crate) fn set_model_selection(&mut self, selection: Option<ModelSelection>) {
+        if let Some(model) = self.runtime.pass_through_model_mut() {
+            *model = selection
+                .map(|value| value.model)
+                .filter(|value| !value.is_empty());
+            return;
+        }
+        let policy = match (self.model_policy().as_ref(), selection) {
+            (ModelPolicy::Prefer(_), Some(selection)) if !selection.model.is_empty() => {
+                ModelPolicy::Prefer(selection)
+            }
+            (ModelPolicy::Require(_), Some(selection)) if !selection.model.is_empty() => {
+                ModelPolicy::Require(selection)
+            }
+            (_, Some(selection)) if !selection.model.is_empty() => ModelPolicy::Select(selection),
+            _ => ModelPolicy::Inherit,
+        };
+        self.set_model_policy(policy);
+    }
+
+    pub(crate) fn set_model_policy(&mut self, policy: ModelPolicy) {
+        if let Some(model) = self.runtime.pass_through_model_mut() {
+            *model = match policy {
+                ModelPolicy::Inherit => None,
+                ModelPolicy::Prefer(selection)
+                | ModelPolicy::Require(selection)
+                | ModelPolicy::Select(selection) => Some(selection.model),
+            };
+            return;
+        }
+        match &mut self.runtime {
+            AgentRuntimeSpec::Rho { model, .. } => *model = policy,
+            AgentRuntimeSpec::Cursor(_) | AgentRuntimeSpec::Antigravity(_) => {
+                unreachable!("external CLI runtimes expose a pass-through model")
+            }
+        }
+    }
+
+    pub(crate) fn set_reasoning(&mut self, level: Option<ReasoningLevel>) {
+        match &mut self.runtime {
+            AgentRuntimeSpec::Rho { reasoning, .. } => *reasoning = level,
+            AgentRuntimeSpec::Cursor(_) | AgentRuntimeSpec::Antigravity(_) => {}
+        }
+    }
+
+    /// Parses tools text (`all`, `[]`, or a bracket list) into the runtime policy.
+    pub(crate) fn set_tools_text(&mut self, value: &str) -> Result<(), String> {
+        let trimmed = value.trim();
+        match &mut self.runtime {
+            AgentRuntimeSpec::Rho { tools, .. } => {
+                if trimmed == "all" {
+                    *tools = ToolPolicy::All;
+                    return Ok(());
+                }
+                let names = parse_tools_list_text(trimmed)?;
+                let mut capabilities = std::collections::BTreeSet::new();
+                for name in names {
+                    capabilities.insert(ToolCapability::parse(name));
+                }
+                *tools = ToolPolicy::Allow(capabilities);
+                Ok(())
+            }
+            AgentRuntimeSpec::Cursor(config) => {
+                config.tools = parse_closed_tools_text(AgentRuntime::Cursor, trimmed)?;
+                Ok(())
+            }
+            AgentRuntimeSpec::Antigravity(config) => {
+                config.tools = parse_closed_tools_text(AgentRuntime::Antigravity, trimmed)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Flips one tool in the runtime allow list.
+    ///
+    /// Rho `all` expands to the built-in set first so a single tool can be
+    /// removed from it; [`Self::toggle_tools_all`] is the way back. Closed lists
+    /// (Cursor, Antigravity) may go empty here because `validate_for_edit`
+    /// rejects that at save.
+    pub(crate) fn toggle_tool(&mut self, name: &str) -> Result<(), String> {
+        match &mut self.runtime {
+            AgentRuntimeSpec::Rho { tools, .. } => {
+                let capability = ToolCapability::parse(name.to_string());
+                if matches!(capability, ToolCapability::Extension(_)) {
+                    return Err(format!("unknown tool '{name}' for runtime: rho"));
+                }
+                let mut set = match std::mem::replace(tools, ToolPolicy::All) {
+                    ToolPolicy::All => BUILTIN_TOOL_CAPABILITIES.iter().cloned().collect(),
+                    ToolPolicy::Allow(set) => set,
+                };
+                if !set.remove(&capability) {
+                    set.insert(capability);
+                }
+                *tools = ToolPolicy::Allow(set);
+                Ok(())
+            }
+            AgentRuntimeSpec::Cursor(config) => toggle_closed_tool(&mut config.tools, name),
+            AgentRuntimeSpec::Antigravity(config) => toggle_closed_tool(&mut config.tools, name),
+        }
+    }
+
+    /// Flips the Rho policy between `all` and an explicit set.
+    ///
+    /// Turning `all` on hands back the set it replaced so the caller can
+    /// stash it; turning it off installs `restore`. Other runtimes have no
+    /// open allow list and report [`ToolsAllToggle::Unsupported`].
+    pub(crate) fn toggle_tools_all(&mut self, restore: ToolCapabilitySet) -> ToolsAllToggle {
+        match &mut self.runtime {
+            AgentRuntimeSpec::Rho { tools, .. } => {
+                match std::mem::replace(tools, ToolPolicy::All) {
+                    ToolPolicy::All => {
+                        *tools = ToolPolicy::Allow(restore);
+                        ToolsAllToggle::TurnedOff
+                    }
+                    ToolPolicy::Allow(replaced) => ToolsAllToggle::TurnedOn { replaced },
+                }
+            }
+            AgentRuntimeSpec::Cursor(_) | AgentRuntimeSpec::Antigravity(_) => {
+                ToolsAllToggle::Unsupported
+            }
+        }
+    }
+
+    pub(crate) fn tools_text(&self) -> String {
+        match &self.runtime {
+            AgentRuntimeSpec::Rho {
+                tools: ToolPolicy::All,
+                ..
+            } => "all".into(),
+            AgentRuntimeSpec::Rho {
+                tools: ToolPolicy::Allow(tools),
+                ..
+            } => format!(
+                "[{}]",
+                tools
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            AgentRuntimeSpec::Cursor(config) => format!(
+                "[{}]",
+                config
+                    .tools
+                    .iter()
+                    .map(|tool| tool.as_flag())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            AgentRuntimeSpec::Antigravity(config) => format!(
+                "[{}]",
+                config
+                    .tools
+                    .iter()
+                    .map(|tool| tool.as_name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    pub(crate) fn model_text(&self) -> String {
+        self.model_policy()
+            .selection()
+            .map(|selection| selection.model.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn provider_text(&self) -> String {
+        self.model_policy()
+            .selection()
+            .and_then(|selection| selection.provider.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn auth_text(&self) -> String {
+        self.model_policy()
+            .selection()
+            .and_then(|selection| selection.auth.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn auth_badge(&self) -> String {
+        match self.auth_text() {
+            value if value.is_empty() => "host".into(),
+            value => value,
+        }
+    }
+
+    /// Short badge: `all`, `none`, the names when few, or a count.
+    ///
+    /// The nav column is narrow; past a handful of names the badge would
+    /// truncate to an ellipsis and say nothing. [`Self::tools_summary`] carries
+    /// the full list for the detail pane.
+    pub(crate) fn tools_badge(&self) -> String {
+        /// Longest name list the badge shows before collapsing to a count.
+        /// Three snake_case names fit the picker nav column at default width.
+        const BADGE_NAME_LIMIT: usize = 3;
+        if let AgentRuntimeSpec::Rho {
+            tools: ToolPolicy::All,
+            ..
+        } = &self.runtime
+        {
+            return "all".into();
+        }
+        let names = self.tool_names();
+        match names.len() {
+            0 => "none".into(),
+            count if count > BADGE_NAME_LIMIT => format!("{count} tools"),
+            _ => names.join(", "),
+        }
+    }
+
+    /// Full tool list for detail text: `all`, `none`, or every name.
+    pub(crate) fn tools_summary(&self) -> String {
+        if let AgentRuntimeSpec::Rho {
+            tools: ToolPolicy::All,
+            ..
+        } = &self.runtime
+        {
+            return "all".into();
+        }
+        let names = self.tool_names();
+        if names.is_empty() {
+            "none".into()
+        } else {
+            names.join(", ")
+        }
+    }
+
+    fn tool_names(&self) -> Vec<String> {
+        match &self.runtime {
+            AgentRuntimeSpec::Rho {
+                tools: ToolPolicy::All,
+                ..
+            } => Vec::new(),
+            AgentRuntimeSpec::Rho {
+                tools: ToolPolicy::Allow(tools),
+                ..
+            } => tools.iter().map(ToString::to_string).collect(),
+            AgentRuntimeSpec::Cursor(config) => config
+                .tools
+                .iter()
+                .map(|tool| tool.label().to_string())
+                .collect(),
+            AgentRuntimeSpec::Antigravity(config) => config
+                .tools
+                .iter()
+                .map(|tool| tool.as_name().to_string())
+                .collect(),
+        }
+    }
+
+    pub(crate) fn model_badge(&self) -> String {
+        match self.model_policy().as_ref() {
+            ModelPolicy::Inherit => "inherit".into(),
+            ModelPolicy::Prefer(selection) => format!("prefer {}", selection.model),
+            ModelPolicy::Require(selection) => format!("require {}", selection.model),
+            ModelPolicy::Select(selection) => selection.model.clone(),
+        }
+    }
+
+    pub(crate) fn model_policy_badge(&self) -> String {
+        match self.model_policy().as_ref() {
+            ModelPolicy::Inherit => "inherit".into(),
+            ModelPolicy::Prefer(_) => "prefer".into(),
+            ModelPolicy::Require(_) => "require".into(),
+            ModelPolicy::Select(_) => "select".into(),
+        }
+    }
+
+    /// Friendly pre-checks for constraints the parser also enforces.
+    pub(crate) fn validate_for_edit(&self) -> Option<String> {
+        if self.description.chars().count() > 1024 {
+            return Some("description must be at most 1024 characters".into());
+        }
+        if self.description.trim().is_empty() {
+            return Some("description is required".into());
+        }
+        if let PromptPolicy::Replace(body) = &self.prompt {
+            if body.trim().is_empty() {
+                return Some("prompt policy 'replace' requires a non-empty prompt body".into());
+            }
+        }
+        if self.fast() && !self.fast_mode_available() {
+            return Some(format!(
+                "fast mode is not available for {}; pick a supported model and provider or turn fast off",
+                self.model_badge()
+            ));
+        }
+        let closed_tools_empty = match &self.runtime {
+            AgentRuntimeSpec::Cursor(config) => config.tools.is_empty(),
+            AgentRuntimeSpec::Antigravity(config) => config.tools.is_empty(),
+            AgentRuntimeSpec::Rho { .. } => return None,
+        };
+        let runtime = self.runtime.runtime();
+        if closed_tools_empty {
+            Some(format!("{runtime} agents need at least one tool"))
+        } else if matches!(self.prompt, PromptPolicy::Replace(_)) {
+            Some(format!(
+                "{runtime} cannot replace its system prompt; use extend"
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+fn build_runtime_spec(
+    runtime: AgentRuntime,
+    model_policy: &ModelPolicy,
+    reasoning: Option<ReasoningLevel>,
+) -> AgentRuntimeSpec {
+    match runtime {
+        AgentRuntime::Rho => {
+            let model = match model_policy.selection() {
+                Some(selection) => ModelPolicy::Select(selection.clone()),
+                None => ModelPolicy::Inherit,
+            };
+            AgentRuntimeSpec::Rho {
+                tools: ToolPolicy::All,
+                model,
+                reasoning,
+            }
+        }
+        AgentRuntime::Cursor => {
+            let model = model_policy
+                .selection()
+                .map(|selection| selection.model.clone());
+            AgentRuntimeSpec::Cursor(CursorAgentConfig {
+                tools: Vec::new(),
+                model,
+            })
+        }
+        AgentRuntime::Antigravity => {
+            let model = model_policy
+                .selection()
+                .map(|selection| selection.model.clone());
+            AgentRuntimeSpec::Antigravity(AntigravityAgentConfig {
+                tools: Vec::new(),
+                model,
+            })
+        }
+    }
+}
+
+/// Parse editor text into a closed vocabulary list (Cursor, Antigravity),
+/// which has no `all` and must be nonempty.
+fn parse_closed_tools_text<T>(runtime: AgentRuntime, text: &str) -> Result<Vec<T>, String>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    if text == "all" {
+        return Err(format!(
+            "runtime: {runtime} does not support tools: all; list closed snake_case names"
+        ));
+    }
+    let names = parse_tools_list_text(text)?;
+    if names.is_empty() {
+        return Err(format!("{runtime} agents need at least one tool"));
+    }
+    names
+        .iter()
+        .map(|name| T::from_str(name).map_err(|error| error.to_string()))
+        .collect()
+}
+
+/// Flip one name in a closed vocabulary list.
+fn toggle_closed_tool<T>(tools: &mut Vec<T>, name: &str) -> Result<(), String>
+where
+    T: FromStr + PartialEq,
+    T::Err: std::fmt::Display,
+{
+    let tool = T::from_str(name).map_err(|error| error.to_string())?;
+    match tools.iter().position(|current| *current == tool) {
+        Some(index) => {
+            tools.remove(index);
+        }
+        None => tools.push(tool),
+    }
+    Ok(())
+}
+
+/// Saves a draft when the file still matches `original_contents`.
+pub(crate) fn save_definition(
+    draft: &AgentDefinition,
+    path: &Path,
+    original_contents: &str,
+) -> Result<String, SaveDefinitionError> {
+    let contents = canonical_definition_contents(draft, path)?;
+    let _lock = acquire_agent_file_lock(path)?;
+    let current = read_current_agent_file(path)?.unwrap_or_default();
+    if current != original_contents {
+        return Err(SaveDefinitionError::Conflict);
+    }
+    write_agent_file(path, contents.as_bytes())?;
+    Ok(contents)
+}
+
+pub(super) fn canonical_definition_contents(
+    draft: &AgentDefinition,
+    path: &Path,
+) -> Result<String, SaveDefinitionError> {
+    let contents = serialize_definition(draft);
+    if let Err(error) = parse_definition(path, draft.id.as_str(), &contents) {
+        return Err(SaveDefinitionError::Validation(error.to_string()));
+    }
+    Ok(contents)
+}
+
+/// Share the stable instruction-file sidecar lock with other local editors.
+pub(super) fn acquire_agent_file_lock(path: &Path) -> Result<EditFileLock, SaveDefinitionError> {
+    acquire_edit_lock(path).map_err(|error| SaveDefinitionError::Write(error.to_string()))
+}
+
+pub(super) fn read_current_agent_file(path: &Path) -> Result<Option<String>, SaveDefinitionError> {
+    match fs::read_to_string(path) {
+        Ok(current) => Ok(Some(current)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(SaveDefinitionError::Write(error.to_string())),
+    }
+}
+
+pub(super) fn write_agent_file(path: &Path, contents: &[u8]) -> Result<(), SaveDefinitionError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
+            SaveDefinitionError::Write("destination is not a regular file".into()),
+        ),
+        Ok(_) => crate::config_writer::replace_regular_file_atomically(path, contents)
+            .map_err(|error| SaveDefinitionError::Write(error.to_string())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            crate::config_writer::write_bytes_atomically(path, contents)
+                .map_err(|error| SaveDefinitionError::Write(error.to_string()))
+        }
+        Err(error) => Err(SaveDefinitionError::Write(error.to_string())),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SaveDefinitionError {
+    Validation(String),
+    Conflict,
+    Write(String),
+}
+
+impl std::fmt::Display for SaveDefinitionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(message) => write!(formatter, "agent validation failed: {message}"),
+            Self::Conflict => write!(formatter, "agent file changed since editing began"),
+            Self::Write(message) => write!(formatter, "could not write agent file: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for SaveDefinitionError {}

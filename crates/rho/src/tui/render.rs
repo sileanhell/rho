@@ -1,0 +1,669 @@
+mod entry_render;
+mod list_picker;
+mod styled_text;
+mod wrapping;
+
+pub(super) use entry_render::{
+    apply_markdown_images, entry_lines, render_entry_with_options, TrailingBlank,
+};
+pub(super) use list_picker::list_picker_frame;
+pub(super) use styled_text::{clip_line, fit_line, wrap_text_lines};
+pub(super) use wrapping::{
+    hard_wrap_ranges, soft_wrap_visible_ranges, wrap_line_at_whitespace,
+    wrap_line_at_whitespace_ranges, wrap_line_at_whitespace_ranges_with_protected_prefix,
+    wrap_line_hard,
+};
+
+use super::{
+    feed_image::{reserve_entry_image_rows, reserve_markdown_image_rows},
+    first_run::{HeaderHints, Hint, SetupState},
+    message_render::{render_assistant_content, render_reasoning_content},
+    rendered_entry::RenderedEntry,
+    theme::Theme,
+    Entry, FeedImage,
+};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+use std::borrow::Cow;
+
+use ratatui::{
+    layout::Position,
+    style::{Modifier, Style},
+    text::{Line, Span},
+};
+
+/// Stable text prefix for [`Entry::Error`] so severity survives without color.
+pub(super) const ERROR_ENTRY_MARKER: &str = "error: ";
+
+/// Shared space pad for render hot paths. Typical terminal widths fit here, so
+/// padding can borrow instead of allocating `" ".repeat(n)` on every row.
+const PAD_SPACES: &str = concat!(
+    "                                                                ",
+    "                                                                ",
+    "                                                                ",
+    "                                                                ",
+    "                                                                ",
+    "                                                                ",
+    "                                                                ",
+    "                                                                ",
+);
+
+/// Spaces of `width` columns, borrowed from [`PAD_SPACES`] when they fit.
+pub(super) fn pad_spaces(width: usize) -> Cow<'static, str> {
+    if width <= PAD_SPACES.len() {
+        Cow::Borrowed(&PAD_SPACES[..width])
+    } else {
+        Cow::Owned(" ".repeat(width))
+    }
+}
+
+fn push_pad_spaces(buf: &mut String, width: usize) {
+    buf.push_str(&pad_spaces(width));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LineFill {
+    Natural,
+    PadToWidth,
+}
+
+impl LineFill {
+    pub(super) fn pads_to_width(self) -> bool {
+        matches!(self, Self::PadToWidth)
+    }
+}
+
+pub(super) fn session_header_lines(
+    setup: SetupState,
+    header_hints: HeaderHints,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled("rho", Theme::brand()),
+            Span::styled("  v", Theme::dim()),
+            Span::styled(super::smoke_injection::display_version(), Theme::success()),
+        ]),
+    ];
+
+    if let Some(headline) = setup.headline() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(headline));
+    }
+    lines.push(Line::raw(""));
+    let hints = setup.hints(header_hints);
+    if !hints.is_empty() {
+        push_session_header_hints(&mut lines, hints, width);
+        lines.push(Line::raw(""));
+    }
+    lines
+}
+
+fn push_session_header_hints(lines: &mut Vec<Line<'static>>, hints: &[Hint], width: usize) {
+    for hint in hints {
+        lines.push(Line::from(Span::styled(
+            truncate_one_line(hint.text, width),
+            hint.style(),
+        )));
+    }
+}
+
+pub(super) fn truncate_one_line(text: &str, width: usize) -> String {
+    // Fast path: no newlines means we skip the replace allocation entirely.
+    if !text.contains('\n') {
+        if UnicodeWidthStr::width(text) <= width {
+            return text.to_string();
+        }
+        if width <= 1 {
+            return "…".chars().take(width).collect();
+        }
+        return format!("{}…", truncate_to_display_width(text, width - 1));
+    }
+
+    let normalized = text.replace('\n', " ");
+    if UnicodeWidthStr::width(normalized.as_str()) <= width {
+        return normalized;
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    format!("{}…", truncate_to_display_width(&normalized, width - 1))
+}
+
+/// Truncate from the front, keeping the end of `text` with a leading ellipsis.
+pub(super) fn truncate_keep_end(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    // Fast path: no newlines means we skip the replace allocation entirely.
+    if !text.contains('\n') {
+        if display_width(text) <= width {
+            return text.to_string();
+        }
+        return truncate_keep_end_owned(text, width);
+    }
+    let normalized = text.replace('\n', " ");
+    if display_width(&normalized) <= width {
+        return normalized;
+    }
+    truncate_keep_end_owned(&normalized, width)
+}
+
+fn truncate_keep_end_owned(text: &str, width: usize) -> String {
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+
+    let target = width - 1;
+    let mut start = text.len();
+    let mut used = 0usize;
+    for (index, grapheme) in text.grapheme_indices(true).rev() {
+        let grapheme_width = display_width(grapheme);
+        if used + grapheme_width > target {
+            break;
+        }
+        used += grapheme_width;
+        start = index;
+    }
+    format!("…{}", &text[start..])
+}
+
+pub(super) fn display_width(text: &str) -> usize {
+    text.split(char::is_control)
+        .map(UnicodeWidthStr::width)
+        .sum()
+}
+
+pub(super) fn truncate_to_display_width(text: &str, max_width: usize) -> Cow<'_, str> {
+    if display_width(text) <= max_width {
+        return Cow::Borrowed(text);
+    }
+    let mut end = 0;
+    let mut width = 0;
+    for (index, grapheme) in text.grapheme_indices(true) {
+        let grapheme_width = display_width(grapheme);
+        if width + grapheme_width > max_width {
+            break;
+        }
+        width += grapheme_width;
+        end = index + grapheme.len();
+    }
+    Cow::Owned(text[..end].to_string())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CompleteVisualPrefix {
+    pub(super) byte_index: usize,
+    pub(super) ends_with_wrap: bool,
+}
+
+#[cfg(test)]
+pub(super) fn complete_visual_prefix(text: &str, width: usize) -> CompleteVisualPrefix {
+    complete_visual_line_ends(text, width)
+        .last()
+        .copied()
+        .map(|(index, ch)| CompleteVisualPrefix {
+            byte_index: index,
+            ends_with_wrap: ch != '\n',
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn complete_visual_prefix_byte_index(text: &str, width: usize) -> usize {
+    complete_visual_prefix(text, width).byte_index
+}
+
+#[cfg(test)]
+fn complete_visual_line_ends(text: &str, width: usize) -> Vec<(usize, char)> {
+    let width = width.max(1);
+    let mut ends = Vec::new();
+    let mut line_start = 0;
+
+    for (index, ch) in text.char_indices() {
+        if ch == '\n' {
+            ends.extend(complete_word_wrapped_line_ends(
+                &text[line_start..index],
+                line_start,
+                width,
+            ));
+            ends.push((index + ch.len_utf8(), ch));
+            line_start = index + ch.len_utf8();
+        }
+    }
+
+    if line_start < text.len() {
+        ends.extend(complete_word_wrapped_line_ends(
+            &text[line_start..],
+            line_start,
+            width,
+        ));
+    }
+
+    ends
+}
+
+#[cfg(test)]
+fn complete_word_wrapped_line_ends(line: &str, offset: usize, width: usize) -> Vec<(usize, char)> {
+    wrap_line_at_whitespace_ranges(line, width)
+        .into_iter()
+        .filter(|range| {
+            range.end < line.len() || display_width(&line[range.clone()]) >= width.max(1)
+        })
+        .map(|range| (offset + range.end, 'x'))
+        .collect()
+}
+
+/// Wrapped composer rows plus the caret position, from one soft-wrap pass.
+pub(super) struct InputFrame {
+    pub(super) lines: Vec<Line<'static>>,
+    /// Caret column in display columns and row among `lines`. Excludes any
+    /// prompt prefix or chrome the caller stacks above the text.
+    pub(super) cursor: Position,
+}
+
+/// Composer text rows plus the caret, derived from the same wrap so layout
+/// and cursor paint can never disagree or pay for a second wrap.
+pub(super) fn input_frame(
+    input: &str,
+    cursor: usize,
+    width: usize,
+    highlighted_range: Option<std::ops::Range<usize>>,
+) -> InputFrame {
+    let visual_lines = editable_input_visual_lines(input, width);
+    let caret = visual_caret_position(&visual_lines, input, cursor);
+    let mut lines = Vec::new();
+    // Walk `input` in lockstep with the visual lines. Composer soft wrap preserves
+    // every character (including break spaces), so one pass replaces a per-frame
+    // `Vec<char>` of the whole composer.
+    let mut input_chars = input.chars().peekable();
+    let mut input_cursor = 0;
+    for (line_index, visual_line) in visual_lines.iter().enumerate() {
+        if line_index > 0 && input_chars.peek() == Some(&'\n') {
+            input_chars.next();
+            input_cursor += 1;
+        }
+        let mut spans = Vec::new();
+        let mut span_text = String::new();
+        let mut span_highlighted = false;
+        for character in visual_line.chars() {
+            let highlighted = highlighted_range
+                .as_ref()
+                .is_some_and(|range| range.contains(&input_cursor));
+            input_chars.next();
+            input_cursor += 1;
+            if !span_text.is_empty() && highlighted != span_highlighted {
+                let style = if span_highlighted {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                spans.push(Span::styled(std::mem::take(&mut span_text), style));
+            }
+            span_highlighted = highlighted;
+            span_text.push(character);
+        }
+        if !span_text.is_empty() {
+            let style = if span_highlighted {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            spans.push(Span::styled(span_text, style));
+        }
+        lines.push(Line::from(spans));
+    }
+    InputFrame {
+        lines,
+        cursor: caret,
+    }
+}
+
+/// Row and display column of char index `cursor` across `visual_lines`.
+///
+/// The lines partition `input` with hard newlines between rows they split, so
+/// the caret lands on the row that paints the character under the cursor: a
+/// cursor on a line end stays there when the break is a hard newline (or end
+/// of input) and falls to the next row when the line soft-wrapped.
+pub(super) fn visual_caret_position(
+    visual_lines: &[String],
+    input: &str,
+    cursor: usize,
+) -> Position {
+    let mut chars = input.chars().peekable();
+    let mut line_start = 0usize;
+    for (row, line) in visual_lines.iter().enumerate() {
+        let len = line.chars().count();
+        let line_end = line_start + len;
+        // Consume this row's source chars so `chars.peek()` is the row break.
+        for _ in 0..len {
+            chars.next();
+        }
+        let next_is_newline = chars.peek() == Some(&'\n');
+        let last_row = row + 1 == visual_lines.len();
+        if cursor < line_end || (cursor == line_end && (last_row || next_is_newline)) {
+            let column_byte = line
+                .char_indices()
+                .nth(cursor - line_start)
+                .map_or(line.len(), |(byte, _)| byte);
+            return Position {
+                x: display_width(&line[..column_byte]) as u16,
+                y: row as u16,
+            };
+        }
+        if next_is_newline {
+            chars.next();
+            line_start = line_end + 1;
+        } else {
+            line_start = line_end;
+        }
+    }
+    Position {
+        x: 0,
+        y: visual_lines.len().saturating_sub(1) as u16,
+    }
+}
+
+/// Map display columns to source character indices at whole-grapheme boundaries.
+pub(super) fn input_cursor_index_on_visual_line(
+    input: &str,
+    visual_lines: &[String],
+    target_row: usize,
+    target_column: usize,
+) -> usize {
+    // Walk `input` once alongside the visual lines. Re-seeking with `nth` per row
+    // made cursor movement quadratic in the length of the composer text.
+    let mut chars = input.chars().peekable();
+    let mut line_start = 0;
+    for line in visual_lines.iter().take(target_row) {
+        let consumed = line.chars().count();
+        for _ in 0..consumed {
+            chars.next();
+        }
+        line_start += consumed;
+        // A hard newline sits between visual lines and belongs to neither.
+        if chars.peek() == Some(&'\n') {
+            chars.next();
+            line_start += 1;
+        }
+    }
+
+    let mut cursor = line_start;
+    let mut column = 0;
+    if let Some(line) = visual_lines.get(target_row) {
+        for grapheme in line.graphemes(true) {
+            let next_column = column + display_width(grapheme);
+            if next_column > target_column {
+                break;
+            }
+            column = next_column;
+            cursor += grapheme.chars().count();
+        }
+    }
+    cursor
+}
+
+/// Map a visual row/column inside the editable composer to a character index.
+pub(super) fn input_char_index_at_position(
+    input: &str,
+    width: usize,
+    row: usize,
+    column: usize,
+) -> usize {
+    let visual_lines = editable_input_visual_lines(input, width);
+    if visual_lines.is_empty() {
+        return 0;
+    }
+    let row = row.min(visual_lines.len() - 1);
+    input_cursor_index_on_visual_line(input, &visual_lines, row, column)
+}
+
+pub(super) fn editable_input_visual_lines(input: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = input_visual_lines(input, width);
+    if !input.is_empty()
+        && lines
+            .last()
+            .is_some_and(|line| display_width(line) >= width)
+    {
+        lines.push(String::new());
+    }
+    lines
+}
+
+pub(super) fn input_visual_lines(input: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for raw_line in input.split('\n') {
+        // Covering soft-wrap: every source character stays on some visual line so
+        // cursor/highlight walks can lockstep with `input` chars.
+        let wrapped = wrap_line_at_whitespace_ranges(raw_line, width)
+            .into_iter()
+            .map(|range| raw_line[range].to_string())
+            .collect::<Vec<_>>();
+        if wrapped.is_empty() {
+            lines.push(String::new());
+        } else {
+            lines.extend(wrapped);
+        }
+    }
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
+}
+
+pub(super) fn tool_entry_lines(
+    tool: &super::ToolEntry,
+    width: usize,
+    max_tool_output_lines: usize,
+    max_image_height: u16,
+) -> Vec<Line<'static>> {
+    super::tool_card_render::tool_entry_lines(tool, width, max_tool_output_lines, max_image_height)
+}
+
+fn render_non_assistant_entry(
+    lines: &mut Vec<Line<'static>>,
+    entry: &Entry,
+    width: usize,
+    max_tool_output_lines: usize,
+) {
+    match entry {
+        Entry::User(text) => push_wrapped_text(
+            lines,
+            text,
+            width,
+            Theme::user_message(),
+            LineFill::PadToWidth,
+        ),
+        Entry::Assistant(_) | Entry::Reasoning(_) => {
+            unreachable!("assistant and reasoning entries are rendered as markdown")
+        }
+        Entry::Tool(tool) => {
+            super::tool_card_render::push_tool_entry(lines, tool, width, max_tool_output_lines);
+        }
+        Entry::Notice(text) => {
+            push_wrapped_text(lines, text, width, Theme::dim_italic(), LineFill::Natural)
+        }
+
+        Entry::Error(text) => {
+            // Text marker keeps severity readable when color is flattened
+            // (monochrome themes, colorblind setups, NO_COLOR-like terminals).
+            let marked = format!("{ERROR_ENTRY_MARKER}{text}");
+            push_wrapped_text(lines, &marked, width, Theme::error(), LineFill::Natural)
+        }
+    }
+}
+
+pub(super) fn push_wrapped_text(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    width: usize,
+    style: Style,
+    fill: LineFill,
+) {
+    push_wrapped_text_with(lines, text, width, style, fill, wrap_line_at_whitespace);
+}
+
+pub(super) fn push_wrapped_text_with(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    width: usize,
+    style: Style,
+    fill: LineFill,
+    wrap_line: fn(&str, usize) -> Vec<&str>,
+) {
+    let width = width.max(1);
+    let mut emitted = false;
+    for raw_line in text.lines() {
+        let chunks = wrap_line(raw_line, width);
+        for chunk in chunks {
+            lines.push(styled_line(chunk.to_string(), width, style, fill));
+            emitted = true;
+        }
+    }
+
+    if !emitted {
+        lines.push(styled_line(String::new(), width, style, fill));
+    }
+}
+
+pub(super) fn styled_line(
+    mut text: String,
+    width: usize,
+    style: Style,
+    fill: LineFill,
+) -> Line<'static> {
+    if fill.pads_to_width() {
+        let len = display_width(&text);
+        if len < width {
+            push_pad_spaces(&mut text, width - len);
+        }
+    }
+    Line::from(Span::styled(text, style))
+}
+
+pub(super) fn styled_blank_line(width: usize, style: Style) -> Line<'static> {
+    Line::from(Span::styled(pad_spaces(width.max(1)), style))
+}
+
+/// Hard-wrap a pre-styled line at display columns, preserving span styles.
+///
+/// `text` must be the concatenation of `spans` contents. Empty input yields one
+/// empty span row using `empty_style`.
+pub(super) fn hard_wrap_styled_spans(
+    text: &str,
+    spans: &[Span<'static>],
+    width: usize,
+    empty_style: Style,
+) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let mut span_index = 0;
+    let mut span_start = 0;
+    hard_wrap_ranges(text, width)
+        .into_iter()
+        .map(|range| {
+            let mut chunk = Vec::new();
+            while let Some(span) = spans.get(span_index) {
+                if span_start >= range.end {
+                    break;
+                }
+                let span_end = span_start + span.content.len();
+                let from = range.start.saturating_sub(span_start);
+                let to = (range.end - span_start).min(span.content.len());
+                if from < to {
+                    chunk.push(Span::styled(span.content[from..to].to_owned(), span.style));
+                }
+                if span_end > range.end {
+                    break;
+                }
+                span_start = span_end;
+                span_index += 1;
+            }
+            if chunk.is_empty() {
+                vec![Span::styled(String::new(), empty_style)]
+            } else {
+                chunk
+            }
+        })
+        .collect()
+}
+
+/// Display width of concatenated styled spans.
+pub(super) fn spans_display_width(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum()
+}
+
+/// Slice concatenated spans by byte offsets into their joined UTF-8 text.
+pub(super) fn slice_spans_by_bytes(
+    spans: &[Span<'static>],
+    start: usize,
+    end: usize,
+) -> Vec<Span<'static>> {
+    if start >= end {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for span in spans {
+        let content = span.content.as_ref();
+        let span_start = offset;
+        let span_end = offset + content.len();
+        offset = span_end;
+        if span_end <= start || span_start >= end {
+            continue;
+        }
+        let from = start.saturating_sub(span_start);
+        let to = (end - span_start).min(content.len());
+        if from >= to {
+            continue;
+        }
+        // Ranges come from the concatenated UTF-8 text, so byte edges are char edges.
+        out.push(Span::styled(content[from..to].to_string(), span.style));
+    }
+    out
+}
+
+/// Width left for content after [`pad_display_line`] takes a column on each side.
+pub(super) fn padded_content_width(width: usize) -> usize {
+    width.saturating_sub(2).max(1)
+}
+
+/// Leading gutter columns on every transcript row. [`pad_display_line`] adds
+/// one, and the session header keeps the same leading indent, so selections
+/// can leave it out. (The right edge is not reserved on every row: the session
+/// header may fill the last column.)
+pub(super) const TRANSCRIPT_LEADING_GUTTER: usize = 1;
+
+/// Indent a rendered line by one column on each side.
+///
+/// Edge spaces keep the leading span's colors (so user-message backgrounds
+/// still fill the gutter) but drop underline. Sampling the content style with
+/// underline left bare URLs and other link lines drawing a one-cell underline
+/// past the real text.
+pub(super) fn pad_display_line(line: Line<'static>) -> Line<'static> {
+    let edge_style = line
+        .spans
+        .first()
+        .map(|span| chrome_edge_style(span.style))
+        .unwrap_or_default();
+    let mut spans = Vec::with_capacity(line.spans.len() + 2);
+    spans.push(Span::styled(" ", edge_style));
+    spans.extend(line.spans);
+    spans.push(Span::styled(" ", edge_style));
+    Line::from(spans)
+}
+
+/// Gutter / spacer chrome may borrow content colors but must not carry
+/// underline into empty cells next to links.
+pub(super) fn chrome_edge_style(style: Style) -> Style {
+    style.remove_modifier(Modifier::UNDERLINED)
+}

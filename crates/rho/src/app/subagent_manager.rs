@@ -1,0 +1,600 @@
+//! Registry of in-process delegated agent runs.
+//!
+//! Spawn, observe, stop, cost accounting, host-input bind, notices, and rail
+//! summaries live here so tools call a manager API instead of executor internals.
+
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use {
+    crate::agent::AgentDefinition,
+    crate::app::{
+        agent_executor::{AgentExecutor, AgentLaunchRequest, AgentRunHandle},
+        subagent_host_input::{SubagentHostInputBridge, SubagentHostInputRequest},
+        subagent_messaging::{SubagentNotice, SubagentNoticeBridge},
+    },
+    crate::subagent::{self, RunStatus},
+};
+
+pub(crate) use super::subagent_messaging::ValidatedMessage;
+
+/// How long the host rail keeps a finished run that the current parent session
+/// will never receive (another or no parent session). Rows it will receive
+/// leave on delivery instead.
+const RAIL_TERMINAL_RETENTION: Duration = Duration::from_secs(10);
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Debug)]
+pub struct SubagentSnapshot {
+    pub id: String,
+    pub agent_id: String,
+    pub title: Option<String>,
+    pub elapsed: Duration,
+    pub status: RunStatus,
+    pub done: bool,
+    pub prior_notices: Vec<String>,
+}
+
+/// Stable run identity and its best available task label for host presentation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SubagentTaskIdentity {
+    pub run_id: String,
+    pub agent_id: String,
+    pub task: String,
+}
+
+struct AgentEntry {
+    agent_id: String,
+    task_fallback: Option<String>,
+    started: Instant,
+    handle: AgentRunHandle,
+    session_id: Option<String>,
+    observed: bool,
+    explicitly_observed: bool,
+    /// Whether this run's terminal cost has already been folded into a parent
+    /// session total. Independent of [`Self::observed`] so cost still counts
+    /// when a run is delivered through `status`/`stop` instead of notification.
+    cost_accounted: bool,
+}
+
+impl AgentEntry {
+    fn snapshot(&self, id: &str) -> SubagentSnapshot {
+        let status = self.handle.status();
+        let elapsed = status
+            .elapsed_duration(subagent::unix_now_secs())
+            .unwrap_or_else(|| self.started.elapsed());
+        SubagentSnapshot {
+            id: id.to_string(),
+            agent_id: self.agent_id.clone(),
+            title: status.title.clone(),
+            elapsed,
+            done: self.handle.is_complete() && status.state.is_terminal(),
+            status,
+            prior_notices: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SubagentNotification {
+    pub snapshot: SubagentSnapshot,
+}
+
+#[derive(Clone)]
+pub struct SubagentManager {
+    inner: Arc<Mutex<HashMap<String, AgentEntry>>>,
+    executor: AgentExecutor,
+    parent_placement: Arc<Mutex<subagent::RunPlacement>>,
+}
+
+impl SubagentManager {
+    pub fn new(config: crate::config::Config, config_path: PathBuf, cwd: PathBuf) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            executor: AgentExecutor::new(
+                config,
+                config_path,
+                cwd,
+                SubagentHostInputBridge::new(),
+                SubagentNoticeBridge::new(),
+            ),
+            parent_placement: Arc::new(Mutex::new(subagent::RunPlacement::parentless())),
+        }
+    }
+
+    /// Delegated Rho agents use the parent's host I/O: they read and edit
+    /// host-served files, so both see the same unsaved text, and run shell
+    /// commands in host terminals.
+    pub(crate) fn with_host_io(mut self, host_io: crate::tools::host_io::HostIo) -> Self {
+        self.executor = self.executor.with_host_io(host_io);
+        self
+    }
+
+    pub(crate) fn bind_host_input(&self) -> tokio::sync::mpsc::Receiver<SubagentHostInputRequest> {
+        self.executor.host_input().bind_parent()
+    }
+
+    pub(crate) fn unbind_host_input(&self) {
+        self.executor.host_input().unbind_parent();
+    }
+
+    /// Atomically replaces the notice binding, retaining in-flight channel notices.
+    ///
+    /// Pass `None` for the first bind. When rebinding, pass the prior receiver so
+    /// posts that already returned `Ok` stay deliverable on the retired generation.
+    pub(crate) fn rebind_notices(
+        &self,
+        old_receiver: Option<tokio::sync::mpsc::Receiver<SubagentNotice>>,
+    ) -> crate::app::subagent_messaging::NoticeRebind {
+        self.executor.notices().rebind_parent(old_receiver)
+    }
+
+    pub(crate) fn unbind_notices(&self) {
+        self.executor.notices().unbind_parent();
+    }
+
+    pub fn bind_parent_session(&self, placement: subagent::RunPlacement) {
+        *self
+            .parent_placement
+            .lock()
+            .expect("delegated session lock") = placement;
+    }
+
+    pub fn update_selection(
+        &self,
+        provider: &str,
+        model: &str,
+        reasoning: rho_sdk::ReasoningLevel,
+        auth: &str,
+    ) {
+        self.executor
+            .update_selection(provider, model, reasoning, auth);
+    }
+
+    pub(crate) fn update_web_search(&self, settings: &crate::config::WebSearchSettings) {
+        self.executor.update_web_search(settings);
+    }
+
+    /// Updates the policy snapshot used by future launches. Already-spawned
+    /// agents retain the mode captured when they were launched.
+    pub(crate) fn update_permission_mode(&self, mode: crate::permission::PermissionMode) {
+        self.executor.update_permission_mode(mode);
+    }
+
+    /// Updates the added workspace directories future launches inherit.
+    pub(crate) fn update_added_dirs(&self, added_dirs: crate::added_dirs::AddedDirs) {
+        self.executor.update_added_dirs(added_dirs);
+    }
+
+    /// Updates the internal-agent selections future launches build from,
+    /// such as the permission classifier and its screen.
+    pub(crate) fn update_internal_agents(
+        &self,
+        internal_agents: &std::collections::BTreeMap<
+            String,
+            crate::config::InternalAgentModelConfig,
+        >,
+    ) {
+        self.executor.update_internal_agents(internal_agents);
+    }
+
+    pub(crate) fn concurrency(&self) -> crate::app::agent_concurrency::AgentConcurrency {
+        self.executor.concurrency()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launch_permission_mode(&self) -> crate::permission::PermissionMode {
+        self.executor.launch_permission_mode()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launch_internal_agents(
+        &self,
+    ) -> std::collections::BTreeMap<String, crate::config::InternalAgentModelConfig> {
+        self.executor.launch_internal_agents()
+    }
+
+    pub(crate) async fn spawn(
+        &self,
+        definition: &AgentDefinition,
+        prompt: &str,
+        cwd: &Path,
+        model_override: Option<&str>,
+    ) -> anyhow::Result<(String, PathBuf)> {
+        let placement = self
+            .parent_placement
+            .lock()
+            .expect("delegated session lock")
+            .clone();
+        let parent_session_id = placement
+            .parent_session_id()
+            .map(str::to_owned)
+            .and_then(|id| rho_sdk::SessionId::from_string(id).ok());
+        let session_id = placement.parent_session_id().map(str::to_owned);
+        let cwd = cwd.to_path_buf();
+        let (id, directory) =
+            tokio::task::spawn_blocking(move || subagent::reserve_run_directory(&placement, &cwd))
+                .await??;
+        let output_file = directory.join(subagent::RESULT_FILE_NAME);
+        let launch = AgentLaunchRequest {
+            definition: Arc::new(definition.clone()),
+            model_override: model_override.map(str::to_owned),
+            prompt: prompt.to_string(),
+            run_id: id.clone(),
+            parent_session_id,
+            output_file,
+        };
+        let handle = match self.executor.spawn(launch) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let cleanup_id = id.clone();
+                let cleanup_directory = directory.clone();
+                let cleanup = tokio::task::spawn_blocking(move || {
+                    subagent::release_run_directory(&cleanup_id, &cleanup_directory)
+                })
+                .await?;
+                if let Err(cleanup_error) = cleanup {
+                    return Err(anyhow::anyhow!(
+                        "{error}; failed to clean up delegated run reservation: {cleanup_error}"
+                    ));
+                }
+                return Err(error);
+            }
+        };
+        self.inner.lock().expect("delegated registry lock").insert(
+            id.clone(),
+            AgentEntry {
+                agent_id: definition.id.to_string(),
+                task_fallback: prompt
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(str::to_owned),
+                started: Instant::now(),
+                handle,
+                session_id,
+                observed: false,
+                explicitly_observed: false,
+                cost_accounted: false,
+            },
+        );
+        Ok((id, directory.join(subagent::LOG_FILE_NAME)))
+    }
+
+    /// Fold terminal costs for `session_id` into a parent total once per run.
+    ///
+    /// Counts every finished run (success or failure)
+    /// the first time the parent claims it. Safe to call from any TUI poll path.
+    pub fn claim_terminal_costs_usd_micros(&self, session_id: &str) -> u64 {
+        let mut entries = self.inner.lock().expect("delegated registry lock");
+        let mut total = 0u64;
+        for entry in entries.values_mut() {
+            if entry.cost_accounted || entry.session_id.as_deref() != Some(session_id) {
+                continue;
+            }
+            let status = entry.handle.status();
+            if !status.state.is_terminal() {
+                continue;
+            }
+            entry.cost_accounted = true;
+            if let Some(cost) = status.total_cost_usd {
+                total = total.saturating_add(subagent::usd_to_micros(cost));
+            }
+        }
+        total
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_completed_for_test(
+        &self,
+        id: &str,
+        session_id: &str,
+        total_cost_usd: Option<f64>,
+    ) {
+        self.insert_completed_status_for_test(
+            id,
+            session_id,
+            crate::subagent::RunStatus {
+                state: crate::subagent::RunState::Ok,
+                total_cost_usd,
+                ..crate::subagent::RunStatus::default()
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_completed_status_for_test(
+        &self,
+        id: &str,
+        session_id: &str,
+        status: crate::subagent::RunStatus,
+    ) {
+        self.insert_handle_for_test(id, session_id, AgentRunHandle::completed_for_test(status));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn post_notice_for_test(&self, notice: SubagentNotice) {
+        self.executor.notices().post(notice).unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_handle_for_test(
+        &self,
+        id: &str,
+        session_id: &str,
+        handle: AgentRunHandle,
+    ) {
+        let _delivery = super::notification_delivery::lock();
+        self.inner.lock().expect("delegated registry lock").insert(
+            id.to_string(),
+            AgentEntry {
+                agent_id: "fixture".into(),
+                task_fallback: None,
+                started: Instant::now(),
+                handle,
+                session_id: Some(session_id.into()),
+                observed: false,
+                explicitly_observed: false,
+                cost_accounted: false,
+            },
+        );
+    }
+
+    /// Read launch metadata without acknowledging a completion notification.
+    pub(crate) fn status(&self, id: &str) -> Option<SubagentSnapshot> {
+        let id = crate::subagent::normalize_id(id).ok()?;
+        self.inner
+            .lock()
+            .expect("delegated registry lock")
+            .get(&id)
+            .map(|entry| entry.snapshot(&id))
+    }
+
+    pub fn list(&self) -> Vec<SubagentSnapshot> {
+        let entries = self.inner.lock().expect("delegated registry lock");
+        let mut snapshots = entries
+            .iter()
+            .map(|(id, entry)| entry.snapshot(id))
+            .collect::<Vec<_>>();
+        snapshots.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.elapsed));
+        snapshots
+    }
+
+    /// Display identity without marking a run's result as observed.
+    pub(crate) fn task_identity(&self, id: &str) -> Option<SubagentTaskIdentity> {
+        let id = crate::subagent::normalize_id(id).ok()?;
+        let entries = self.inner.lock().expect("delegated registry lock");
+        let entry = entries.get(&id)?;
+        let task = entry
+            .handle
+            .status()
+            .title
+            .filter(|title| !title.trim().is_empty())
+            .or_else(|| entry.task_fallback.clone())
+            .unwrap_or_else(|| "Delegated task".into());
+        Some(SubagentTaskIdentity {
+            run_id: id,
+            agent_id: entry.agent_id.clone(),
+            task,
+        })
+    }
+
+    /// Live runs plus finished runs whose result has not been delivered yet.
+    ///
+    /// A finished row leaves once its result is observed, so the rail drops it
+    /// in the same repaint that lands the result in the transcript. Until then
+    /// runs owned by `session_id` keep showing their verdict. Runs it will never
+    /// receive (other or no parent session) keep a recent `finished_at` window.
+    ///
+    /// Host UI only. `list()` stays the full agent-facing registry.
+    pub(crate) fn rail_summaries(&self, session_id: &str) -> Vec<SubagentSnapshot> {
+        let now = subagent::unix_now_secs();
+        let retention = RAIL_TERMINAL_RETENTION.as_secs();
+        let entries = self.inner.lock().expect("delegated registry lock");
+        let mut snapshots = entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                let snapshot = entry.snapshot(id);
+                if snapshot.done {
+                    if entry.observed {
+                        return None;
+                    }
+                    if entry.session_id.as_deref() == Some(session_id) {
+                        return Some(snapshot);
+                    }
+                    let finished_at = snapshot.status.finished_at?;
+                    if now.saturating_sub(finished_at) >= retention {
+                        return None;
+                    }
+                }
+                Some(snapshot)
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.elapsed));
+        snapshots
+    }
+
+    pub fn has_running_for_session(&self, session_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("delegated registry lock")
+            .values()
+            .any(|entry| {
+                entry.session_id.as_deref() == Some(session_id) && !entry.handle.is_complete()
+            })
+    }
+
+    /// True while this session still has an undelivered child.
+    pub fn has_active_or_pending_notification(&self, session_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("delegated registry lock")
+            .values()
+            .any(|entry| entry.session_id.as_deref() == Some(session_id) && !entry.observed)
+    }
+
+    /// Waits for any current child to finish without marking its result delivered.
+    /// Hosts call this at a provider boundary, after all launches have registered.
+    pub(crate) async fn wait_for_notification(&self, session_id: &str) {
+        let handles = {
+            let entries = self.inner.lock().expect("delegated registry lock");
+            // Include unobserved terminals too: completion can change while
+            // this registry lock is held, and their wait returns immediately.
+            entries
+                .values()
+                .filter(|entry| entry.session_id.as_deref() == Some(session_id) && !entry.observed)
+                .map(|entry| entry.handle.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut waits = handles
+            .into_iter()
+            .map(|mut handle| async move { handle.wait().await })
+            .collect::<futures_util::stream::FuturesUnordered<_>>();
+        if futures_util::StreamExt::next(&mut waits).await.is_none() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Atomically drains every unobserved terminal background run for the
+    /// session and marks the whole batch observed, in launch order so batched
+    /// delivery is deterministic.
+    pub fn take_notifications(&self, session_id: &str) -> Vec<SubagentNotification> {
+        let mut entries = self.inner.lock().expect("delegated registry lock");
+        let mut notifications = entries
+            .iter_mut()
+            .filter_map(|(id, entry)| {
+                if entry.observed || entry.session_id.as_deref() != Some(session_id) {
+                    return None;
+                }
+                let snapshot = entry.snapshot(id);
+                snapshot.done.then(|| {
+                    entry.observed = true;
+                    (entry.started, SubagentNotification { snapshot })
+                })
+            })
+            .collect::<Vec<_>>();
+        notifications.sort_by(|(a_started, a), (b_started, b)| {
+            a_started
+                .cmp(b_started)
+                .then_with(|| a.snapshot.id.cmp(&b.snapshot.id))
+        });
+        notifications
+            .into_iter()
+            .map(|(_, notification)| notification)
+            .collect()
+    }
+
+    /// Returns drained notifications so a failed turn setup can deliver them
+    /// again. Only terminal background entries still present are reopened.
+    pub fn restore_notifications(&self, notifications: &[SubagentNotification]) {
+        if notifications.is_empty() {
+            return;
+        }
+        let mut entries = self.inner.lock().expect("delegated registry lock");
+        for notification in notifications {
+            let Some(entry) = entries.get_mut(&notification.snapshot.id) else {
+                continue;
+            };
+            let snapshot = entry.snapshot(&notification.snapshot.id);
+            if snapshot.done && entry.observed && !entry.explicitly_observed {
+                entry.observed = false;
+            }
+        }
+    }
+
+    /// Returns the run snapshot; a terminal snapshot counts as delivered, so
+    /// automatic notification will not repeat a result the parent already
+    /// read through `status` or `stop`.
+    pub fn observe(&self, id: &str) -> Option<SubagentSnapshot> {
+        let id = crate::subagent::normalize_id(id).ok()?;
+        let _delivery = super::notification_delivery::lock();
+        let mut entries = self.inner.lock().expect("delegated registry lock");
+        let entry = entries.get_mut(&id)?;
+        let mut snapshot = entry.snapshot(&id);
+        if snapshot.done {
+            snapshot.prior_notices = self
+                .executor
+                .notices()
+                .pending_for_run(&id)
+                .into_iter()
+                .map(|notice| {
+                    notice.acknowledge();
+                    notice.message
+                })
+                .collect();
+            entry.observed = true;
+            entry.explicitly_observed = true;
+        }
+        Some(snapshot)
+    }
+
+    #[cfg(test)]
+    pub async fn wait_done(&self, id: &str) -> Option<SubagentSnapshot> {
+        let id = crate::subagent::normalize_id(id).ok()?;
+        let mut handle = self
+            .inner
+            .lock()
+            .expect("delegated registry lock")
+            .get(&id)?
+            .handle
+            .clone();
+        handle.wait().await;
+        self.status(&id)
+    }
+
+    pub async fn stop(&self, id: &str) -> anyhow::Result<SubagentSnapshot> {
+        let id = crate::subagent::normalize_id(id)?;
+        let mut handle = self
+            .inner
+            .lock()
+            .expect("delegated registry lock")
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("unknown delegated run '{id}'"))?
+            .handle
+            .clone();
+        handle.cancel();
+        tokio::time::timeout(SHUTDOWN_TIMEOUT, handle.wait())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out stopping delegated run '{id}'"))?;
+        // Stopping hands the terminal snapshot to the caller, so it counts
+        // as delivered and is not repeated by automatic notification.
+        self.observe(&id)
+            .ok_or_else(|| anyhow::anyhow!("delegated run '{id}' disappeared"))
+    }
+
+    /// Stages a parent plain-text message for a running delegated agent.
+    pub(crate) async fn message(&self, id: &str, message: &ValidatedMessage) -> anyhow::Result<()> {
+        let id = crate::subagent::normalize_id(id)?;
+        let handle = self
+            .inner
+            .lock()
+            .expect("delegated registry lock")
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("unknown delegated run '{id}'"))?
+            .handle
+            .clone();
+        handle.message_from_parent(message).await
+    }
+
+    pub async fn shutdown(&self) {
+        let handles = self
+            .inner
+            .lock()
+            .expect("delegated registry lock")
+            .values()
+            .map(|entry| entry.handle.clone())
+            .collect::<Vec<_>>();
+        for handle in &handles {
+            handle.cancel();
+        }
+        let waits = handles.into_iter().map(|mut handle| async move {
+            handle.wait().await;
+        });
+        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, futures_util::future::join_all(waits)).await;
+    }
+}

@@ -1,0 +1,689 @@
+use thiserror::Error;
+
+mod availability;
+pub(crate) mod init_turn;
+pub(crate) use availability::CommandContext;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandId {
+    AddDir,
+    Advisor,
+    New,
+    Login,
+    Logout,
+    Model,
+    RefreshModels,
+    Remember,
+    Resume,
+    Rewind,
+    Sessions,
+    Tree,
+    Config,
+    Context,
+    Permissions,
+    Info,
+    Init,
+    Help,
+    Compact,
+    Computer,
+    Copy,
+    Goal,
+    Skills,
+    Theme,
+    Hooks,
+    Agents,
+    CreateAgent,
+    Attach,
+    Codemode,
+    Diff,
+    Doctor,
+    Limits,
+    Export,
+    Mcp,
+    Title,
+    Fast,
+    Workflow,
+    Side,
+    Spend,
+    Reasoning,
+    Todo,
+    Exit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandSpec {
+    pub id: CommandId,
+    pub name: &'static str,
+    pub usage: &'static str,
+    pub description: &'static str,
+    pub argument_choices: &'static [CommandArgumentChoice],
+}
+
+fn agents_create_request(args: &str) -> Option<&str> {
+    let mut parts = args.splitn(2, char::is_whitespace);
+    let action = parts.next()?;
+    action
+        .eq_ignore_ascii_case("create")
+        .then(|| parts.next().unwrap_or_default().trim())
+}
+
+/// User request for `/agents create` / `/create-agent` after the command token.
+///
+/// `expanded_args` is the text after the first slash token in the expanded
+/// model input, so pasted bodies stay intact. `/agents create` still has to
+/// drop the `create` sub-action; `/create-agent` does not.
+pub(crate) fn create_agent_request<'a>(command_name: &str, expanded_args: &'a str) -> &'a str {
+    let args = expanded_args.trim();
+    if command_name.eq_ignore_ascii_case("agents") {
+        agents_create_request(args).unwrap_or("")
+    } else {
+        args
+    }
+}
+
+impl CommandSpec {
+    /// A slash name that only resolves to `target`. No unique id or handler.
+    const fn alias(
+        name: &'static str,
+        usage: &'static str,
+        description: &'static str,
+        target: CommandId,
+    ) -> Self {
+        Self {
+            id: target,
+            name,
+            usage,
+            description,
+            argument_choices: &[],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandArgumentChoice {
+    pub completion: &'static str,
+    pub usage: &'static str,
+    pub description: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandInvocation {
+    pub id: CommandId,
+    pub name: String,
+    pub raw_args: String,
+    pub args: String,
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum CommandParseError {
+    #[error("unknown command '/{0}'")]
+    Unknown(String),
+}
+
+const GOAL_ARGUMENT_CHOICES: &[CommandArgumentChoice] = &[
+    CommandArgumentChoice {
+        completion: "/goal resume",
+        usage: "/goal resume",
+        description: "verify and continue a blocked goal",
+    },
+    CommandArgumentChoice {
+        completion: "/goal clear",
+        usage: "/goal clear",
+        description: "stop and clear the current goal",
+    },
+];
+
+const REMEMBER_ARGUMENT_CHOICES: &[CommandArgumentChoice] = &[CommandArgumentChoice {
+    completion: "/remember global",
+    usage: "/remember global <text>",
+    description: "remember an instruction for every project",
+}];
+
+const AGENTS_ARGUMENT_CHOICES: &[CommandArgumentChoice] = &[CommandArgumentChoice {
+    completion: "/agents create",
+    usage: "/agents create [request]",
+    description: "create an agent through a guided questionnaire",
+}];
+
+const ADVISOR_ARGUMENT_CHOICES: &[CommandArgumentChoice] = &[
+    CommandArgumentChoice {
+        completion: "/advisor on",
+        usage: "/advisor on",
+        description: "let the agent ask an advisor model for guidance",
+    },
+    CommandArgumentChoice {
+        completion: "/advisor off",
+        usage: "/advisor off",
+        description: "work without advisor guidance",
+    },
+    CommandArgumentChoice {
+        completion: "/advisor model",
+        usage: "/advisor model",
+        description: "choose the advisor model and its reasoning level",
+    },
+];
+
+const FAST_ARGUMENT_CHOICES: &[CommandArgumentChoice] = &[
+    CommandArgumentChoice {
+        completion: "/fast on",
+        usage: "/fast on",
+        description: "enable faster responses at a higher rate",
+    },
+    CommandArgumentChoice {
+        completion: "/fast off",
+        usage: "/fast off",
+        description: "use standard response speed",
+    },
+];
+
+const PERMISSIONS_ARGUMENT_CHOICES: &[CommandArgumentChoice] = &[
+    CommandArgumentChoice {
+        completion: "/permissions bypass",
+        usage: "/permissions bypass",
+        description: "skip permission checks",
+    },
+    CommandArgumentChoice {
+        completion: "/permissions auto",
+        usage: "/permissions auto",
+        description: "let a classifier review gated actions",
+    },
+    CommandArgumentChoice {
+        completion: "/permissions allow_edits",
+        usage: "/permissions allow_edits",
+        description: "allow tracked workspace edits; ask for other gated actions",
+    },
+    CommandArgumentChoice {
+        completion: "/permissions plan",
+        usage: "/permissions plan",
+        description: "investigate without writes or process execution",
+    },
+    CommandArgumentChoice {
+        completion: "/permissions supervised",
+        usage: "/permissions supervised",
+        description: "ask before writes and other gated actions",
+    },
+];
+
+const CODEMODE_ARGUMENT_CHOICES: &[CommandArgumentChoice] = &[
+    CommandArgumentChoice {
+        completion: "/codemode status",
+        usage: "/codemode status",
+        description: "show the current codemode mode",
+    },
+    CommandArgumentChoice {
+        completion: "/codemode on",
+        usage: "/codemode on",
+        description: "declare direct tools next to codemode; use either",
+    },
+    CommandArgumentChoice {
+        completion: "/codemode only",
+        usage: "/codemode only",
+        description: "hide direct tools; compose through codemode",
+    },
+];
+
+const COMPUTER_ARGUMENT_CHOICES: &[CommandArgumentChoice] = &[
+    CommandArgumentChoice {
+        completion: "/computer status",
+        usage: "/computer status",
+        description: "show computer use and Cua Driver detection without connecting",
+    },
+    CommandArgumentChoice {
+        completion: "/computer setup",
+        usage: "/computer setup",
+        description: "install, configure and verify Cua Driver with separate consent",
+    },
+    CommandArgumentChoice {
+        completion: "/computer update",
+        usage: "/computer update",
+        description: "check for a newer Cua Driver and install it with separate consent",
+    },
+    CommandArgumentChoice {
+        completion: "/computer on",
+        usage: "/computer on",
+        description: "grant this session access to the local desktop through Cua Driver",
+    },
+    CommandArgumentChoice {
+        completion: "/computer off",
+        usage: "/computer off",
+        description: "revoke computer use and disconnect this session",
+    },
+];
+
+// Keep alphabetical by `name` so the slash palette stays sorted as commands are added.
+pub static COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        id: CommandId::AddDir,
+        name: "add-dir",
+        usage: "/add-dir [path]",
+        description: "add a directory to this session's workspace scope",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Advisor,
+        name: "advisor",
+        usage: "/advisor [on|off|model]",
+        description: "toggle advisor mode or choose the advisor model",
+        argument_choices: ADVISOR_ARGUMENT_CHOICES,
+    },
+    CommandSpec {
+        id: CommandId::Agents,
+        name: "agents",
+        usage: "/agents [create]",
+        description: "browse agents or create one through a guided questionnaire",
+        argument_choices: AGENTS_ARGUMENT_CHOICES,
+    },
+    CommandSpec {
+        id: CommandId::Attach,
+        name: "attach",
+        usage: "/attach",
+        description: "attach to a subagent run",
+        argument_choices: &[],
+    },
+    CommandSpec::alias("btw", "/btw [prompt]", "alias for /side", CommandId::Side),
+    CommandSpec::alias("clear", "/clear", "alias for /new", CommandId::New),
+    CommandSpec {
+        id: CommandId::Codemode,
+        name: "codemode",
+        usage: "/codemode [status|on|only]",
+        description: "compose tools in a Starlark script; nested calls follow /permissions",
+        argument_choices: CODEMODE_ARGUMENT_CHOICES,
+    },
+    CommandSpec {
+        id: CommandId::Compact,
+        name: "compact",
+        usage: "/compact [instructions]",
+        description: "compact older conversation context, optionally saying what to keep",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Computer,
+        name: "computer",
+        usage: "/computer [status|setup|update|on|off]",
+        description: "computer use powered by Cua Driver, off until explicitly enabled",
+        argument_choices: COMPUTER_ARGUMENT_CHOICES,
+    },
+    CommandSpec {
+        id: CommandId::Config,
+        name: "config",
+        usage: "/config",
+        description: "open configuration picker",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Context,
+        name: "context",
+        usage: "/context",
+        description: "show what fills the context window, by source",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Copy,
+        name: "copy",
+        usage: "/copy",
+        description: "choose an assistant output to copy to the clipboard",
+        argument_choices: &[],
+    },
+    CommandSpec::alias(
+        "create-agent",
+        "/create-agent [request]",
+        "alias for /agents create",
+        CommandId::CreateAgent,
+    ),
+    CommandSpec {
+        id: CommandId::Diff,
+        name: "diff",
+        usage: "/diff",
+        description: "show Git status and worktree patches",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Doctor,
+        name: "doctor",
+        usage: "/doctor",
+        description: "run local setup diagnostics",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Exit,
+        name: "exit",
+        usage: "/exit",
+        description: "quit rho",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Export,
+        name: "export",
+        usage: "/export [path]",
+        description: "export the session transcript (html/md/json; default ~/.rho/exports)",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Fast,
+        name: "fast",
+        usage: "/fast [on|off]",
+        description: "toggle faster responses at a higher rate",
+        argument_choices: FAST_ARGUMENT_CHOICES,
+    },
+    CommandSpec {
+        id: CommandId::Goal,
+        name: "goal",
+        usage: "/goal [condition|resume|clear]",
+        description: "show status or work until a condition is met",
+        argument_choices: GOAL_ARGUMENT_CHOICES,
+    },
+    CommandSpec {
+        id: CommandId::Help,
+        name: "help",
+        usage: "/help",
+        description: "show keyboard shortcuts",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Hooks,
+        name: "hooks",
+        usage: "/hooks",
+        description: "reload lifecycle hooks and show what each one will run",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Info,
+        name: "info",
+        usage: "/info",
+        description: "show runtime, usage, and workspace details in an overlay",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Init,
+        name: "init",
+        usage: "/init",
+        description: "survey the repository and write AGENTS.md",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Limits,
+        name: "limits",
+        usage: "/limits",
+        description: "show connected usage limits in an overlay",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Login,
+        name: "login",
+        usage: "/login [provider]",
+        description: "log in to a provider",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Logout,
+        name: "logout",
+        usage: "/logout [provider]",
+        description: "delete provider credentials",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Mcp,
+        name: "mcp",
+        usage: "/mcp",
+        description: "show configured MCP servers and session load status",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Model,
+        name: "model",
+        usage: "/model [model]",
+        description: "show or switch model",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::New,
+        name: "new",
+        usage: "/new",
+        description: "start a new session",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Permissions,
+        name: "permissions",
+        usage: "/permissions [bypass|auto|allow_edits|plan|supervised]",
+        description: "show or change the permission mode",
+        argument_choices: PERMISSIONS_ARGUMENT_CHOICES,
+    },
+    CommandSpec {
+        id: CommandId::RefreshModels,
+        name: "refresh-models",
+        usage: "/refresh-models",
+        description: "refresh cached provider model lists and the models.dev catalog",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Remember,
+        name: "remember",
+        usage: "/remember [global] <text>",
+        description: "append a standing instruction to AGENTS.md without a model turn",
+        argument_choices: REMEMBER_ARGUMENT_CHOICES,
+    },
+    CommandSpec {
+        id: CommandId::Resume,
+        name: "resume",
+        usage: "/resume [id]",
+        description: "resume a saved session",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Reasoning,
+        name: "reasoning",
+        usage: "/reasoning",
+        description: "open reasoning configuration",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Rewind,
+        name: "rewind",
+        usage: "/rewind [turn]",
+        description: "preview and restore a completed turn's workspace checkpoint",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Sessions,
+        name: "sessions",
+        usage: "/sessions",
+        description: "browse, resume, and delete saved sessions in every directory",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Side,
+        name: "side",
+        usage: "/side [prompt]",
+        description: "ask aside without changing the session",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Skills,
+        name: "skills",
+        usage: "/skills",
+        description: "show loaded skills and descriptions",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Spend,
+        name: "spend",
+        usage: "/spend",
+        description: "show AI spend and usage history across this machine",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Todo,
+        name: "todo",
+        usage: "/todo",
+        description: "show the current task checklist",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Theme,
+        name: "theme",
+        usage: "/theme",
+        description: "preview and apply a color theme",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Title,
+        name: "title",
+        usage: "/title <name>",
+        description: "rename the current session",
+        argument_choices: &[],
+    },
+    CommandSpec {
+        id: CommandId::Tree,
+        name: "tree",
+        usage: "/tree",
+        description: "navigate this session's conversation tree",
+        argument_choices: &[],
+    },
+    CommandSpec::alias("usage", "/usage", "alias for /limits", CommandId::Limits),
+    CommandSpec {
+        id: CommandId::Workflow,
+        name: "workflow",
+        usage: "/workflow",
+        description: "start a workflow or check runs",
+        argument_choices: &[],
+    },
+];
+
+pub(crate) fn argument_choices(
+    input: &str,
+    cursor: usize,
+    context: &CommandContext,
+) -> &'static [CommandArgumentChoice] {
+    let cursor_byte = input
+        .char_indices()
+        .nth(cursor)
+        .map(|(index, _)| index)
+        .unwrap_or(input.len());
+    let (before_cursor, after_cursor) = input.split_at(cursor_byte);
+    if !after_cursor.is_empty() {
+        return &[];
+    }
+    let Some((command, args)) = before_cursor.split_once(char::is_whitespace) else {
+        return &[];
+    };
+    let command = command.strip_prefix('/').unwrap_or(command);
+    let Some(spec) = COMMANDS
+        .iter()
+        .find(|spec| spec.name.eq_ignore_ascii_case(command))
+    else {
+        return &[];
+    };
+    if args.trim().is_empty() && context.is_discoverable(spec.id) {
+        spec.argument_choices
+    } else {
+        &[]
+    }
+}
+
+pub fn command_prefix(input: &str) -> Option<&str> {
+    let token_end = input
+        .char_indices()
+        .find_map(|(index, ch)| ch.is_whitespace().then_some(index))
+        .unwrap_or(input.len());
+    let prefix = input[..token_end].strip_prefix('/')?;
+    if prefix.starts_with('/') {
+        None
+    } else {
+        Some(prefix)
+    }
+}
+
+pub fn matching_commands(prefix: &str) -> Vec<&'static CommandSpec> {
+    let prefix = prefix
+        .strip_prefix('/')
+        .unwrap_or(prefix)
+        .to_ascii_lowercase();
+    // COMMANDS is kept alphabetical by name; filtering preserves that order.
+    COMMANDS
+        .iter()
+        .filter(|command| command.name.starts_with(&prefix))
+        .collect()
+}
+
+pub fn parse_command(input: &str) -> Result<Option<CommandInvocation>, CommandParseError> {
+    // Trailing newlines are paste-burst Enter artifacts, not a multiline
+    // prompt. Strip them before the newline check so `/exit\n` still quits.
+    let input = input.trim_end();
+    if input.contains(['\n', '\r']) {
+        return Ok(None);
+    }
+    let Some(rest) = input.strip_prefix('/') else {
+        return Ok(None);
+    };
+    if rest.starts_with('/') {
+        return Ok(None);
+    }
+
+    let name_end = rest
+        .char_indices()
+        .find_map(|(index, ch)| ch.is_whitespace().then_some(index))
+        .unwrap_or(rest.len());
+    let name = &rest[..name_end];
+    let raw_args = rest[name_end..].to_string();
+    let args = raw_args.trim().to_string();
+
+    let spec = COMMANDS
+        .iter()
+        .find(|command| command.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| CommandParseError::Unknown(name.to_string()))?;
+
+    Ok(Some(canonicalize_invocation(CommandInvocation {
+        id: spec.id,
+        name: spec.name.to_string(),
+        raw_args,
+        args,
+    })))
+}
+
+fn canonicalize_invocation(mut invocation: CommandInvocation) -> CommandInvocation {
+    if invocation.id == CommandId::Agents {
+        if let Some(request) = agents_create_request(&invocation.args) {
+            invocation.id = CommandId::CreateAgent;
+            invocation.args = request.to_string();
+        }
+    }
+    invocation
+}
+
+pub fn complete_command(input: &str, cursor: usize, spec: &CommandSpec) -> (String, usize) {
+    let token_end = first_token_end_byte(input);
+    let token_len = input[..token_end].chars().count();
+    let args = input[token_end..].trim_start();
+    let completed_prefix = format!("/{} ", spec.name);
+    let completed_prefix_len = completed_prefix.chars().count();
+    let completed = if args.is_empty() {
+        completed_prefix
+    } else {
+        format!("{completed_prefix}{args}")
+    };
+
+    let new_cursor = if cursor <= token_len {
+        completed_prefix_len
+    } else {
+        completed
+            .chars()
+            .count()
+            .min(completed_prefix_len.saturating_add(cursor.saturating_sub(token_len)))
+    };
+
+    (completed, new_cursor)
+}
+
+pub(crate) fn complete_argument_choice(choice: &CommandArgumentChoice) -> (String, usize) {
+    let input = choice.completion.to_string();
+    let cursor = input.chars().count();
+    (input, cursor)
+}
+
+fn first_token_end_byte(input: &str) -> usize {
+    input
+        .char_indices()
+        .find_map(|(index, ch)| ch.is_whitespace().then_some(index))
+        .unwrap_or(input.len())
+}

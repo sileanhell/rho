@@ -1,0 +1,244 @@
+//! Selection identity and action policy for an open picker.
+//!
+//! Feature modules construct a picker through [`super::UiPicker`] named
+//! constructors. Matching on [`PickerAction`] stays in `crate::tui::picker_actions`.
+
+/// What confirming the highlighted row should do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::tui) enum PickerAction {
+    SelectModel,
+    SelectInternalAgentModel,
+    /// Advisor reasoning level, offered after `/advisor model` picks a model.
+    SelectAdvisorReasoning,
+    LoginGroup,
+    LoginProvider,
+    LoginFlow(Box<crate::tui::login_flow::LoginFlowTarget>),
+    LogoutProvider,
+    SwitchAuthMode,
+    RefreshModelList,
+    InsertSkillCommand,
+    /// Prompt history search; confirming recalls the prompt into the composer.
+    RecallPrompt,
+    ViewAgent,
+    /// Read-only MCP server inventory. Distinct from `Dismiss` so background
+    /// refreshes can tell this picker apart without reading its title.
+    ViewMcpServers,
+    ResumeSession,
+    ManageSessions,
+    SelectTreeNode,
+    CopyOutput,
+    SelectRewindCheckpoint,
+    ConfirmRewindCheckpoint,
+    Config,
+    SelectTheme,
+    EditAgent,
+    Workflow,
+    AttachSubagent,
+    /// Read-only `/diff` viewer. Distinct from `Dismiss` so selection changes
+    /// can load the highlighted file's patch.
+    ViewDiff,
+    Dismiss,
+}
+
+/// How typed filter text selects and orders picker rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::tui) enum PickerFilterMode {
+    /// Case-insensitive regex over every visible row field; keeps row order.
+    Regex,
+    /// Subsequence match ranked by score.
+    Fuzzy,
+    /// Case-insensitive substring of the label or value; keeps row order.
+    Literal,
+}
+
+/// Whether a picker commit runs idle or during a model turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::tui) enum PickerTurn {
+    Idle,
+    DuringTurn,
+}
+
+/// Config row to re-select after a child picker closes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::tui) enum ConfigParentRow {
+    ConversationModel,
+    Theme,
+    LogoutProvider,
+    SwitchAuthMode,
+    RefreshModelList,
+}
+
+/// What confirming a row does while a model turn is running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::tui) enum DuringTurnSelect {
+    Apply,
+    CloseOnly,
+    Unavailable(&'static str),
+}
+
+impl PickerAction {
+    pub(in crate::tui) fn space_confirms_selection(&self) -> bool {
+        matches!(self, PickerAction::Config)
+    }
+
+    /// How typed filter text matches rows unless the picker overrides it.
+    pub(in crate::tui) fn filter_mode(&self) -> PickerFilterMode {
+        match self {
+            PickerAction::SelectModel
+            | PickerAction::SelectInternalAgentModel
+            | PickerAction::SelectTheme => PickerFilterMode::Fuzzy,
+            // Prompts are prose and code: `vec.push(` must search, not fail
+            // as a regex, and recency order must survive filtering.
+            PickerAction::RecallPrompt => PickerFilterMode::Literal,
+            PickerAction::SelectAdvisorReasoning
+            | PickerAction::LoginGroup
+            | PickerAction::LoginProvider
+            | PickerAction::LoginFlow(_)
+            | PickerAction::LogoutProvider
+            | PickerAction::SwitchAuthMode
+            | PickerAction::RefreshModelList
+            | PickerAction::InsertSkillCommand
+            | PickerAction::ViewAgent
+            | PickerAction::ViewMcpServers
+            | PickerAction::ResumeSession
+            | PickerAction::ManageSessions
+            | PickerAction::SelectTreeNode
+            | PickerAction::CopyOutput
+            | PickerAction::SelectRewindCheckpoint
+            | PickerAction::ConfirmRewindCheckpoint
+            | PickerAction::Config
+            | PickerAction::EditAgent
+            | PickerAction::Workflow
+            | PickerAction::AttachSubagent
+            | PickerAction::ViewDiff
+            | PickerAction::Dismiss => PickerFilterMode::Regex,
+        }
+    }
+
+    pub(in crate::tui) fn default_confirm_verb(&self) -> &'static str {
+        match self {
+            PickerAction::Config => "change",
+            PickerAction::Dismiss
+            | PickerAction::ViewMcpServers
+            | PickerAction::ViewAgent
+            | PickerAction::ViewDiff => "close",
+            PickerAction::RefreshModelList => "refresh",
+            PickerAction::CopyOutput => "copy",
+            PickerAction::SelectModel
+            | PickerAction::SelectInternalAgentModel
+            | PickerAction::SelectAdvisorReasoning
+            | PickerAction::SelectTheme
+            | PickerAction::LoginGroup
+            | PickerAction::LoginProvider
+            | PickerAction::LoginFlow(_)
+            | PickerAction::LogoutProvider
+            | PickerAction::SwitchAuthMode
+            | PickerAction::InsertSkillCommand
+            | PickerAction::RecallPrompt
+            | PickerAction::ResumeSession
+            | PickerAction::ManageSessions
+            | PickerAction::SelectTreeNode
+            | PickerAction::SelectRewindCheckpoint
+            | PickerAction::ConfirmRewindCheckpoint
+            | PickerAction::EditAgent
+            | PickerAction::Workflow
+            | PickerAction::AttachSubagent => "select",
+        }
+    }
+
+    pub(in crate::tui) fn is_model_list(&self) -> bool {
+        matches!(
+            self,
+            PickerAction::SelectModel | PickerAction::SelectInternalAgentModel
+        )
+    }
+
+    pub(in crate::tui) fn keeps_composer_open(&self, turn: PickerTurn) -> bool {
+        match turn {
+            PickerTurn::Idle => matches!(
+                self,
+                PickerAction::Config
+                    | PickerAction::LoginGroup
+                    | PickerAction::LoginProvider
+                    | PickerAction::ViewAgent
+                    | PickerAction::EditAgent
+                    | PickerAction::SelectRewindCheckpoint
+                    | PickerAction::ConfirmRewindCheckpoint
+                    | PickerAction::Workflow
+                    | PickerAction::ManageSessions
+            ),
+            PickerTurn::DuringTurn => matches!(self, PickerAction::Config),
+        }
+    }
+
+    pub(in crate::tui) fn during_turn_select(&self) -> DuringTurnSelect {
+        match self {
+            PickerAction::InsertSkillCommand
+            | PickerAction::RecallPrompt
+            | PickerAction::CopyOutput
+            | PickerAction::AttachSubagent
+            | PickerAction::Config
+            | PickerAction::SelectModel
+            | PickerAction::SelectTheme => DuringTurnSelect::Apply,
+            PickerAction::Dismiss
+            | PickerAction::ViewMcpServers
+            | PickerAction::ViewAgent
+            | PickerAction::ViewDiff => DuringTurnSelect::CloseOnly,
+            PickerAction::SelectInternalAgentModel | PickerAction::EditAgent => {
+                DuringTurnSelect::Unavailable(
+                    "agent editing is unavailable while a model turn is running",
+                )
+            }
+            PickerAction::SelectAdvisorReasoning => DuringTurnSelect::Unavailable(
+                "advisor reasoning cannot change while a model turn is running",
+            ),
+            PickerAction::ResumeSession
+            | PickerAction::ManageSessions
+            | PickerAction::SelectTreeNode
+            | PickerAction::SelectRewindCheckpoint
+            | PickerAction::ConfirmRewindCheckpoint
+            | PickerAction::Workflow => DuringTurnSelect::Unavailable(
+                "workflow and session navigation are unavailable while a model turn is running",
+            ),
+            PickerAction::LoginGroup
+            | PickerAction::LoginProvider
+            | PickerAction::LoginFlow(_)
+            | PickerAction::LogoutProvider
+            | PickerAction::SwitchAuthMode
+            | PickerAction::RefreshModelList => DuringTurnSelect::Unavailable(
+                "that picker action is unavailable while a model turn is running",
+            ),
+        }
+    }
+
+    pub(in crate::tui) fn config_parent_row(&self) -> Option<ConfigParentRow> {
+        match self {
+            PickerAction::SelectModel => Some(ConfigParentRow::ConversationModel),
+            PickerAction::SelectTheme => Some(ConfigParentRow::Theme),
+            PickerAction::LogoutProvider => Some(ConfigParentRow::LogoutProvider),
+            PickerAction::SwitchAuthMode => Some(ConfigParentRow::SwitchAuthMode),
+            PickerAction::RefreshModelList => Some(ConfigParentRow::RefreshModelList),
+            PickerAction::SelectInternalAgentModel
+            | PickerAction::SelectAdvisorReasoning
+            | PickerAction::LoginGroup
+            | PickerAction::LoginProvider
+            | PickerAction::LoginFlow(_)
+            | PickerAction::InsertSkillCommand
+            | PickerAction::RecallPrompt
+            | PickerAction::ViewAgent
+            | PickerAction::ViewMcpServers
+            | PickerAction::ResumeSession
+            | PickerAction::ManageSessions
+            | PickerAction::SelectTreeNode
+            | PickerAction::CopyOutput
+            | PickerAction::SelectRewindCheckpoint
+            | PickerAction::ConfirmRewindCheckpoint
+            | PickerAction::Config
+            | PickerAction::EditAgent
+            | PickerAction::Workflow
+            | PickerAction::AttachSubagent
+            | PickerAction::ViewDiff
+            | PickerAction::Dismiss => None,
+        }
+    }
+}

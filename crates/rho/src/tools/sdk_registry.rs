@@ -1,0 +1,781 @@
+//! Composes selected SDK tool bundles and shuts them down through one contract.
+
+use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
+
+#[path = "sdk_registry_inventory.rs"]
+mod inventory;
+use inventory::ToolInventory;
+
+use rho_sdk::tool::Tool;
+
+use crate::{
+    agent::{AgentCapabilities, ToolCapability},
+    config::Config,
+    diagnostics::RuntimeDiagnostics,
+};
+
+use super::{
+    advisor::AdvisorSessionStore,
+    agent::{DelegationBundleOptions, DelegationToolSelection, SubagentManager},
+    code_mode::ContextExposure,
+};
+
+/// A feature-owned group of tools and any resources they need.
+///
+/// Bundles keep lifecycle ownership in the feature that creates each tool. The
+/// boxed future is `Send` so callers can shut bundles down from async runtimes.
+pub(crate) trait ToolBundle: Send + Sync {
+    fn tools(&self) -> &[Arc<dyn Tool>];
+
+    /// How every tool in this bundle reaches model context. Owners of large
+    /// generated catalogs return [`ContextExposure::Hidden`].
+    fn context_exposure(&self) -> ContextExposure {
+        ContextExposure::Direct
+    }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+}
+
+/// A bundle for features which need no shutdown work.
+pub(crate) struct StaticToolBundle {
+    tools: Vec<Arc<dyn Tool>>,
+}
+
+impl StaticToolBundle {
+    pub(crate) fn new(tools: Vec<Arc<dyn Tool>>) -> Self {
+        Self { tools }
+    }
+}
+
+impl ToolBundle for StaticToolBundle {
+    fn tools(&self) -> &[Arc<dyn Tool>] {
+        &self.tools
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DelegationConfig {
+    cwd: PathBuf,
+    config_path: PathBuf,
+    /// Catalog already discovered for `cwd`; the agent tool rediscovers when
+    /// absent.
+    catalog: Option<Arc<crate::agent::AgentCatalog>>,
+}
+
+impl DelegationConfig {
+    pub fn new(
+        cwd: PathBuf,
+        config_path: PathBuf,
+        catalog: Option<Arc<crate::agent::AgentCatalog>>,
+    ) -> Self {
+        Self {
+            cwd,
+            config_path,
+            catalog,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ToolSetOptions {
+    capabilities: AgentCapabilities,
+    advisor: Option<AdvisorSessionStore>,
+    delegation: Option<DelegationConfig>,
+    workflow: Option<Arc<dyn super::workflow::WorkflowToolService>>,
+    workflow_tracker: super::workflow_tracker::WorkflowRunTracker,
+    process_keep_warm: super::process::KeepWarmOffer,
+    host_io: crate::tools::host_io::HostIo,
+}
+
+impl Default for ToolSetOptions {
+    fn default() -> Self {
+        Self::new(AgentCapabilities::all_host_tools())
+    }
+}
+
+impl ToolSetOptions {
+    pub fn new(capabilities: AgentCapabilities) -> Self {
+        Self {
+            capabilities,
+            advisor: None,
+            delegation: None,
+            workflow: None,
+            workflow_tracker: super::workflow_tracker::WorkflowRunTracker::new(),
+            process_keep_warm: super::process::KeepWarmOffer::Hidden,
+            host_io: Default::default(),
+        }
+    }
+
+    /// What the host does in place of local disk and processes: file tools
+    /// use its files, the shell tool its terminals, and delegated Rho agents
+    /// both.
+    pub(crate) fn host_io(mut self, host_io: crate::tools::host_io::HostIo) -> Self {
+        self.host_io = host_io;
+        self
+    }
+
+    /// Advertises `keep_warm` on `process start`. Only a host that runs a
+    /// cache warmer (the interactive TUI) may offer it.
+    pub(crate) fn process_keep_warm(mut self, offer: super::process::KeepWarmOffer) -> Self {
+        self.process_keep_warm = offer;
+        self
+    }
+
+    /// Supplies the session store the `advisor` tool reads. Without it the
+    /// capability alone registers no tool, so runs with no live session to
+    /// review cannot offer the advisor.
+    ///
+    /// The store is kept whether or not advisor mode is on, so a later
+    /// `/advisor on` registers the tool without rebuilding the tool set.
+    pub fn advisor(mut self, store: AdvisorSessionStore) -> Self {
+        self.advisor = Some(store);
+        self
+    }
+
+    pub fn delegation(mut self, config: DelegationConfig) -> Self {
+        self.delegation = Some(config);
+        self
+    }
+
+    pub(crate) fn workflow(
+        mut self,
+        service: Arc<dyn super::workflow::WorkflowToolService>,
+    ) -> Self {
+        self.workflow = Some(service);
+        self
+    }
+
+    pub(crate) fn workflow_tracker(
+        mut self,
+        tracker: super::workflow_tracker::WorkflowRunTracker,
+    ) -> Self {
+        self.workflow_tracker = tracker;
+        self
+    }
+}
+
+/// The `advisor` tool and the store it reads, held whether or not the tool is
+/// currently advertised.
+///
+/// Advisor mode toggles mid-session, and the executor must never see a tool the
+/// run does not have, so registration is a state transition on the built tool
+/// set rather than a reason to rebuild it.
+struct AdvisorTools {
+    store: AdvisorSessionStore,
+    registration: HostToolRegistration,
+}
+
+struct PlanExitTools {
+    slot: super::plan_exit::PlanExitSlot,
+    classifier_configured: Arc<std::sync::atomic::AtomicBool>,
+    registration: HostToolRegistration,
+    /// Approvals the tool asks a permission-prompt host, between the host's
+    /// prompts. A running prompt takes it to answer them.
+    permission_requests: Option<super::plan_exit::PlanPermissionReceiver>,
+}
+
+struct ComputerTools {
+    session: super::computer_use::ComputerUseSession,
+    registration: HostToolRegistration,
+}
+
+/// Retains ownership independently of whether a host-controlled tool is advertised.
+struct HostToolRegistration {
+    tool: Arc<dyn Tool>,
+    registered: bool,
+}
+
+impl HostToolRegistration {
+    fn new(tool: Arc<dyn Tool>) -> Self {
+        Self {
+            tool,
+            registered: false,
+        }
+    }
+
+    fn set_registered(&mut self, tools: &mut Vec<Arc<dyn Tool>>, registered: bool) -> bool {
+        if self.registered == registered {
+            return false;
+        }
+        self.registered = registered;
+        if registered {
+            tools.push(self.tool.clone());
+        } else {
+            tools.retain(|tool| !Arc::ptr_eq(tool, &self.tool));
+        }
+        true
+    }
+}
+
+pub struct AppToolSet {
+    inventory: ToolInventory,
+    bundles: Vec<Box<dyn ToolBundle>>,
+    advisor: Option<AdvisorTools>,
+    computer_use: Option<ComputerTools>,
+    plan_exit: Option<PlanExitTools>,
+    subagents: Option<SubagentManager>,
+    /// The agent catalog the `agent` tool spec advertises, when registered.
+    advertised_agents: Option<crate::agent::AdvertisedAgents>,
+    processes: Option<super::process::ProcessManager>,
+    workflow_tracker: super::workflow_tracker::WorkflowRunTracker,
+    checkpoint_tracker: Arc<crate::session::workspace_checkpoint::WorkspaceCheckpointTracker>,
+    web_access: super::web::WebAccessStore,
+    web_search_capable: bool,
+    mcp_report: super::mcp::McpSessionReport,
+    mcp_catalog: super::mcp::McpCatalog,
+    openapi_report: super::openapi::report::OpenApiReport,
+    file_view: rho_tools::FileViewPolicy,
+    /// Kept so a mid-session edit-tool switch uses the same host I/O.
+    host_io: crate::tools::host_io::HostIo,
+    session_search: super::sessions::SessionBinding,
+    /// Present only when the `sessions` tool is installed, since recall is
+    /// the only way to read an elided result back.
+    recall: Option<crate::session::recall::RecallStore>,
+    todo: super::todo::TodoState,
+}
+
+impl AppToolSet {
+    pub fn disabled() -> Self {
+        Self {
+            inventory: ToolInventory::default(),
+            bundles: Vec::new(),
+            advisor: None,
+            subagents: None,
+            advertised_agents: None,
+            computer_use: None,
+            plan_exit: None,
+            processes: None,
+            workflow_tracker: super::workflow_tracker::WorkflowRunTracker::new(),
+            checkpoint_tracker: Arc::new(
+                crate::session::workspace_checkpoint::WorkspaceCheckpointTracker::new(false),
+            ),
+            web_access: super::web::WebAccessStore::new(),
+            web_search_capable: false,
+            mcp_report: super::mcp::McpSessionReport::default(),
+            mcp_catalog: super::mcp::McpCatalog::default(),
+            openapi_report: super::openapi::report::OpenApiReport::default(),
+            file_view: rho_tools::FileViewPolicy::default(),
+            host_io: Default::default(),
+            session_search: super::sessions::SessionBinding::default(),
+            recall: None,
+            todo: super::todo::TodoState::default(),
+        }
+    }
+
+    pub fn new(config: &Config, diagnostics: RuntimeDiagnostics, options: ToolSetOptions) -> Self {
+        let ToolSetOptions {
+            capabilities,
+            advisor,
+            delegation,
+            workflow,
+            workflow_tracker,
+            process_keep_warm,
+            host_io,
+        } = options;
+        let mut tool_set = Self::disabled();
+        tool_set.workflow_tracker = workflow_tracker;
+        tool_set.host_io = host_io;
+        tool_set.checkpoint_tracker = Arc::new(
+            crate::session::workspace_checkpoint::WorkspaceCheckpointTracker::new(
+                config.workspace_rewind,
+            ),
+        );
+        // Compose one child-process environment policy for every process tool.
+        // Provider credential env vars are excluded so agent commands cannot
+        // read host API keys from the ambient environment.
+        let process_environment =
+            rho_sdk::ProcessEnvironment::inherit_except(rho_providers::credential_env_vars());
+
+        let edit_format = config.resolved_edit_tool();
+        tool_set.file_view.set(edit_format);
+        // The shell a freshly bound session advertises: the configured one
+        // when its capability survived bind, the other only if an explicit
+        // allowlist named it.
+        let shell = config.resolved_shell_tool();
+        tool_set.add_bundle(super::coding::sdk_bundle(
+            &capabilities,
+            shell,
+            config.max_output_bytes,
+            process_environment.clone(),
+            tool_set.checkpoint_tracker.clone(),
+            tool_set.file_view.clone(),
+            &tool_set.host_io,
+        ));
+        if capabilities.contains(&ToolCapability::Process) {
+            let bundle = super::process::sdk_bundle(
+                config.max_output_bytes,
+                process_environment.clone(),
+                tool_set.checkpoint_tracker.clone(),
+                process_keep_warm,
+                shell,
+            );
+            tool_set.processes = Some(bundle.manager_handle());
+            tool_set.add_bundle(bundle);
+        }
+        if capabilities.contains(&ToolCapability::Skill) {
+            tool_set.add_bundle(super::sdk_features::skill_bundle(config.max_output_bytes));
+        }
+        if capabilities.contains(&ToolCapability::Sessions) {
+            let recall = crate::session::recall::RecallStore::default();
+            tool_set.recall = Some(recall.clone());
+            tool_set.add_bundle(super::sessions::sdk_bundle(
+                tool_set.session_search.clone(),
+                recall,
+                config.max_output_bytes,
+            ));
+        }
+        if capabilities.contains(&ToolCapability::Rho) {
+            tool_set.add_bundle(super::rho::sdk_bundle(diagnostics, config.max_output_bytes));
+        }
+        if capabilities.contains(&ToolCapability::Todo) {
+            tool_set.add_bundle(super::todo::sdk_bundle(tool_set.todo.clone()));
+        }
+        if capabilities.contains(&ToolCapability::Questionnaire) {
+            tool_set.add_bundle(super::sdk_features::questionnaire_bundle());
+        }
+        if let (true, Some(store)) = (capabilities.contains(&ToolCapability::Advisor), advisor) {
+            // The tool set owns advisor initialization: the model and the
+            // registration state both come from the same config read.
+            store.set_model(super::advisor::advisor_model(config).cloned());
+            tool_set.advisor = Some(AdvisorTools {
+                registration: HostToolRegistration::new(super::advisor::advisor_tool(
+                    store.clone(),
+                )),
+                store,
+            });
+            tool_set.set_advisor_registered(super::advisor::advisor_available(config));
+        }
+        if let (true, Some(service)) = (capabilities.contains(&ToolCapability::Workflow), workflow)
+        {
+            tool_set.add_bundle(super::workflow::sdk_bundle(
+                service,
+                config.max_output_bytes,
+            ));
+        }
+        #[cfg(debug_assertions)]
+        if capabilities.contains(&ToolCapability::Extension(super::tui_fixture::NAME.into())) {
+            if let Some(bundle) = super::tui_fixture::sdk_bundle(tool_set.processes.clone()) {
+                tool_set.add_bundle(bundle);
+            }
+        }
+        tool_set.web_search_capable = capabilities.contains(&ToolCapability::WebSearch);
+        let web_access = tool_set.web_access.clone();
+        tool_set.add_bundle(super::web::sdk_bundle(
+            config,
+            &capabilities,
+            process_environment,
+            web_access,
+        ));
+
+        let delegation_tools = DelegationToolSelection::from_capabilities(&capabilities);
+        if let (Some(selection), Some(delegation)) = (delegation_tools, delegation) {
+            let mut bundle = super::agent::sdk_bundle(
+                config,
+                DelegationBundleOptions {
+                    cwd: delegation.cwd,
+                    tools: selection,
+                    config_path: delegation.config_path,
+                    catalog: delegation.catalog,
+                    host_io: tool_set.host_io.clone(),
+                },
+                tool_set.checkpoint_tracker.clone(),
+            );
+            tool_set.subagents = Some(bundle.manager_handle());
+            tool_set.advertised_agents = bundle.take_advertised_agents();
+            tool_set.add_bundle(bundle);
+        }
+
+        tool_set.code_mode().set_mode(config.codemode.mode);
+        let orchestration = tool_set.code_mode().orchestration_tools();
+        tool_set
+            .inventory
+            .extend(&orchestration, ContextExposure::Direct);
+
+        tool_set
+    }
+
+    /// Attach MCP inventory and any live tool bundle from session assembly.
+    pub(crate) fn with_mcp(mut self, outcome: super::mcp::McpConnectOutcome) -> Self {
+        self.attach_mcp(outcome);
+        self
+    }
+
+    /// Attach a finished MCP connect onto an already-built tool set.
+    pub(crate) fn attach_mcp(&mut self, outcome: super::mcp::McpConnectOutcome) {
+        self.mcp_report = outcome.report;
+        self.mcp_catalog = outcome.catalog;
+        if let Some(bundle) = outcome.bundle {
+            self.add_bundle(bundle);
+        }
+    }
+
+    /// Attach loaded OpenAPI sources onto an already-built tool set.
+    pub(crate) fn attach_openapi(&mut self, outcome: super::openapi::bundle::OpenApiLoadOutcome) {
+        self.openapi_report = outcome.report;
+        if let Some(bundle) = outcome.bundle {
+            self.add_bundle(bundle);
+        }
+    }
+
+    /// Registers a bundle so nested calls and discovery see its tools immediately.
+    pub(crate) fn add_bundle(&mut self, bundle: impl ToolBundle + 'static) {
+        self.inventory
+            .extend(bundle.tools(), bundle.context_exposure());
+        self.bundles.push(Box::new(bundle));
+    }
+
+    pub(crate) fn bind_session_search(&self, id: &str) {
+        self.session_search.bind(id);
+    }
+
+    /// Binds where elided tool results are saved, for hosts without an
+    /// interactive session controller. No-op when recall is unavailable.
+    pub(crate) fn bind_recall(&self, storage: Option<&crate::session::Session>) {
+        if let Some(recall) = &self.recall {
+            recall.bind(storage.and_then(crate::session::Session::recall_dir));
+        }
+    }
+
+    /// Recall store for the compactor and session sidecars, or `None` when
+    /// this agent cannot call `sessions` and so could never recall.
+    pub(crate) fn recall_store(&self) -> Option<crate::session::recall::RecallStore> {
+        self.recall.clone()
+    }
+
+    pub(crate) fn todo_state(&self) -> super::todo::TodoState {
+        self.todo.clone()
+    }
+
+    /// Attach the root interactive session's host-controlled desktop grant.
+    pub(crate) fn with_computer_use(
+        mut self,
+        session: super::computer_use::ComputerUseSession,
+    ) -> Self {
+        let connected = session.status() == super::computer_use::ComputerUseStatus::Connected;
+        self.set_computer_use_registered(false);
+        self.computer_use = Some(ComputerTools {
+            registration: HostToolRegistration::new(session.tool()),
+            session,
+        });
+        self.set_computer_use_registered(connected);
+        self
+    }
+
+    pub(crate) fn computer_use(&self) -> Option<&super::computer_use::ComputerUseSession> {
+        self.computer_use.as_ref().map(|computer| &computer.session)
+    }
+
+    /// Advertising is separate from authorization. The runtime reconciles this
+    /// at idle boundaries; retained tool handles enforce the grant themselves.
+    pub(crate) fn set_computer_use_registered(&mut self, registered: bool) -> bool {
+        let Some(computer) = self.computer_use.as_mut() else {
+            return false;
+        };
+        self.inventory
+            .mutate(|tools| computer.registration.set_registered(tools, registered))
+    }
+
+    /// Prompts and resources connected servers offer the user.
+    pub(crate) fn mcp_catalog(&self) -> &super::mcp::McpCatalog {
+        &self.mcp_catalog
+    }
+
+    pub(crate) fn mcp_report(&self) -> &super::mcp::McpSessionReport {
+        &self.mcp_report
+    }
+
+    pub(crate) fn openapi_report(&self) -> &super::openapi::report::OpenApiReport {
+        &self.openapi_report
+    }
+
+    /// Full executable tool list for a runtime build.
+    pub fn tools(&self) -> &[Arc<dyn Tool>] {
+        self.inventory.tools()
+    }
+
+    pub(crate) fn code_mode(&self) -> &Arc<super::code_mode::CodeModeSurface> {
+        self.inventory.surface()
+    }
+
+    /// Live per-request model advertisement, installed by the runtime builder.
+    pub fn tool_visibility(&self) -> Arc<dyn rho_sdk::tool::ToolVisibility> {
+        self.code_mode().clone()
+    }
+
+    pub fn specs(&self) -> Vec<rho_sdk::model::ToolSpec> {
+        let specs = self
+            .tools()
+            .iter()
+            .map(|tool| tool.spec())
+            .collect::<Vec<_>>();
+        rho_sdk::tool::advertised_specs(&specs, self.tool_visibility().as_ref())
+    }
+
+    /// Returns registry names without applying any additional capability filter.
+    pub fn unfiltered_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.inventory
+            .named_tools()
+            .map(|(name, _)| name.to_owned())
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.inventory
+            .named_tools()
+            .any(|(registered, _)| registered == name)
+    }
+
+    /// Gets an executable handle without applying model advertisement filters.
+    pub(crate) fn tool_named(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.inventory
+            .named_tools()
+            .find(|(registered, _)| *registered == name)
+            .map(|(_, tool)| tool.clone())
+    }
+
+    /// Replaces delegation only when launch was enabled for this session.
+    /// The native bundle stays alive (with an idle manager) for lifecycle and
+    /// permission updates; replacement tools own their own execution state.
+    pub(crate) fn replace_delegation_tools(&mut self, replacements: [Arc<dyn Tool>; 2]) -> bool {
+        if !self.contains("agent") {
+            return false;
+        }
+        self.inventory.mutate(|tools| {
+            tools.retain(|tool| !matches!(tool.spec().name.as_str(), "agent" | "agents"));
+            tools.extend(replacements);
+        });
+        true
+    }
+
+    /// The advisor's session store, present whenever the run may offer the
+    /// advisor, even while advisor mode is off.
+    pub fn advisor(&self) -> Option<&AdvisorSessionStore> {
+        self.advisor.as_ref().map(|advisor| &advisor.store)
+    }
+
+    /// Whether the `advisor` tool is currently advertised to the model.
+    pub fn advisor_registered(&self) -> bool {
+        self.advisor
+            .as_ref()
+            .is_some_and(|advisor| advisor.registration.registered)
+    }
+
+    /// Adds or removes the `advisor` tool, so `/advisor` reaches the next
+    /// runtime build without disturbing tools that hold live state.
+    ///
+    /// Returns whether the advertised tool list changed; callers rebuild the
+    /// runtime only then.
+    pub fn set_advisor_registered(&mut self, registered: bool) -> bool {
+        let Some(advisor) = self.advisor.as_mut() else {
+            return false;
+        };
+        self.inventory
+            .mutate(|tools| advisor.registration.set_registered(tools, registered))
+    }
+
+    /// Installs plan handoff for an interactive host that can ask the user.
+    /// A questionnaire host needs the questionnaire tool, which exists only
+    /// when the host can draw questionnaires.
+    pub(crate) fn with_plan_exit_host(
+        mut self,
+        config: &Config,
+        host: super::plan_exit::PlanExitHost,
+    ) -> Self {
+        use super::plan_exit::{PlanExitHost, PlanExitPrompt};
+
+        let (prompt, permission_requests) = match host {
+            PlanExitHost::Questionnaire if self.contains("questionnaire") => {
+                (PlanExitPrompt::Questionnaire, None)
+            }
+            PlanExitHost::Questionnaire => return self,
+            PlanExitHost::Permission => {
+                let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                (PlanExitPrompt::Permission(sender), Some(receiver))
+            }
+        };
+        let slot = super::plan_exit::PlanExitSlot::default();
+        let classifier_configured = Arc::new(std::sync::atomic::AtomicBool::new(
+            config
+                .internal_agents
+                .contains_key(crate::agent::PERMISSION_CLASSIFIER_AGENT_ID),
+        ));
+        self.plan_exit = Some(PlanExitTools {
+            registration: HostToolRegistration::new(Arc::new(super::plan_exit::PlanExitTool {
+                slot: Some(slot.clone()),
+                prompt,
+                classifier_configured: classifier_configured.clone(),
+            })),
+            slot,
+            classifier_configured,
+            permission_requests,
+        });
+        self.set_plan_exit_registered(config.permission_mode);
+        self
+    }
+
+    /// Takes the plan approvals a permission-prompt host answers, for one
+    /// prompt; [`Self::restore_plan_permission_requests`] hands them back.
+    pub(crate) fn take_plan_permission_requests(
+        &mut self,
+    ) -> Option<super::plan_exit::PlanPermissionReceiver> {
+        self.plan_exit.as_mut()?.permission_requests.take()
+    }
+
+    pub(crate) fn restore_plan_permission_requests(
+        &mut self,
+        requests: Option<super::plan_exit::PlanPermissionReceiver>,
+    ) {
+        if let (Some(plan_exit), Some(requests)) = (self.plan_exit.as_mut(), requests) {
+            plan_exit.permission_requests = Some(requests);
+        }
+    }
+
+    pub(crate) fn set_plan_exit_registered(
+        &mut self,
+        mode: crate::permission::PermissionMode,
+    ) -> bool {
+        let Some(plan_exit) = self.plan_exit.as_mut() else {
+            return false;
+        };
+        self.inventory.mutate(|tools| {
+            plan_exit
+                .registration
+                .set_registered(tools, mode == crate::permission::PermissionMode::Plan)
+        })
+    }
+
+    pub(crate) fn update_plan_exit_classifier(&self, config: &Config) {
+        if let Some(plan_exit) = &self.plan_exit {
+            plan_exit.classifier_configured.store(
+                config
+                    .internal_agents
+                    .contains_key(crate::agent::PERMISSION_CLASSIFIER_AGENT_ID),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    pub(crate) fn take_plan_exit_decision(&self) -> Option<super::plan_exit::PlanExitDecision> {
+        self.plan_exit.as_ref()?.slot.take()
+    }
+
+    /// Replaces the advertised built-in file edit tool.
+    ///
+    /// Returns the previous format when the advertised tool list changed so
+    /// callers can rebuild the runtime and tell the model. No-ops when this
+    /// run has no edit tool or the selection is already active.
+    ///
+    /// Matches built-in edit tool names (`edit`, `apply_patch`, `str_replace`).
+    pub fn set_edit_tool(
+        &mut self,
+        edit_tool: rho_tools::EditFormat,
+        max_output_bytes: usize,
+    ) -> Option<rho_tools::EditFormat> {
+        let previous = self.edit_tool()?;
+        if previous == edit_tool {
+            return None;
+        }
+        let position = self
+            .tools()
+            .iter()
+            .position(|tool| rho_tools::EditFormat::is_edit_tool_name(tool.spec().name.as_str()))?;
+        let mutation_observer: Arc<dyn rho_tools::WorkspaceMutationObserver> =
+            self.checkpoint_tracker.clone();
+        let replacement = super::coding::edit_tool(
+            edit_tool,
+            max_output_bytes,
+            mutation_observer,
+            &self.host_io,
+        );
+        self.inventory.mutate(|tools| tools[position] = replacement);
+        self.file_view.set(edit_tool);
+        Some(previous)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_view_style(&self) -> rho_tools::FileViewStyle {
+        self.file_view.style()
+    }
+
+    /// The currently advertised built-in edit format, when this run exposes one.
+    pub fn edit_tool(&self) -> Option<rho_tools::EditFormat> {
+        self.tools()
+            .iter()
+            .find_map(|tool| rho_tools::EditFormat::from_tool_name(tool.spec().name.as_str()))
+    }
+
+    pub fn subagents(&self) -> Option<&SubagentManager> {
+        self.subagents.as_ref()
+    }
+
+    pub(crate) fn advertised_agents(&self) -> Option<&crate::agent::AdvertisedAgents> {
+        self.advertised_agents.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_advertised_agents_for_tests(
+        &mut self,
+        advertised: crate::agent::AdvertisedAgents,
+    ) {
+        self.advertised_agents = Some(advertised);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_subagents_for_tests(&mut self, manager: SubagentManager) {
+        self.subagents = Some(manager);
+    }
+
+    pub fn processes(&self) -> Option<&super::process::ProcessManager> {
+        self.processes.as_ref()
+    }
+
+    pub fn workflow_tracker(&self) -> &super::workflow_tracker::WorkflowRunTracker {
+        &self.workflow_tracker
+    }
+
+    pub fn checkpoint_tracker(
+        &self,
+    ) -> &Arc<crate::session::workspace_checkpoint::WorkspaceCheckpointTracker> {
+        &self.checkpoint_tracker
+    }
+
+    /// Replace only search, retaining content storage and all other live tools.
+    pub(crate) fn replace_web_search(&mut self, config: &Config) -> Option<Arc<dyn Tool>> {
+        let replacement = if self.web_search_capable {
+            super::web::sdk_web_search(config, self.web_access.clone(), config.max_output_bytes)
+        } else {
+            None
+        };
+        self.inventory.mutate(|tools| {
+            let previous = tools
+                .iter()
+                .position(|tool| tool.spec().name == super::web::WEB_SEARCH_TOOL_NAME)
+                .map(|index| tools.remove(index));
+            if let Some(tool) = replacement {
+                tools.push(Arc::new(tool));
+            }
+            previous
+        })
+    }
+
+    pub(crate) fn restore_web_search(&mut self, previous: Option<Arc<dyn Tool>>) {
+        self.inventory.mutate(|tools| {
+            tools.retain(|tool| tool.spec().name != super::web::WEB_SEARCH_TOOL_NAME);
+            tools.extend(previous);
+        });
+    }
+
+    pub fn web_access(&self) -> &super::web::WebAccessStore {
+        &self.web_access
+    }
+
+    pub async fn shutdown(&self) {
+        if let Some(computer) = &self.computer_use {
+            computer.session.disconnect().await;
+        }
+        for bundle in &self.bundles {
+            bundle.shutdown().await;
+        }
+    }
+}

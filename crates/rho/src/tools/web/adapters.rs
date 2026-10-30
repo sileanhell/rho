@@ -1,0 +1,353 @@
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use {
+    crate::config::{Config, WebSearchMode},
+    rho_tools::tool::{
+        truncate, AppToolFuture, Tool, ToolContext, ToolError, ToolResult, ToolSpec,
+    },
+};
+
+use super::{
+    output::{format_stored_item, format_web_search},
+    search::{self, SearchBackendConfig},
+    storage::{self, StoredContent, StoredItem, WebAccessStore},
+};
+
+pub struct WebSearch {
+    config: SearchBackendConfig,
+    client: reqwest::Client,
+    store: WebAccessStore,
+}
+
+pub struct GetSearchContent {
+    store: WebAccessStore,
+}
+
+impl GetSearchContent {
+    pub(super) fn new(store: WebAccessStore) -> Self {
+        Self { store }
+    }
+}
+
+impl WebSearch {
+    pub(super) fn with_client(
+        config: &Config,
+        client: reqwest::Client,
+        store: WebAccessStore,
+    ) -> Self {
+        Self {
+            config: SearchBackendConfig::from_config(config),
+            client,
+            store,
+        }
+    }
+
+    /// Client-side backend when mode is not Off and the selected backend is ready.
+    pub fn client_available(&self) -> bool {
+        self.config.settings.mode != WebSearchMode::Off && self.config.is_ready()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSearchArgs {
+    query: Option<String>,
+    queries: Option<Vec<String>>,
+    num_results: Option<usize>,
+    recency_filter: Option<String>,
+    domain_filter: Option<Vec<String>>,
+    include_content: Option<bool>,
+    workflow: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct GetSearchContentArgs {
+    pub(super) response_id: String,
+    pub(super) query: Option<String>,
+    pub(super) query_index: Option<usize>,
+    pub(super) url: Option<String>,
+    pub(super) url_index: Option<usize>,
+}
+
+impl Tool for WebSearch {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "web_search".into(),
+            description: "Search the web through the backend selected in user configuration. Returns a concise summary, stores snippets by default under a responseId, and stores full source pages only when includeContent succeeds. Use get_search_content with that responseId when you need stored snippets or source pages.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "queries": {"type": "array", "items": {"type": "string"}, "description": "Search queries. Use one item for a single search, or multiple items for broader research."},
+                    "numResults": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Results per query."},
+                    "recencyFilter": {"type": "string", "enum": ["day", "week", "month", "year"]},
+                    "domainFilter": {"type": "array", "items": {"type": "string"}},
+                    "includeContent": {"type": "boolean", "description": "Try to fetch and store result pages when the selected backend returns URLs."},
+                    "workflow": {"type": "string", "enum": ["none", "summary-review", "auto-summary"]}
+                },
+                "required": ["queries"]
+            }),
+        }
+    }
+
+    fn call<'a>(&'a self, args: Value, ctx: ToolContext, id: String) -> AppToolFuture<'a> {
+        Box::pin(async move {
+            Ok(self
+                .search(args, ctx.max_output_bytes)
+                .await?
+                .into_result(id))
+        })
+    }
+}
+
+/// Per-result snippet cap in structured content, matching the Exa backend's
+/// existing 500-char snippet bound so every backend returns the same size.
+const STRUCTURED_SNIPPET_CHARS: usize = 500;
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub(super) struct WebSearchOutput {
+    /// Pass to get_search_content for stored snippets or pages.
+    response_id: String,
+    results: Vec<SearchResultView>,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+struct SearchResultView {
+    query: String,
+    title: Option<String>,
+    url: Option<String>,
+    snippet: String,
+}
+
+impl WebSearch {
+    /// Runs the search and stores items; returns the model text (bounded by
+    /// `max_output_bytes`) and the script-facing results. Results are bounded
+    /// by `numResults` (max 20) per query; snippets come from the backend.
+    pub(super) async fn search(
+        &self,
+        args: Value,
+        max_output_bytes: usize,
+    ) -> Result<rho_tools::Rendered<WebSearchOutput>, ToolError> {
+        let args: WebSearchArgs = serde_json::from_value(args)?;
+        if !self.client_available() {
+            return Err(ToolError::Message(
+                "web search is disabled or the selected backend is unavailable".into(),
+            ));
+        }
+        let queries = collect_values(args.query, args.queries, "query", "queries")?;
+        let num_results = args.num_results.unwrap_or(5).clamp(1, 20);
+        let backend = self.config.backend();
+        let workflow = args.workflow.unwrap_or_else(|| "summary-review".into());
+        let include_content = args.include_content.unwrap_or(false);
+        let response_id = storage::new_response_id();
+        let mut items = Vec::new();
+        let mut summaries = Vec::new();
+        let mut results = Vec::new();
+
+        for query in queries {
+            let result = search::run_search_query(
+                &self.client,
+                &query,
+                num_results,
+                args.recency_filter.as_deref(),
+                args.domain_filter.as_deref(),
+                &self.config,
+            )
+            .await;
+            match result {
+                Ok(search_items) if !search_items.is_empty() => {
+                    for (index, item) in search_items.into_iter().enumerate() {
+                        results.push(SearchResultView {
+                            query: query.clone(),
+                            title: item.title.clone(),
+                            url: item.url.clone(),
+                            snippet: item
+                                .snippet
+                                .chars()
+                                .take(STRUCTURED_SNIPPET_CHARS)
+                                .collect(),
+                        });
+                        let (content, content_kind) =
+                            search::item_content(&item, include_content).await;
+                        summaries.push(format!(
+                            "{}. [{}] {}{}",
+                            index + 1,
+                            item.title.as_deref().unwrap_or("result"),
+                            item.url.as_deref().unwrap_or("no url"),
+                            item.snippet
+                                .is_empty()
+                                .then(String::new)
+                                .unwrap_or_else(|| format!(" - {}", item.snippet))
+                        ));
+                        let metadata = json!({"backend": backend, "workflow": workflow, "contentKind": content_kind});
+                        items.push(StoredItem {
+                            url: item.url,
+                            query: Some(query.clone()),
+                            title: item.title,
+                            content,
+                            metadata,
+                        });
+                    }
+                }
+                Err(error) => return Err(error),
+                Ok(_) => {
+                    let message =
+                        format!("The selected search backend returned no results for '{query}'.");
+                    summaries.push(message.clone());
+                    let metadata = json!({"backend": backend, "workflow": workflow, "status": "empty", "contentKind": "snippet"});
+                    items.push(StoredItem {
+                        url: None,
+                        query: Some(query),
+                        title: Some("no search results".into()),
+                        content: message,
+                        metadata,
+                    });
+                }
+            }
+        }
+
+        self.store.store(
+            response_id.clone(),
+            StoredContent {
+                kind: "web_search".into(),
+                items,
+            },
+        )?;
+
+        let content = truncate(
+            format_web_search(&response_id, &summaries),
+            max_output_bytes,
+        );
+        rho_tools::Rendered::new(
+            content,
+            WebSearchOutput {
+                response_id,
+                results,
+            },
+        )
+        .limit_data(max_output_bytes)
+        .map_err(|error| ToolError::Message(error.to_string()))
+    }
+}
+
+impl Tool for GetSearchContent {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "get_search_content".into(),
+            description: "Retrieve stored web_search snippets/source pages or fetch_content bodies by responseId. Prefer responseId alone, or exact url/urlIndex/query/queryIndex selectors from the prior tool result. query is the original search query or fetch prompt, not a free-text content search.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "responseId": {"type": "string", "pattern": "^[0-9a-f]{32}$", "description": "responseId returned by web_search or fetch_content."},
+                    "query": {"type": "string", "description": "Exact original web_search query or fetch_content prompt. Not a keyword search over page text."},
+                    "queryIndex": {"type": "integer", "minimum": 0, "description": "Index among stored items that have a query."},
+                    "url": {"type": "string", "description": "Exact stored URL to select."},
+                    "urlIndex": {"type": "integer", "minimum": 0, "description": "Index into the stored item list."}
+                },
+                "required": ["responseId"]
+            }),
+        }
+    }
+
+    fn call<'a>(&'a self, args: Value, ctx: ToolContext, id: String) -> AppToolFuture<'a> {
+        Box::pin(async move {
+            let args: GetSearchContentArgs = serde_json::from_value(args)?;
+            self.execute(args, ctx.max_output_bytes, id)
+        })
+    }
+}
+
+impl GetSearchContent {
+    pub(super) fn execute(
+        &self,
+        args: GetSearchContentArgs,
+        max_output_bytes: usize,
+        id: String,
+    ) -> Result<ToolResult, ToolError> {
+        let stored = self.store.load(&args.response_id)?;
+        let item = select_stored_item(&stored, &args)?;
+        Ok(ToolResult {
+            id,
+            ok: true,
+            content: format_stored_item(item, max_output_bytes),
+        })
+    }
+}
+
+fn select_stored_item<'a>(
+    stored: &'a StoredContent,
+    args: &GetSearchContentArgs,
+) -> Result<&'a StoredItem, ToolError> {
+    let available = || storage::available_selectors(stored);
+    if let Some(url) = &args.url {
+        return stored
+            .items
+            .iter()
+            .find(|item| item.url.as_deref() == Some(url.as_str()))
+            .ok_or_else(|| {
+                ToolError::Message(format!(
+                    "url not found for responseId: {url}. Available selectors:\n{}",
+                    available()
+                ))
+            });
+    }
+    if let Some(index) = args.url_index {
+        return stored.items.get(index).ok_or_else(|| {
+            ToolError::Message(format!(
+                "urlIndex out of range: {index}. Available selectors:\n{}",
+                available()
+            ))
+        });
+    }
+    if let Some(query) = &args.query {
+        return stored
+            .items
+            .iter()
+            .find(|item| item.query.as_deref() == Some(query.as_str()))
+            .ok_or_else(|| {
+                ToolError::Message(format!(
+                    "query not found for responseId: {query}. query must equal an original web_search query or fetch_content prompt, not page keywords. Available selectors:\n{}",
+                    available()
+                ))
+            });
+    }
+    if let Some(index) = args.query_index {
+        return stored
+            .items
+            .iter()
+            .filter(|item| item.query.is_some())
+            .nth(index)
+            .ok_or_else(|| {
+                ToolError::Message(format!(
+                    "queryIndex out of range: {index}. Available selectors:\n{}",
+                    available()
+                ))
+            });
+    }
+    stored
+        .items
+        .first()
+        .ok_or_else(|| ToolError::Message("responseId has no stored content".into()))
+}
+
+fn collect_values(
+    value: Option<String>,
+    values: Option<Vec<String>>,
+    singular: &str,
+    plural: &str,
+) -> Result<Vec<String>, ToolError> {
+    let values = value
+        .into_iter()
+        .chain(values.into_iter().flatten())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        Err(ToolError::Message(format!(
+            "{singular} or {plural} must include at least one value"
+        )))
+    } else {
+        Ok(values)
+    }
+}

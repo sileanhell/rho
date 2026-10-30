@@ -1,0 +1,797 @@
+use std::{borrow::Cow, collections::BTreeSet};
+
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
+
+use crate::model::{
+    handoff::{prepare_assistant, PreparedAssistant},
+    ContentBlock, Message, ModelError, ModelIdentity, ModelResponse, PartialToolCall,
+    ProviderContextBlock,
+};
+use rho_sdk::model::{ToolCall, ToolSpec};
+
+use crate::protocol::openai_chat::{
+    ChatResponse, OpenAiFunctionCall, OpenAiMessage, OpenAiTool, OpenAiToolCall, OpenAiToolFunction,
+};
+
+use super::image_generation::{is_image_generation_replay, restore_image_generation_results};
+use super::tool_calls::{finalize_chat_tool_calls, ChatToolCallPolicy, RawChatToolCall};
+
+/// Provider-context kind for chat-completions `reasoning_content`.
+///
+/// Models such as Qwen3.x stream thinking in `delta.reasoning_content` and expect
+/// that field to be replayed on later assistant messages that carried tool calls.
+/// Raw reasoning stays opaque provider context (never `reasoning_summary`).
+pub(crate) const OPENAI_CHAT_REASONING_CONTENT_KIND: &str = "openai_chat_reasoning_content";
+
+/// Normalized chat-completions assistant payload after stream or JSON convert.
+#[derive(Debug)]
+pub(crate) struct ChatAssistantFinish {
+    pub(crate) response: ModelResponse,
+    pub(crate) reasoning_content: Option<String>,
+}
+
+/// Builds the shared chat assistant response from accumulated text, reasoning,
+/// and tool calls. Callers emit [`crate::model::ModelEvent::ProviderContext`]
+/// for reasoning separately via [`emit_chat_reasoning_context`].
+pub(crate) fn finalize_chat_assistant(
+    text: String,
+    reasoning: String,
+    tool_calls: Vec<RawChatToolCall>,
+    policy: ChatToolCallPolicy,
+) -> Result<ChatAssistantFinish, ModelError> {
+    let mut blocks = Vec::new();
+    if !text.is_empty() {
+        blocks.push(ContentBlock::Text(text));
+    }
+    blocks.extend(
+        finalize_chat_tool_calls(tool_calls, policy)?
+            .into_iter()
+            .map(ContentBlock::ToolCall),
+    );
+    if blocks.is_empty() {
+        return Err(ModelError::empty_assistant());
+    }
+    Ok(ChatAssistantFinish {
+        response: ModelResponse::Assistant(blocks),
+        reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+    })
+}
+
+/// Publishes retained chat `reasoning_content` as opaque provider context.
+pub(crate) fn emit_chat_reasoning_context(
+    reasoning_content: Option<String>,
+    on_event: &mut (dyn FnMut(crate::model::ModelEvent) -> Result<(), ModelError> + Send),
+) -> Result<(), ModelError> {
+    let Some(reasoning) = reasoning_content.filter(|text| !text.is_empty()) else {
+        return Ok(());
+    };
+    on_event(crate::model::ModelEvent::ProviderContext {
+        kind: OPENAI_CHAT_REASONING_CONTENT_KIND.into(),
+        position: Some(0),
+        data: serde_json::Value::String(reasoning),
+    })
+}
+
+/// Non-stream completions keep only the portable assistant response.
+///
+/// Chat `reasoning_content` is stream-path provider context
+/// ([`OPENAI_CHAT_REASONING_CONTENT_KIND`]). `send_turn` / `complete_turn` have
+/// no event channel to publish it, and [`ModelResponse`] cannot carry it.
+/// Rho orchestration always uses the stream path for multi-step tool loops.
+pub(crate) fn response_without_stream_context(finish: ChatAssistantFinish) -> ModelResponse {
+    let _ = finish.reasoning_content;
+    finish.response
+}
+
+/// Converts a non-stream chat completion using the shared assistant finalizer.
+///
+/// Reasoning is returned on [`ChatAssistantFinish`] so callers can emit
+/// provider context on event-capable paths.
+pub(crate) fn convert_openai_response(
+    response: ChatResponse,
+    policy: ChatToolCallPolicy,
+) -> Result<ChatAssistantFinish, ModelError> {
+    let message = response
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| ModelError::InvalidResponse("missing choices".into()))?
+        .message;
+    let text = message
+        .content
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    let reasoning = message
+        .reasoning_content
+        .filter(|text| !text.is_empty())
+        .unwrap_or_default();
+    let raw_calls = message
+        .tool_calls
+        .unwrap_or_default()
+        .into_iter()
+        .map(|call| RawChatToolCall {
+            id: Some(call.id),
+            name: Some(call.function.name),
+            arguments: call.function.arguments,
+        })
+        .collect();
+    finalize_chat_assistant(text, reasoning, raw_calls, policy)
+}
+
+/// Known chat wire fields extracted from replayable provider context.
+struct ChatReplay {
+    reasoning_content: Option<String>,
+}
+
+fn chat_replay(replay_context: Vec<ProviderContextBlock>) -> Result<ChatReplay, ModelError> {
+    let mut reasoning_content = None;
+    let mut unknown_kinds = Vec::new();
+    for block in replay_context {
+        if block.kind == OPENAI_CHAT_REASONING_CONTENT_KIND {
+            let Some(text) = block
+                .data
+                .as_str()
+                .map(str::to_owned)
+                .filter(|text| !text.is_empty())
+            else {
+                continue;
+            };
+            if reasoning_content.is_some() {
+                return Err(ModelError::InvalidResponse(
+                    "openai chat received multiple reasoning_content replay blocks".into(),
+                ));
+            }
+            reasoning_content = Some(text);
+            continue;
+        }
+        if !unknown_kinds.contains(&block.kind) {
+            unknown_kinds.push(block.kind);
+        }
+    }
+    if !unknown_kinds.is_empty() {
+        return Err(ModelError::InvalidResponse(format!(
+            "openai chat cannot encode provider context kinds: {}",
+            unknown_kinds.join(", ")
+        )));
+    }
+    Ok(ChatReplay { reasoning_content })
+}
+
+pub(crate) fn codex_reasoning_param(
+    effort: Option<&str>,
+    summary: Option<&str>,
+) -> Option<serde_json::Value> {
+    let summary = summary.filter(|value| !value.eq_ignore_ascii_case("none"));
+    if effort.is_none() && summary.is_none() {
+        return None;
+    }
+    let mut reasoning = serde_json::Map::new();
+    if let Some(effort) = effort {
+        reasoning.insert("effort".into(), json!(effort));
+    }
+    if let Some(summary) = summary {
+        reasoning.insert("summary".into(), json!(summary));
+    }
+    Some(serde_json::Value::Object(reasoning))
+}
+
+pub(crate) fn to_openai_tool(tool: &ToolSpec) -> OpenAiTool<'_> {
+    OpenAiTool {
+        kind: "function",
+        function: OpenAiToolFunction {
+            name: &tool.name,
+            description: &tool.description,
+            parameters: Cow::Borrowed(&tool.input_schema),
+            strict: false,
+        },
+    }
+}
+
+/// The `strict` value a Responses function tool carries on the wire.
+///
+/// Every Responses endpoint keeps the `strict` key, so this picks the value
+/// rather than whether the field appears. Codex sends an explicit JSON `null`;
+/// the public OpenAI API and xAI send a boolean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolStrictness {
+    /// Serializes as JSON `null`.
+    Unspecified,
+    /// Serializes as JSON `true` or `false`.
+    Explicit(bool),
+}
+
+impl ToolStrictness {
+    fn to_json(self) -> serde_json::Value {
+        match self {
+            Self::Unspecified => serde_json::Value::Null,
+            Self::Explicit(strict) => json!(strict),
+        }
+    }
+}
+
+/// Whether a Responses function tool is advertised as async.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolAsync {
+    Off,
+    On,
+}
+
+/// Serializes a tool for a Responses endpoint that offers hosted tools.
+pub(crate) fn to_responses_tool(
+    tool: &ToolSpec,
+    strictness: ToolStrictness,
+    hosted_web_search: bool,
+    async_mode: ToolAsync,
+) -> serde_json::Value {
+    if hosted_web_search && tool.name == "web_search" {
+        return json!({
+            "type": "web_search",
+            "external_web_access": true,
+        });
+    }
+
+    let mut value = to_responses_lite_tool(tool, strictness);
+    if async_mode == ToolAsync::On {
+        value["async"] = json!(true);
+    }
+    value
+}
+
+/// Serializes a tool for a Responses endpoint with no hosted tool types.
+pub(crate) fn to_responses_lite_tool(
+    tool: &ToolSpec,
+    strictness: ToolStrictness,
+) -> serde_json::Value {
+    Value::Object(Map::from_iter([
+        ("type".into(), "function".into()),
+        ("name".into(), Value::String(tool.name.clone())),
+        (
+            "description".into(),
+            Value::String(tool.description.clone()),
+        ),
+        ("parameters".into(), tool.input_schema.clone()),
+        ("strict".into(), strictness.to_json()),
+    ]))
+}
+
+pub(crate) fn codex_input_items(
+    messages: &[Message],
+    instructions: &mut Vec<String>,
+) -> Result<Vec<serde_json::Value>, ModelError> {
+    codex_input_items_for_target(messages, instructions, None)
+}
+
+pub(crate) fn codex_input_items_for_target(
+    messages: &[Message],
+    instructions: &mut Vec<String>,
+    target: Option<&crate::model::ModelIdentity>,
+) -> Result<Vec<serde_json::Value>, ModelError> {
+    let mut input = Vec::new();
+    for message in messages {
+        append_codex_history_message(message, &mut input, instructions, target)?;
+    }
+    Ok(input)
+}
+
+/// Lowers one history message into Responses input items (or instructions).
+///
+/// Providers that interleave policy items (for example `configuration_update`)
+/// can call this per message without teaching this converter about that policy.
+pub(crate) fn lower_codex_history_message(
+    message: &Message,
+    instructions: &mut Vec<String>,
+    target: Option<&crate::model::ModelIdentity>,
+) -> Result<Vec<serde_json::Value>, ModelError> {
+    let mut input = Vec::new();
+    append_codex_history_message(message, &mut input, instructions, target)?;
+    Ok(input)
+}
+
+fn append_codex_history_message(
+    message: &Message,
+    input: &mut Vec<serde_json::Value>,
+    instructions: &mut Vec<String>,
+    target: Option<&crate::model::ModelIdentity>,
+) -> Result<(), ModelError> {
+    match message {
+        Message::System(content) => instructions.push(content.clone()),
+        Message::User(blocks) => input.push(Value::Object(Map::from_iter([
+            ("role".into(), "user".into()),
+            ("content".into(), codex_content_blocks(blocks)),
+        ]))),
+        Message::Assistant(blocks) => {
+            append_codex_assistant(input, blocks)?;
+        }
+        Message::EnrichedAssistant(message) => {
+            let fallback_target = message
+                .provenance
+                .clone()
+                .unwrap_or_else(|| ModelIdentity::new("foreign", "openai-responses", "foreign"));
+            let target = target.unwrap_or(&fallback_target);
+            let async_call_ids = async_call_ids_for_target(&message.provider_context, target);
+            let prepared = prepare_assistant((**message).clone(), target);
+            append_codex_prepared_assistant(input, prepared, &async_call_ids)?;
+        }
+        Message::AbortedAssistant(message) => {
+            let mut enriched = crate::model::AssistantMessage {
+                content: aborted_content_as_non_executable(message),
+                provenance: message.provenance.clone(),
+                reasoning_summary: message.reasoning_summary.clone(),
+                provider_context: message.provider_context.clone(),
+            };
+            enriched
+                .content
+                .push(ContentBlock::Text("[Operation aborted]".into()));
+            let fallback_target = enriched
+                .provenance
+                .clone()
+                .unwrap_or_else(|| ModelIdentity::new("foreign", "openai-responses", "foreign"));
+            let target = target.unwrap_or(&fallback_target);
+            let async_call_ids = async_call_ids_for_target(&message.provider_context, target);
+            let prepared = prepare_assistant(enriched, target);
+            append_codex_prepared_assistant(input, prepared, &async_call_ids)?;
+        }
+        Message::ToolResult(result) => input.push(json!({
+            "type": "function_call_output",
+            "call_id": &result.id,
+            "output": &result.content,
+        })),
+    }
+    Ok(())
+}
+
+fn append_codex_prepared_assistant(
+    input: &mut Vec<serde_json::Value>,
+    mut prepared: PreparedAssistant,
+    async_call_ids: &BTreeSet<&str>,
+) -> Result<(), ModelError> {
+    restore_image_generation_results(&mut prepared.replay_context, &prepared.content);
+    let content = portable_assistant_blocks(&prepared);
+    let mut assistant_items = Vec::new();
+    // `prepare_assistant` already suppresses portable fallback when opaque
+    // context can replay, so converters only append the lowered content.
+    append_codex_assistant(&mut assistant_items, &content)?;
+    mark_replayed_async_function_calls(&mut assistant_items, async_call_ids);
+    merge_replay_items(&mut assistant_items, prepared.replay_context);
+    input.extend(assistant_items);
+    Ok(())
+}
+
+fn async_call_ids_for_target<'a>(
+    blocks: &'a [ProviderContextBlock],
+    target: &ModelIdentity,
+) -> BTreeSet<&'a str> {
+    // Async-call markers are SDK metadata, so `prepare_assistant` never puts
+    // them in `replay_context`. Collect matching ids from the original
+    // assistant context instead.
+    blocks
+        .iter()
+        .filter(|block| block.identity == *target)
+        .filter_map(ProviderContextBlock::async_tool_call_id)
+        .collect()
+}
+
+/// Replaying `"async": true` on INPUT `function_call` items is our
+/// extrapolation; OpenAI docs only show the flag on output items. Keep this in
+/// one place so it is a one-line revert.
+fn mark_replayed_async_function_calls(
+    items: &mut [serde_json::Value],
+    async_call_ids: &BTreeSet<&str>,
+) {
+    for item in items {
+        if item.get("type").and_then(|value| value.as_str()) != Some("function_call") {
+            continue;
+        }
+        let Some(call_id) = item.get("call_id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if async_call_ids.contains(call_id) {
+            item["async"] = json!(true);
+        }
+    }
+}
+
+/// Native `image_generation_call` replay already carries the image, so those
+/// assistant Image blocks must not also become omitted-image placeholders.
+fn portable_assistant_blocks(prepared: &PreparedAssistant) -> Cow<'_, [ContentBlock]> {
+    if prepared
+        .replay_context
+        .iter()
+        .any(is_image_generation_replay)
+    {
+        Cow::Owned(
+            prepared
+                .content
+                .iter()
+                .filter(|block| !matches!(block, ContentBlock::Image(_)))
+                .cloned()
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(&prepared.content)
+    }
+}
+
+fn merge_replay_items(
+    assistant_items: &mut Vec<serde_json::Value>,
+    replay_context: Vec<ProviderContextBlock>,
+) {
+    let mut replay_items = replay_context
+        .into_iter()
+        .enumerate()
+        // Other kinds (including recorded reasoning effort) stay off this wire.
+        .filter(|(_, block)| block.kind == "openai_response_output_item")
+        .collect::<Vec<_>>();
+    // Positionless items sort to the tail, so a single position-ordered pass
+    // handles both: positioned items merge in, positionless items trail.
+    replay_items.sort_by_key(|(sequence, block)| (block.position.unwrap_or(usize::MAX), *sequence));
+    // `position` is the item's index in the provider's original `output`
+    // array, and the lowered portable items already sit in original relative
+    // order (one lowered item per original item). Emitting each replay item
+    // once the rebuilt list reaches its original index therefore
+    // reconstructs the provider's exact output sequence. Inserting original
+    // indexes into the shorter lowered list instead strands trailing
+    // reasoning items behind the tool call, which strict Responses gateways
+    // reject (opencode-go muse-spark: HTTP 500).
+    let mut replay = replay_items.into_iter().map(|(_, block)| block).peekable();
+    let mut merged = Vec::with_capacity(assistant_items.len() + replay.len());
+    for item in assistant_items.drain(..) {
+        while let Some(block) = replay.next_if(|block| {
+            block
+                .position
+                .is_some_and(|position| position <= merged.len())
+        }) {
+            merged.push(block.data);
+        }
+        merged.push(item);
+    }
+    merged.extend(replay.map(|block| block.data));
+    *assistant_items = merged;
+}
+
+fn append_codex_assistant(
+    input: &mut Vec<serde_json::Value>,
+    blocks: &[ContentBlock],
+) -> Result<(), ModelError> {
+    let text = assistant_text(blocks);
+    if !text.is_empty() {
+        input.push(Value::Object(Map::from_iter([
+            ("role".into(), "assistant".into()),
+            ("content".into(), Value::String(text)),
+        ])));
+    }
+    for block in blocks {
+        if let ContentBlock::ToolCall(call) = block {
+            let arguments = serde_json::to_string(&call.arguments).map_err(|e| {
+                ModelError::InvalidResponse(format!("invalid tool call arguments: {e}"))
+            })?;
+            input.push(Value::Object(Map::from_iter([
+                ("type".into(), "function_call".into()),
+                ("call_id".into(), Value::String(call.id.clone())),
+                ("name".into(), Value::String(call.name.clone())),
+                ("arguments".into(), Value::String(arguments)),
+            ])));
+        }
+    }
+    Ok(())
+}
+
+fn openai_assistant_message(blocks: &[ContentBlock]) -> Result<OpenAiMessage, ModelError> {
+    openai_prepared_assistant(
+        PreparedAssistant {
+            content: blocks.to_vec(),
+            replay_context: Vec::new(),
+        },
+        // Plain assistant history carries no provenance, so it never gets
+        // same-model reasoning synthesis.
+        /*synthesize_tool_reasoning*/
+        false,
+    )
+}
+
+/// DeepSeek's thinking mode rejects tool-call turns that omit
+/// `reasoning_content` (a present empty string is accepted), while stricter
+/// chat hosts can reject the field as unknown. Synthesis is therefore scoped
+/// to same-model turns for the models documented to require it.
+fn synthesizes_tool_reasoning(
+    provenance: Option<&crate::model::ModelIdentity>,
+    target: &crate::model::ModelIdentity,
+) -> bool {
+    provenance == Some(target) && target.model.to_ascii_lowercase().contains("deepseek")
+}
+
+/// Converts a prepared assistant turn for the chat-completions wire.
+///
+/// `synthesize_tool_reasoning` makes tool-call turns always carry
+/// `reasoning_content`, defaulting to an empty string; see
+/// [`synthesizes_tool_reasoning`].
+fn openai_prepared_assistant(
+    prepared: PreparedAssistant,
+    synthesize_tool_reasoning: bool,
+) -> Result<OpenAiMessage, ModelError> {
+    let replay = chat_replay(prepared.replay_context)?;
+    let content = assistant_text(&prepared.content);
+    let tool_calls = prepared
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolCall(call) => Some(tool_call_to_openai(call)),
+            ContentBlock::Text(_) | ContentBlock::Image(_) => None,
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(OpenAiMessage {
+        role: "assistant".into(),
+        content: (!content.is_empty()).then(|| Value::String(content)),
+        reasoning_content: replay
+            .reasoning_content
+            .or_else(|| (synthesize_tool_reasoning && !tool_calls.is_empty()).then(String::new)),
+        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+        tool_call_id: None,
+    })
+}
+
+pub(crate) fn to_openai_messages_for_target(
+    messages: &[Message],
+    target: Option<&crate::model::ModelIdentity>,
+) -> Result<Vec<OpenAiMessage>, ModelError> {
+    crate::protocol::late_tool_results::normalize_late_tool_results(messages)
+        .iter()
+        .map(|message| to_openai_message_for_target(message, target))
+        .collect()
+}
+
+pub(crate) fn to_openai_message_for_target(
+    message: &Message,
+    target: Option<&crate::model::ModelIdentity>,
+) -> Result<OpenAiMessage, ModelError> {
+    match message {
+        Message::System(content) => Ok(openai_text_message("system", content.clone())),
+        Message::User(blocks) => Ok(OpenAiMessage {
+            role: "user".into(),
+            content: Some(chat_content_blocks(blocks)),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }),
+        Message::Assistant(blocks) => openai_assistant_message(blocks),
+        Message::EnrichedAssistant(message) => {
+            let fallback_target = message.provenance.clone().unwrap_or_else(|| {
+                crate::model::ModelIdentity::new("foreign", "openai-chat-completions", "foreign")
+            });
+            let target = target.unwrap_or(&fallback_target);
+            let synthesize = synthesizes_tool_reasoning(message.provenance.as_ref(), target);
+            openai_prepared_assistant(prepare_assistant((**message).clone(), target), synthesize)
+        }
+        Message::AbortedAssistant(message) => {
+            let mut enriched = crate::model::AssistantMessage {
+                content: aborted_content_as_non_executable(message),
+                provenance: message.provenance.clone(),
+                reasoning_summary: message.reasoning_summary.clone(),
+                provider_context: message.provider_context.clone(),
+            };
+            enriched
+                .content
+                .push(ContentBlock::Text("[Operation aborted]".into()));
+            let fallback_target = enriched.provenance.clone().unwrap_or_else(|| {
+                crate::model::ModelIdentity::new("foreign", "openai-chat-completions", "foreign")
+            });
+            let target = target.unwrap_or(&fallback_target);
+            let synthesize = synthesizes_tool_reasoning(enriched.provenance.as_ref(), target);
+            openai_prepared_assistant(prepare_assistant(enriched, target), synthesize)
+        }
+        Message::ToolResult(result) => Ok(OpenAiMessage {
+            role: "tool".into(),
+            content: Some(json!(result.content)),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: Some(result.id.clone()),
+        }),
+    }
+}
+
+fn openai_text_message(role: &str, content: String) -> OpenAiMessage {
+    OpenAiMessage {
+        role: role.into(),
+        content: Some(Value::String(content)),
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+    }
+}
+
+fn tool_call_to_openai(call: &ToolCall) -> Result<OpenAiToolCall, ModelError> {
+    let arguments = serde_json::to_string(&call.arguments)
+        .map_err(|e| ModelError::InvalidResponse(format!("invalid tool call arguments: {e}")))?;
+    Ok(OpenAiToolCall {
+        id: call.id.clone(),
+        kind: "function".into(),
+        function: OpenAiFunctionCall {
+            name: call.name.clone(),
+            arguments,
+        },
+    })
+}
+
+fn chat_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
+    let content = blocks
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text(text) => json!({ "type": "text", "text": text }),
+            ContentBlock::Image(image) => Value::Object(Map::from_iter([
+                ("type".into(), "image_url".into()),
+                (
+                    "image_url".into(),
+                    Value::Object(Map::from_iter([(
+                        "url".into(),
+                        Value::String(format!("data:{};base64,{}", image.mime_type, image.data)),
+                    )])),
+                ),
+            ])),
+            ContentBlock::ToolCall(call) => Value::Object(Map::from_iter([
+                ("type".into(), "text".into()),
+                ("text".into(), Value::String(render_tool_call(call))),
+            ])),
+        })
+        .collect::<Vec<_>>();
+    Value::Array(content)
+}
+
+fn codex_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
+    let content = blocks
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text(text) => json!({ "type": "input_text", "text": text }),
+            ContentBlock::Image(image) => Value::Object(Map::from_iter([
+                ("type".into(), "input_image".into()),
+                (
+                    "image_url".into(),
+                    Value::String(format!("data:{};base64,{}", image.mime_type, image.data)),
+                ),
+            ])),
+            ContentBlock::ToolCall(call) => Value::Object(Map::from_iter([
+                ("type".into(), "input_text".into()),
+                ("text".into(), Value::String(render_tool_call(call))),
+            ])),
+        })
+        .collect::<Vec<_>>();
+    Value::Array(content)
+}
+
+/// Placeholder for an assistant image neither OpenAI protocol can encode.
+pub(crate) const ASSISTANT_IMAGE_OMITTED_TEXT: &str =
+    "[image omitted: assistant history cannot carry image content]";
+
+/// Joins assistant text, replacing images with [`ASSISTANT_IMAGE_OMITTED_TEXT`].
+///
+/// Neither OpenAI wire protocol has an assistant image slot. Images degrade to
+/// text so history keeps a trace of the content instead of dropping it silently
+/// or failing the whole turn.
+fn assistant_text(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.as_str()),
+            ContentBlock::Image(_) => Some(ASSISTANT_IMAGE_OMITTED_TEXT),
+            ContentBlock::ToolCall(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_tool_call(call: &ToolCall) -> String {
+    let arguments = serde_json::to_string_pretty(&call.arguments)
+        .unwrap_or_else(|_| call.arguments.to_string());
+    format!("Tool call: {}\n{}", call.name, arguments)
+}
+
+fn render_partial_tool_call(call: &PartialToolCall) -> String {
+    format!(
+        "[Partial tool call (not executed)]\nID: {}\nName: {}\nArguments:\n{}",
+        call.id.as_deref().unwrap_or("[unknown]"),
+        call.name.as_deref().unwrap_or("[unknown]"),
+        call.arguments,
+    )
+}
+
+fn aborted_content_as_non_executable(
+    message: &crate::model::AbortedAssistant,
+) -> Vec<ContentBlock> {
+    let mut blocks = Vec::with_capacity(message.content.len() + message.tool_calls.len());
+    let mut seen_ids = std::collections::HashSet::new();
+    for block in &message.content {
+        match block {
+            ContentBlock::ToolCall(call) => {
+                seen_ids.insert(call.id.clone());
+                blocks.push(ContentBlock::Text(render_tool_call(call)));
+            }
+            other => blocks.push(other.clone()),
+        }
+    }
+    for call in &message.tool_calls {
+        if call
+            .id
+            .as_ref()
+            .is_some_and(|id| !id.is_empty() && seen_ids.contains(id))
+        {
+            continue;
+        }
+        blocks.push(ContentBlock::Text(render_partial_tool_call(call)));
+    }
+    blocks
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ResponsesResponse {
+    output_text: Option<String>,
+    output: Option<Vec<ResponseOutput>>,
+}
+
+#[derive(Deserialize)]
+struct ResponseOutput {
+    content: Option<Vec<ResponseContent>>,
+}
+
+#[derive(Deserialize)]
+struct ResponseContent {
+    text: Option<String>,
+    annotations: Option<Vec<ResponseAnnotation>>,
+}
+
+#[derive(Deserialize)]
+struct ResponseAnnotation {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    title: Option<String>,
+    url: Option<String>,
+}
+
+pub(crate) fn extract_response_text(response: ResponsesResponse) -> Result<String, ModelError> {
+    let mut content_texts = Vec::new();
+    let mut citations = Vec::new();
+    for content in response
+        .output
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|o| o.content.unwrap_or_default())
+    {
+        if let Some(text) = content.text.filter(|text| !text.is_empty()) {
+            content_texts.push(text);
+        }
+        for annotation in content.annotations.unwrap_or_default() {
+            if annotation.kind.as_deref() == Some("url_citation") {
+                if let Some(url) = annotation.url.filter(|url| !url.trim().is_empty()) {
+                    citations.push((annotation.title, url));
+                }
+            }
+        }
+    }
+
+    let mut text = response
+        .output_text
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| content_texts.join("\n"));
+    if text.is_empty() {
+        return Err(ModelError::InvalidResponse("missing response text".into()));
+    }
+    append_response_citations(&mut text, citations);
+    Ok(text)
+}
+
+fn append_response_citations(text: &mut String, citations: Vec<(Option<String>, String)>) {
+    let mut seen = std::collections::HashSet::new();
+    let citations = citations
+        .into_iter()
+        .filter(|(_, url)| seen.insert(url.clone()))
+        .collect::<Vec<_>>();
+    if citations.is_empty() {
+        return;
+    }
+    text.push_str("\n\nSources:");
+    for (title, url) in citations {
+        let title = title
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| url.clone());
+        text.push_str(&format!("\n- {title}: {url}"));
+    }
+}

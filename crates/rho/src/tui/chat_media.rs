@@ -1,0 +1,140 @@
+use rho_providers::model::{image_summary, ContentBlock, ImageContent};
+
+/// Ready media queued with the next user turn.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum ChatMedia {
+    Image(ImageContent),
+    TextDocument(ChatTextDocument),
+}
+
+/// One ordered attachment shown in the composer.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum ComposerAttachment {
+    Ready(ChatMedia),
+    Pending {
+        id: MediaAttachId,
+        source: PendingAttachmentSource,
+        name: String,
+    },
+}
+
+/// Where a pending attachment is coming from, so the composer names the wait
+/// for what it is instead of calling every slow attachment a file extraction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PendingAttachmentSource {
+    /// A file on disk being read and extracted.
+    File,
+    /// A resource being read from an MCP server.
+    McpResource,
+    /// An image paste decoding a composer preview off the UI thread.
+    Image,
+}
+
+/// Stable identity shared by a pending composer item and its extraction task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MediaAttachId(uuid::Uuid);
+
+impl MediaAttachId {
+    pub(super) fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+/// Extracted document content kept as text rather than raw file bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ChatTextDocument {
+    pub(super) name: String,
+    pub(super) mime: String,
+    pub(super) body: String,
+    pub(super) truncated: bool,
+    pub(super) warnings: Vec<String>,
+}
+
+impl ChatMedia {
+    pub(super) fn composer_label(&self, index: usize) -> String {
+        match self {
+            Self::Image(image) => format!("[image {index}: {}]", image_summary(image)),
+            Self::TextDocument(document) => document.label(),
+        }
+    }
+
+    pub(super) fn display_block(&self) -> ContentBlock {
+        match self {
+            Self::Image(image) => ContentBlock::Image(image.clone()),
+            Self::TextDocument(document) => ContentBlock::Text(document.label()),
+        }
+    }
+
+    pub(super) fn model_block(self) -> ContentBlock {
+        match self {
+            Self::Image(image) => ContentBlock::Image(image),
+            Self::TextDocument(document) => ContentBlock::Text(document.model_text()),
+        }
+    }
+}
+
+impl ComposerAttachment {
+    pub(super) fn composer_label(&self, index: usize) -> String {
+        match self {
+            Self::Ready(media) => media.composer_label(index),
+            Self::Pending { source, name, .. } => match source {
+                PendingAttachmentSource::File => format!("[file: {name} · extracting]"),
+                PendingAttachmentSource::McpResource => format!("[resource: {name} · reading]"),
+                PendingAttachmentSource::Image => format!("[image: {name} · decoding]"),
+            },
+        }
+    }
+
+    pub(super) fn pending_id(&self) -> Option<MediaAttachId> {
+        match self {
+            Self::Pending { id, .. } => Some(*id),
+            Self::Ready(_) => None,
+        }
+    }
+}
+
+impl ChatTextDocument {
+    fn label(&self) -> String {
+        let kind = document_kind(&self.name, &self.mime);
+        let suffix = if self.truncated { " · truncated" } else { "" };
+        format!(
+            "[{kind}: {} · {} chars{suffix}]",
+            self.name,
+            self.body.chars().count()
+        )
+    }
+
+    fn model_text(self) -> String {
+        let mut header = format!("Attached file: {} ({})", self.name, self.mime);
+        if self.truncated {
+            header.push_str("\nExtraction notice: content was truncated to the attachment limit.");
+        }
+        if !self.warnings.is_empty() {
+            header.push_str("\nExtraction warnings: ");
+            header.push_str(&self.warnings.join("; "));
+        }
+        format!("{header}\n<<<\n{}\n>>>", self.body)
+    }
+}
+
+impl From<rho_tools::document::ExtractedDocument> for ChatTextDocument {
+    fn from(document: rho_tools::document::ExtractedDocument) -> Self {
+        Self {
+            name: document.name,
+            mime: document.mime,
+            body: document.text,
+            truncated: document.truncated,
+            warnings: document.warnings,
+        }
+    }
+}
+
+fn document_kind(name: &str, mime: &str) -> String {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| extension.to_ascii_lowercase())
+        .or_else(|| mime.split('/').next_back().map(str::to_owned))
+        .unwrap_or_else(|| "document".into())
+}

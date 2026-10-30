@@ -1,0 +1,588 @@
+use std::{
+    collections::VecDeque,
+    fmt,
+    future::Future,
+    num::NonZeroUsize,
+    panic::AssertUnwindSafe,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
+
+use tokio::sync::{mpsc, oneshot};
+
+use crate::{model::Message, CancellationToken, SessionId};
+
+use super::{CapabilityKind, CapabilityRequest};
+
+/// Run-scoped context supplied with an approval prompt.
+///
+/// Authorization builds this from the active tool call so handlers that need
+/// transcript or cancellation do not keep late-bound session state.
+#[derive(Clone, Debug)]
+pub struct ApprovalContext {
+    session_id: SessionId,
+    cancellation: CancellationToken,
+    history: Vec<Message>,
+}
+
+impl ApprovalContext {
+    pub fn new(
+        session_id: SessionId,
+        cancellation: CancellationToken,
+        history: Vec<Message>,
+    ) -> Self {
+        Self {
+            session_id,
+            cancellation,
+            history,
+        }
+    }
+
+    /// Empty history and a fresh cancellation token. Used when a caller has no
+    /// active run context (direct `ApprovalRequest::new` construction, tests).
+    pub fn detached(session_id: SessionId) -> Self {
+        Self::new(session_id, CancellationToken::new(), Vec::new())
+    }
+
+    /// Cancellation (and optional history) without a stable session identity.
+    ///
+    /// Used by authorization bundles that can still prompt in tests but have no
+    /// session on the scope. Prefer [`Self::new`] with the real session id in
+    /// production run paths.
+    pub fn anonymous(cancellation: CancellationToken, history: Vec<Message>) -> Self {
+        Self::new(SessionId::new(), cancellation, history)
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    pub fn history(&self) -> &[Message] {
+        &self.history
+    }
+}
+
+/// Host decision for one approval request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ApprovalDecision {
+    AllowOnce,
+    /// Remember only this exact structured request for the current session.
+    AllowForSession,
+    Deny {
+        reason: String,
+    },
+}
+
+/// Owned request supplied to an [`ApprovalHandler`].
+///
+/// Equality ignores [`ApprovalContext`]: context is run-scoped metadata for the
+/// prompt, not part of the capability identity hosts remember or compare.
+#[derive(Clone)]
+pub struct ApprovalRequest {
+    capability: CapabilityRequest,
+    reason: String,
+    tool_call_id: Option<crate::ToolCallId>,
+    context: ApprovalContext,
+}
+
+impl ApprovalRequest {
+    pub fn new(capability: CapabilityRequest, reason: impl Into<String>) -> Self {
+        Self {
+            capability,
+            reason: reason.into(),
+            tool_call_id: None,
+            context: ApprovalContext::detached(SessionId::new()),
+        }
+    }
+
+    pub(crate) fn with_tool_call_id(mut self, tool_call_id: Option<crate::ToolCallId>) -> Self {
+        self.tool_call_id = tool_call_id;
+        self
+    }
+
+    /// Attaches run-scoped transcript and cancellation for this prompt.
+    pub fn with_context(mut self, context: ApprovalContext) -> Self {
+        self.context = context;
+        self
+    }
+
+    pub fn capability(&self) -> &CapabilityRequest {
+        &self.capability
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// Identifies the tool call that requested approval during a run.
+    pub fn tool_call_id(&self) -> Option<&crate::ToolCallId> {
+        self.tool_call_id.as_ref()
+    }
+
+    /// Run-scoped transcript and cancellation for handlers that classify or
+    /// cancel with the active turn.
+    pub fn context(&self) -> &ApprovalContext {
+        &self.context
+    }
+}
+
+impl PartialEq for ApprovalRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.capability == other.capability
+            && self.reason == other.reason
+            && self.tool_call_id == other.tool_call_id
+    }
+}
+
+impl Eq for ApprovalRequest {}
+
+impl fmt::Debug for ApprovalRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovalRequest")
+            .field("capability_kind", &self.capability.kind())
+            .field("source", self.capability.source())
+            .field("correlated_tool_call", &self.tool_call_id.is_some())
+            .field("details", &"available through accessors")
+            .field("reason", &"[redacted]")
+            .field("session_id", self.context.session_id())
+            .field("history_len", &self.context.history().len())
+            .finish()
+    }
+}
+
+/// Future returned by approval handlers.
+pub type ApprovalFuture<'a> = Pin<Box<dyn Future<Output = ApprovalDecision> + Send + 'a>>;
+
+/// Host extension point for interactive or remote approval decisions.
+///
+/// Run-scoped transcript and cancellation ride on [`ApprovalRequest::context`].
+/// Handlers that ignore context keep implementing [`Self::request`] only.
+pub trait ApprovalHandler: Send + Sync {
+    fn request<'a>(&'a self, request: ApprovalRequest) -> ApprovalFuture<'a>;
+
+    /// When true, the runtime publishes the turn in flight for
+    /// [`crate::Session::live_history`] even if no registered tool declares
+    /// [`crate::tool::Tool::reads_live_history`].
+    fn reads_live_history(&self) -> bool {
+        false
+    }
+
+    /// How the runtime hands this handler requests that session memory does
+    /// not already allow. Defaults to [`ApprovalConcurrency::Serial`], which
+    /// suits a handler that prompts a person.
+    fn concurrency(&self) -> ApprovalConcurrency {
+        ApprovalConcurrency::Serial
+    }
+}
+
+/// How the runtime hands an [`ApprovalHandler`] requests that session memory
+/// does not already allow. Requests that memory allows never reach the handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ApprovalConcurrency {
+    /// One request at a time across the approval session. After each answer
+    /// the runtime re-checks session memory, so a concurrent identical request
+    /// observes an [`ApprovalDecision::AllowForSession`] instead of asking
+    /// again. Unrelated requests wait behind a slow answer.
+    Serial,
+    /// Requests as they arrive. For handlers that decide on their own, such
+    /// as an automated classifier, whose answers would otherwise queue behind
+    /// each other. The handler orders any prompts it shows a person, and
+    /// concurrent identical requests may each be asked.
+    Concurrent,
+}
+
+/// Shared approval state for one host-owned authorization session.
+///
+/// Clones use the same handler, exact-request memory, and audit log. A host can
+/// attach one value to several SDK runtimes and [`ToolHost`](crate::ToolHost)
+/// instances when those executors belong to one logical run.
+#[derive(Clone)]
+pub struct ApprovalSession {
+    handler: Arc<dyn ApprovalHandler>,
+    remembered: Arc<SessionApprovals>,
+    audit: Arc<ApprovalAuditLog>,
+}
+
+impl ApprovalSession {
+    pub fn new<A>(handler: A) -> Self
+    where
+        A: ApprovalHandler + 'static,
+    {
+        Self::from_shared(Arc::new(handler))
+    }
+
+    pub fn from_shared(handler: Arc<dyn ApprovalHandler>) -> Self {
+        Self {
+            handler,
+            remembered: Arc::default(),
+            audit: Arc::default(),
+        }
+    }
+
+    pub(crate) fn from_parts(
+        handler: Arc<dyn ApprovalHandler>,
+        remembered: Arc<SessionApprovals>,
+        audit: Arc<ApprovalAuditLog>,
+    ) -> Self {
+        Self {
+            handler,
+            remembered,
+            audit,
+        }
+    }
+
+    pub fn audit(&self) -> Vec<ApprovalAuditRecord> {
+        self.audit.snapshot()
+    }
+
+    pub(crate) fn handler(&self) -> Arc<dyn ApprovalHandler> {
+        Arc::clone(&self.handler)
+    }
+
+    pub(crate) fn remembered(&self) -> Arc<SessionApprovals> {
+        Arc::clone(&self.remembered)
+    }
+
+    pub(crate) fn audit_log(&self) -> Arc<ApprovalAuditLog> {
+        Arc::clone(&self.audit)
+    }
+}
+
+impl fmt::Debug for ApprovalSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovalSession")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Approval handler that denies every request.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DenyApprovals;
+
+impl ApprovalHandler for DenyApprovals {
+    fn request<'a>(&'a self, _request: ApprovalRequest) -> ApprovalFuture<'a> {
+        Box::pin(async {
+            ApprovalDecision::Deny {
+                reason: "no approval handler is configured".into(),
+            }
+        })
+    }
+}
+
+/// Cloneable approval handler backed by a bounded host request channel.
+#[derive(Clone, Debug)]
+pub struct ChannelApprovalHandler {
+    sender: mpsc::Sender<PendingApproval>,
+}
+
+impl ChannelApprovalHandler {
+    #[cfg(test)]
+    pub(crate) async fn wait_until_full(&self) {
+        while self.sender.capacity() > 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+impl ApprovalHandler for ChannelApprovalHandler {
+    fn request<'a>(&'a self, request: ApprovalRequest) -> ApprovalFuture<'a> {
+        Box::pin(async move {
+            let (response, receiver) = oneshot::channel();
+            let pending = PendingApproval {
+                request,
+                response: Some(response),
+            };
+            if self.sender.send(pending).await.is_err() {
+                return ApprovalDecision::Deny {
+                    reason: "approval request receiver was dropped".into(),
+                };
+            }
+            receiver.await.unwrap_or_else(|_| ApprovalDecision::Deny {
+                reason: "approval responder was dropped".into(),
+            })
+        })
+    }
+}
+
+/// Receiving side of a bounded approval request channel.
+#[derive(Debug)]
+pub struct ApprovalRequestReceiver {
+    receiver: mpsc::Receiver<PendingApproval>,
+}
+
+impl ApprovalRequestReceiver {
+    pub async fn recv(&mut self) -> Option<PendingApproval> {
+        while let Some(pending) = self.receiver.recv().await {
+            if pending.is_live() {
+                return Some(pending);
+            }
+        }
+        None
+    }
+}
+
+/// One pending approval with an exactly-once response slot.
+#[derive(Debug)]
+pub struct PendingApproval {
+    request: ApprovalRequest,
+    response: Option<oneshot::Sender<ApprovalDecision>>,
+}
+
+impl PendingApproval {
+    /// Build a pending approval for hosts and tests that drive the prompt directly.
+    pub fn new(request: ApprovalRequest) -> (Self, oneshot::Receiver<ApprovalDecision>) {
+        let (response, receiver) = oneshot::channel();
+        (
+            Self {
+                request,
+                response: Some(response),
+            },
+            receiver,
+        )
+    }
+
+    fn is_live(&self) -> bool {
+        self.response
+            .as_ref()
+            .is_some_and(|response| !response.is_closed())
+    }
+
+    pub fn request(&self) -> &ApprovalRequest {
+        &self.request
+    }
+
+    /// Completes the request. A second call returns the decision unchanged.
+    pub fn respond(&mut self, decision: ApprovalDecision) -> Result<(), ApprovalDecision> {
+        let Some(response) = self.response.take() else {
+            return Err(decision);
+        };
+        response.send(decision)
+    }
+}
+
+impl Drop for PendingApproval {
+    fn drop(&mut self) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(ApprovalDecision::Deny {
+                reason: "approval responder was dropped".into(),
+            });
+        }
+    }
+}
+
+pub fn approval_channel(
+    capacity: NonZeroUsize,
+) -> (ChannelApprovalHandler, ApprovalRequestReceiver) {
+    let (sender, receiver) = mpsc::channel(capacity.get());
+    (
+        ChannelApprovalHandler { sender },
+        ApprovalRequestReceiver { receiver },
+    )
+}
+
+/// Successful source of authorization returned to a tool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AuthorizationOutcome {
+    AllowedByPolicy,
+    AllowedOnce,
+    AllowedForSession,
+    AllowedByRememberedApproval,
+}
+
+/// Typed source of an authorization denial.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AuthorizationDenialKind {
+    Policy,
+    Host,
+    Cancelled,
+    /// A trusted pre-action hook narrowed the decision to a denial.
+    Hook,
+}
+
+/// Typed authorization failure available to tool implementations and hosts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizationError {
+    kind: AuthorizationDenialKind,
+    capability: CapabilityKind,
+    message: String,
+}
+
+impl AuthorizationError {
+    pub(crate) fn denied(
+        kind: AuthorizationDenialKind,
+        capability: CapabilityKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            capability,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn cancelled(capability: CapabilityKind) -> Self {
+        Self::denied(
+            AuthorizationDenialKind::Cancelled,
+            capability,
+            "authorization cancelled",
+        )
+    }
+
+    pub fn kind(&self) -> AuthorizationDenialKind {
+        self.kind
+    }
+
+    pub fn capability(&self) -> CapabilityKind {
+        self.capability
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for AuthorizationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "authorization denied: {}", self.message)
+    }
+}
+
+impl std::error::Error for AuthorizationError {}
+
+/// Secret-free approval decision retained in runtime diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApprovalAuditRecord {
+    sequence: u64,
+    capability: CapabilityKind,
+    decision: ApprovalAuditDecision,
+}
+
+impl ApprovalAuditRecord {
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn capability(&self) -> CapabilityKind {
+        self.capability
+    }
+
+    pub fn decision(&self) -> ApprovalAuditDecision {
+        self.decision
+    }
+}
+
+/// Sanitized approval result. Reasons, paths, commands, URLs, and environment
+/// values are intentionally not retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ApprovalAuditDecision {
+    AllowedOnce,
+    AllowedForSession,
+    AllowedByRememberedApproval,
+    DeniedByPolicy,
+    DeniedByHost,
+    Cancelled,
+    /// A trusted pre-action hook denied the request before any prompt.
+    DeniedByHook,
+}
+
+const MAX_AUDIT_RECORDS: usize = 1024;
+
+#[derive(Debug, Default)]
+pub(crate) struct ApprovalAuditLog {
+    records: Mutex<VecDeque<ApprovalAuditRecord>>,
+}
+
+impl ApprovalAuditLog {
+    pub(crate) fn record(&self, capability: CapabilityKind, decision: ApprovalAuditDecision) {
+        let mut records = self
+            .records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sequence = records.back().map_or(1, |record| record.sequence + 1);
+        if records.len() == MAX_AUDIT_RECORDS {
+            records.pop_front();
+        }
+        records.push_back(ApprovalAuditRecord {
+            sequence,
+            capability,
+            decision,
+        });
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<ApprovalAuditRecord> {
+        self.records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .copied()
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionApprovals {
+    exact_requests: Mutex<Vec<CapabilityRequest>>,
+    /// Serializes the miss path of approval evaluation: check remembered, prompt
+    /// the host if needed, then record `AllowForSession`. Waiters re-check under
+    /// the gate so an identical concurrent request observes the first decision
+    /// instead of prompting again.
+    ///
+    /// This is a session-wide prompt gate, not identical-only singleflight. A
+    /// slow host approval orders unrelated `RequireApproval` misses behind it.
+    /// Remembered hits stay outside the gate, and a handler that reports
+    /// [`ApprovalConcurrency::Concurrent`] skips it.
+    ///
+    /// Wrapped in `AssertUnwindSafe` so embedding `tokio::sync::Mutex` does not
+    /// strip `UnwindSafe` / `RefUnwindSafe` from public types that hold session
+    /// state (`Session`). The gate only orders cooperative approval work.
+    approval_gate: AssertUnwindSafe<tokio::sync::Mutex<()>>,
+}
+
+impl Default for SessionApprovals {
+    fn default() -> Self {
+        Self {
+            exact_requests: Mutex::new(Vec::new()),
+            approval_gate: AssertUnwindSafe(tokio::sync::Mutex::new(())),
+        }
+    }
+}
+
+impl SessionApprovals {
+    pub(crate) fn contains(&self, request: &CapabilityRequest) -> bool {
+        self.exact_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(request)
+    }
+
+    pub(crate) fn remember(&self, request: CapabilityRequest) {
+        let mut requests = self
+            .exact_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !requests.contains(&request) {
+            requests.push(request);
+        }
+    }
+
+    pub(crate) fn approval_gate(&self) -> &tokio::sync::Mutex<()> {
+        &self.approval_gate.0
+    }
+}
+
+impl fmt::Debug for dyn ApprovalHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ApprovalHandler(..)")
+    }
+}

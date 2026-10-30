@@ -1,0 +1,290 @@
+//! History scrolling, scrollbar chrome, and jump-to-bottom for the transcript view.
+
+use std::time::Instant;
+
+use crossterm::event::KeyEvent;
+use ratatui::{
+    backend::Backend,
+    text::{Line, Span},
+    Terminal,
+};
+
+use crate::keybindings::ReservedComposerKey;
+
+use super::{
+    activity,
+    history_cache::HistoryRenderSettings,
+    screen_layout::ScreenLayout,
+    scrollbar::{unmeasured_prefix_scroll_need, unmeasured_prefix_scrollbar_top_need},
+    App, ComposerMode, HistoryScroll, HistoryScrollbar, Theme, HISTORY_SCROLLBAR_REVEAL_DURATION,
+};
+
+impl App {
+    pub(super) fn ensure_measured_history_suffix(
+        &mut self,
+        settings: HistoryRenderSettings,
+        viewport: usize,
+    ) {
+        // One extra pane so wheel/page-up does not wrap on the first notch.
+        let min_lines = viewport.saturating_add(viewport.max(1));
+        let cwd = &self.info.runtime.cwd;
+        self.history
+            .with_lines_and_images_mut(|cache, entries, images| {
+                cache.ensure_suffix(entries, settings, min_lines, &|index, sources| {
+                    images.ready_images(index, sources, cwd)
+                });
+            });
+    }
+
+    pub(super) fn grow_measured_history_prefix(
+        &mut self,
+        settings: HistoryRenderSettings,
+        extra_lines: usize,
+    ) -> usize {
+        let cwd = &self.info.runtime.cwd;
+        self.history
+            .with_lines_and_images_mut(|cache, entries, images| {
+                cache.grow_prefix(entries, settings, extra_lines, &|index, sources| {
+                    images.ready_images(index, sources, cwd)
+                })
+            })
+    }
+
+    pub(super) fn scroll_history_to_bottom(&mut self) {
+        self.history.scroll_to_bottom();
+    }
+
+    pub(super) fn scroll_history_lines(
+        &mut self,
+        layout: &ScreenLayout,
+        settings: HistoryRenderSettings,
+        delta: isize,
+    ) {
+        let content_height = layout.history_content.height as usize;
+        let history_len = layout.history_len;
+        let start = self.visible_history_start(history_len, content_height);
+        let had_unmeasured = self.history.has_unmeasured_prefix();
+        let overflow = unmeasured_prefix_scroll_need(start, delta, had_unmeasured);
+        if overflow > 0 {
+            // One extra pane so the next wheel ticks do not wrap immediately.
+            let prepended =
+                self.grow_measured_history_prefix(settings, overflow.max(content_height.max(1)));
+            let header_inserted = had_unmeasured && !self.history.has_unmeasured_prefix();
+            let header_shift = if header_inserted {
+                self.visible_session_header_len(settings.width)
+            } else {
+                0
+            };
+            let new_len = history_len
+                .saturating_add(prepended)
+                .saturating_add(header_shift);
+            let new_start = start
+                .saturating_add(prepended)
+                .saturating_add(header_shift)
+                .saturating_add_signed(delta);
+            self.history
+                .scroll_chrome_mut()
+                .set_top_line(new_len, content_height, new_start);
+            return;
+        }
+        self.history
+            .scroll_chrome_mut()
+            .scroll_by(history_len, content_height, delta);
+    }
+
+    /// Measure unmeasured prefix entries, one pane at a time, until
+    /// `deadline` passes or the transcript starts. Always measures at least
+    /// one entry, so repeated calls finish. A manual viewport keeps showing
+    /// the same rows; following the bottom stays at the bottom.
+    pub(super) fn measure_history_prefix_until(
+        &mut self,
+        layout: &ScreenLayout,
+        settings: HistoryRenderSettings,
+        deadline: Instant,
+    ) {
+        if !self.history.has_unmeasured_prefix() {
+            return;
+        }
+        let content_height = layout.history_content.height as usize;
+        let start = self.visible_history_start(layout.history_len, content_height);
+        let mut prepended = 0usize;
+        loop {
+            prepended = prepended
+                .saturating_add(self.grow_measured_history_prefix(settings, content_height.max(1)));
+            if !self.history.has_unmeasured_prefix() || Instant::now() >= deadline {
+                break;
+            }
+        }
+        // The session header joins the document once no prefix is unmeasured.
+        // Rows only grew above the viewport, so a manual position holds even
+        // when it is the last screenful, such as a focused search hit.
+        let shift = prepended.saturating_add(self.visible_session_header_len(settings.width));
+        if matches!(self.history.scroll(), HistoryScroll::Manual { .. }) {
+            self.history.scroll_chrome_mut().hold_top_line(
+                layout.history_len.saturating_add(shift),
+                content_height,
+                start.saturating_add(shift),
+            );
+        }
+    }
+
+    /// Dragging the bar to the measured top wraps one more pane of prefix.
+    ///
+    /// Same bound as page-up so a long resume does not wrap the whole
+    /// transcript on one click. Another drag at line 0 pulls the next pane.
+    pub(super) fn reveal_unmeasured_history_at_scrollbar_top(
+        &mut self,
+        layout: &ScreenLayout,
+        settings: HistoryRenderSettings,
+    ) {
+        let content_height = layout.history_content.height as usize;
+        let history_len = layout.history_len;
+        let extra = unmeasured_prefix_scrollbar_top_need(
+            self.visible_history_start(history_len, content_height),
+            self.history.has_unmeasured_prefix(),
+            content_height,
+        );
+        if extra == 0 {
+            return;
+        }
+        let prepended = self.grow_measured_history_prefix(settings, extra);
+        if prepended == 0 {
+            return;
+        }
+        self.history.scroll_chrome_mut().pin_top_line(
+            history_len.saturating_add(prepended),
+            content_height,
+            0,
+        );
+    }
+
+    pub(super) fn reveal_history_scrollbar(&mut self, now: Instant) {
+        self.history
+            .reveal_scrollbar(now, HISTORY_SCROLLBAR_REVEAL_DURATION);
+    }
+
+    pub(super) fn hide_history_scrollbar(&mut self) {
+        self.history.hide_scrollbar();
+    }
+
+    pub(super) fn should_render_history_scrollbar(&self, now: Instant) -> bool {
+        self.history.should_render_scrollbar(now)
+    }
+
+    pub(super) fn update_history_scrollbar_hover(
+        &mut self,
+        scrollbar: Option<HistoryScrollbar>,
+        column: u16,
+        row: u16,
+    ) {
+        self.history
+            .scroll_chrome_mut()
+            .update_hover(scrollbar, column, row);
+    }
+
+    pub(super) fn clamp_history_scroll_for_terminal<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+    ) -> Result<(), B::Error> {
+        let size = terminal.size()?;
+        let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+        let ctx = self.frame_context(area);
+        self.history
+            .scroll_chrome_mut()
+            .clamp(ctx.history_len, ctx.layout.history_content.height as usize);
+        Ok(())
+    }
+
+    pub(super) fn jump_to_bottom_line(&self, width: usize) -> Line<'static> {
+        let state = self.jump_chip_state();
+        let text = self.jump_to_bottom_text(width, state);
+        let binding = self.info.runtime.keybindings.jump_to_bottom.to_string();
+        let Some(action) = text.strip_suffix(&binding) else {
+            return Line::styled(text, Theme::jump_to_bottom());
+        };
+        let action_style = if state.is_attention() {
+            Theme::jump_to_bottom_attention()
+        } else {
+            Theme::jump_to_bottom()
+        };
+        Line::from(vec![
+            Span::styled(action.to_string(), action_style),
+            Span::styled(binding, Theme::jump_to_bottom_shortcut()),
+        ])
+    }
+
+    /// What the jump chip should say right now. Only meaningful when the chip
+    /// is visible (history scrolled away from bottom).
+    pub(super) fn jump_chip_state(&self) -> activity::JumpChipState {
+        if matches!(self.history.scroll(), HistoryScroll::Bottom) {
+            return activity::JumpChipState::Neutral;
+        }
+        match self.input_ui.composer() {
+            ComposerMode::Approval(_) => activity::JumpChipState::ApprovalNeeded,
+            ComposerMode::Questionnaire(_) => activity::JumpChipState::InputNeeded,
+            _ if self.turn_finished_attention => activity::JumpChipState::ResponseReady,
+            _ => activity::JumpChipState::Neutral,
+        }
+    }
+
+    /// Expire the response-ready cue once the user is back at bottom. Called
+    /// per frame so every scroll path (keys, wheel, drag, jump) clears it
+    /// without each having to know about the flag.
+    pub(super) fn settle_turn_finished_attention(&mut self) {
+        if self.history.scroll() == HistoryScroll::Bottom {
+            self.turn_finished_attention = false;
+        }
+    }
+
+    pub(super) fn jump_to_bottom_text(
+        &self,
+        width: usize,
+        state: activity::JumpChipState,
+    ) -> String {
+        activity::jump_to_bottom_text(
+            width,
+            &self.info.runtime.keybindings.jump_to_bottom.to_string(),
+            /*alongside_activity*/ self.activity_status().is_some(),
+            state,
+        )
+    }
+
+    pub(super) fn handle_history_key<B: Backend>(
+        &mut self,
+        key: KeyEvent,
+        terminal: &mut Terminal<B>,
+    ) -> Result<bool, B::Error> {
+        if self.input_ui.composer().is_centered_overlay() {
+            return Ok(false);
+        }
+        match ReservedComposerKey::from_key(key) {
+            Some(
+                direction @ (ReservedComposerKey::HistoryPageUp
+                | ReservedComposerKey::HistoryPageDown),
+            ) => {
+                let size = terminal.size()?;
+                let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+                let ctx = self.frame_context(area);
+                self.reveal_history_scrollbar(Instant::now());
+                self.history.set_scrollbar_drag(None);
+                let page = (ctx.layout.history_content.height as usize).max(1) as isize;
+                let delta = if direction == ReservedComposerKey::HistoryPageUp {
+                    -page
+                } else {
+                    page
+                };
+                self.scroll_history_lines(&ctx.layout, ctx.settings, delta);
+                self.input_ui.clear_paste_burst();
+                self.ctrl_c_streak = 0;
+                Ok(true)
+            }
+            _ if self.info.runtime.keybindings.jump_to_bottom.matches(key) => {
+                self.scroll_history_to_bottom();
+                self.input_ui.clear_paste_burst();
+                self.ctrl_c_streak = 0;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+}

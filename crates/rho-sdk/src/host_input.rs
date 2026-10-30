@@ -1,0 +1,448 @@
+use std::{collections::BTreeMap, fmt};
+
+use tokio::sync::{mpsc, oneshot};
+
+use crate::{CancellationToken, Error, HostInputId};
+
+use serde_json::Value;
+
+/// One selectable answer in a host question.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostChoice {
+    value: String,
+    label: String,
+    description: Option<String>,
+}
+
+impl HostChoice {
+    pub fn new(value: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            label: label.into(),
+            description: None,
+        }
+    }
+
+    /// Add short supporting text that hosts may show below the choice label.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn description_text(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+/// Selection mode for a host question.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SelectionMode {
+    One,
+    Many,
+}
+
+/// How a host should apply a question's default value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DefaultSelection {
+    /// Pre-select the default answer.
+    #[default]
+    Selected,
+    /// Focus the default choice without selecting it. Hosts may mark it as
+    /// recommended so the user still confirms consciously.
+    Focused,
+}
+
+/// One structured question presented by a host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostQuestion {
+    id: String,
+    prompt: String,
+    header: Option<String>,
+    choices: Vec<HostChoice>,
+    selection: SelectionMode,
+    allow_other: bool,
+    help: Option<String>,
+    default: Option<Value>,
+    default_selection: DefaultSelection,
+    required: bool,
+}
+
+impl HostQuestion {
+    pub fn new(
+        id: impl Into<String>,
+        prompt: impl Into<String>,
+        choices: Vec<HostChoice>,
+        selection: SelectionMode,
+    ) -> Result<Self, Error> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(Error::InvalidHostResponse {
+                message: "host question ID must not be empty".into(),
+            });
+        }
+        if choices.is_empty() {
+            return Err(Error::InvalidHostResponse {
+                message: format!("host question '{id}' must have at least one choice"),
+            });
+        }
+        let mut values = std::collections::BTreeSet::new();
+        if choices.iter().any(|choice| !values.insert(&choice.value)) {
+            return Err(Error::InvalidHostResponse {
+                message: format!("host question '{id}' choice values must be unique"),
+            });
+        }
+        Ok(Self {
+            id,
+            prompt: prompt.into(),
+            header: None,
+            choices,
+            selection,
+            allow_other: false,
+            help: None,
+            default: None,
+            default_selection: DefaultSelection::Selected,
+            required: true,
+        })
+    }
+
+    pub fn allow_other(mut self) -> Self {
+        self.allow_other = true;
+        self
+    }
+
+    /// Very short label hosts may show in place of the full prompt where
+    /// space is tight, such as a question tab.
+    pub fn header(mut self, header: impl Into<String>) -> Self {
+        self.header = Some(header.into());
+        self
+    }
+
+    pub fn help(mut self, help: impl Into<String>) -> Self {
+        self.help = Some(help.into());
+        self
+    }
+
+    pub fn default_value(mut self, default: Value) -> Self {
+        self.default = Some(default);
+        self
+    }
+
+    /// Control whether `default_value` pre-selects or only focuses the choice.
+    pub fn default_selection(mut self, selection: DefaultSelection) -> Self {
+        self.default_selection = selection;
+        self
+    }
+
+    pub fn optional(mut self) -> Self {
+        self.required = false;
+        self
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub fn header_text(&self) -> Option<&str> {
+        self.header.as_deref()
+    }
+
+    pub fn choices(&self) -> &[HostChoice] {
+        &self.choices
+    }
+
+    pub fn selection(&self) -> SelectionMode {
+        self.selection
+    }
+
+    pub fn permits_other(&self) -> bool {
+        self.allow_other
+    }
+
+    pub fn help_text(&self) -> Option<&str> {
+        self.help.as_deref()
+    }
+
+    pub fn default_value_ref(&self) -> Option<&Value> {
+        self.default.as_ref()
+    }
+
+    pub fn default_selection_mode(&self) -> DefaultSelection {
+        self.default_selection
+    }
+
+    pub fn is_required(&self) -> bool {
+        self.required
+    }
+}
+
+/// Typed questionnaire request emitted by an SDK run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostInputRequest {
+    id: HostInputId,
+    title: String,
+    questions: Vec<HostQuestion>,
+    timeout_fallback: Option<(HostInputResponse, String)>,
+}
+
+impl HostInputRequest {
+    pub fn questionnaire(
+        title: impl Into<String>,
+        questions: Vec<HostQuestion>,
+    ) -> Result<Self, Error> {
+        if questions.is_empty() {
+            return Err(Error::InvalidHostResponse {
+                message: "host questionnaire must contain at least one question".into(),
+            });
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        if questions.iter().any(|question| !ids.insert(&question.id)) {
+            return Err(Error::InvalidHostResponse {
+                message: "host questionnaire question IDs must be unique".into(),
+            });
+        }
+        Ok(Self {
+            id: HostInputId::new(),
+            title: title.into(),
+            questions,
+            timeout_fallback: None,
+        })
+    }
+
+    /// Offer explicit fallback answers for a safe, reversible decision. Hosts
+    /// decide whether and when to use them; defaults never authorize a timeout.
+    /// Never use this for permissions or other authorization.
+    pub fn with_timeout_fallback(
+        mut self,
+        mut response: HostInputResponse,
+        reason: impl Into<String>,
+    ) -> Result<Self, Error> {
+        self.validate_answers(&response)?;
+        let reason = reason.into();
+        if reason.trim().is_empty() {
+            return Err(Error::InvalidHostResponse {
+                message: "timeout fallback reason must not be empty".into(),
+            });
+        }
+        response.source = HostInputSource::TimeoutFallback;
+        self.timeout_fallback = Some((response, reason));
+        Ok(self)
+    }
+
+    /// Validated answers a host may submit after its own inactivity deadline.
+    pub fn timeout_fallback(&self) -> Option<&HostInputResponse> {
+        self.timeout_fallback.as_ref().map(|(response, _)| response)
+    }
+
+    pub fn timeout_reason(&self) -> Option<&str> {
+        self.timeout_fallback
+            .as_ref()
+            .map(|(_, reason)| reason.as_str())
+    }
+
+    pub fn id(&self) -> &HostInputId {
+        &self.id
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn questions(&self) -> &[HostQuestion] {
+        &self.questions
+    }
+
+    pub fn validate(&self, response: &HostInputResponse) -> Result<(), Error> {
+        if response.source == HostInputSource::TimeoutFallback
+            && self.timeout_fallback() != Some(response)
+        {
+            return Err(Error::InvalidHostResponse {
+                message: "timeout response must match the request's explicit fallback".into(),
+            });
+        }
+        self.validate_answers(response)
+    }
+
+    fn validate_answers(&self, response: &HostInputResponse) -> Result<(), Error> {
+        if let Some(question_id) = response
+            .answers
+            .keys()
+            .find(|id| !self.questions.iter().any(|question| &question.id == *id))
+        {
+            return Err(Error::InvalidHostResponse {
+                message: format!("host response contains unknown question '{question_id}'"),
+            });
+        }
+        for question in &self.questions {
+            let Some(answers) = response.answers.get(&question.id) else {
+                if question.required {
+                    return Err(Error::InvalidHostResponse {
+                        message: format!("host response is missing question '{}'", question.id),
+                    });
+                }
+                continue;
+            };
+            if (answers.is_empty() && question.required)
+                || (question.selection == SelectionMode::One && answers.len() > 1)
+            {
+                return Err(Error::InvalidHostResponse {
+                    message: format!("invalid answer count for question '{}'", question.id),
+                });
+            }
+            let mut unique = std::collections::BTreeSet::new();
+            for answer in answers {
+                if !unique.insert(answer) {
+                    return Err(Error::InvalidHostResponse {
+                        message: format!("duplicate answer for question '{}'", question.id),
+                    });
+                }
+                let known = question
+                    .choices
+                    .iter()
+                    .any(|choice| choice.value == *answer);
+                if !known && !question.allow_other {
+                    return Err(Error::InvalidHostResponse {
+                        message: format!("unknown answer for question '{}'", question.id),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Origin of host answers. A timeout fallback is not user authorization.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostInputSource {
+    #[default]
+    User,
+    TimeoutFallback,
+}
+
+/// Why a host answered a host input request without answers.
+///
+/// Hosts send one through [`crate::Run::request_refuse`]; the asking tool
+/// receives [`crate::Error::HostInputRefused`] and decides how to carry on,
+/// for example by failing its call so the model can continue without it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HostInputRefusal {
+    /// The user explicitly declined to answer.
+    Declined,
+    /// The user dismissed the request without choosing.
+    Dismissed,
+}
+
+/// Structured host answers keyed by question ID, with their origin.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostInputResponse {
+    answers: BTreeMap<String, Vec<String>>,
+    source: HostInputSource,
+}
+
+impl HostInputResponse {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn answer(
+        mut self,
+        question_id: impl Into<String>,
+        values: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.answers.insert(
+            question_id.into(),
+            values.into_iter().map(Into::into).collect(),
+        );
+        self
+    }
+
+    pub fn answers(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.answers
+    }
+
+    pub fn source(&self) -> HostInputSource {
+        self.source
+    }
+
+    /// Preserve provenance while adapting host answers. Timeout responses are
+    /// accepted only when they exactly match the request's explicit fallback.
+    pub fn with_source(mut self, source: HostInputSource) -> Self {
+        self.source = source;
+        self
+    }
+}
+
+pub(crate) struct HostInputEnvelope {
+    pub(crate) request: HostInputRequest,
+    pub(crate) response: oneshot::Sender<Result<HostInputResponse, Error>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct HostInputRequester {
+    sender: mpsc::Sender<HostInputEnvelope>,
+    cancellation: CancellationToken,
+}
+
+impl HostInputRequester {
+    pub(crate) fn new(
+        sender: mpsc::Sender<HostInputEnvelope>,
+        cancellation: CancellationToken,
+    ) -> Self {
+        Self {
+            sender,
+            cancellation,
+        }
+    }
+
+    pub(crate) async fn request(
+        &self,
+        request: HostInputRequest,
+    ) -> Result<HostInputResponse, Error> {
+        let (response, receiver) = oneshot::channel();
+        tokio::select! {
+            result = self.sender.send(HostInputEnvelope { request, response }) => {
+                result.map_err(|_| Error::Interrupted {
+                    message: "run stopped accepting host input requests".into(),
+                })?;
+            }
+            () = self.cancellation.cancelled() => return Err(Error::Cancelled),
+        }
+        tokio::select! {
+            result = receiver => result.map_err(|_| Error::Interrupted {
+                message: "host input request was dropped without a response".into(),
+            })?,
+            () = self.cancellation.cancelled() => Err(Error::Cancelled),
+        }
+    }
+}
+
+impl fmt::Debug for HostInputRequester {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostInputRequester")
+            .field("cancelled", &self.cancellation.is_cancelled())
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) fn channel(
+    capacity: usize,
+    cancellation: CancellationToken,
+) -> (HostInputRequester, mpsc::Receiver<HostInputEnvelope>) {
+    let (sender, receiver) = mpsc::channel(capacity);
+    (HostInputRequester::new(sender, cancellation), receiver)
+}

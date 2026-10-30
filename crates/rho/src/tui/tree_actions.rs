@@ -1,0 +1,142 @@
+use crate::tui::DefaultTerminal;
+
+use crate::session::tree::{NodeId, SessionTreeItem, SessionTreeItemKind};
+
+use super::{
+    picker::OverlayChrome, App, ComposerMode, Entry, InteractiveRuntime, PickerBadge,
+    PickerBadgeTone, PickerItem, PickerLayout, UiPicker, ViewModelEvent,
+};
+
+pub(super) fn tree_picker(items: Vec<SessionTreeItem>) -> UiPicker {
+    let selected = items.iter().position(|item| item.active).unwrap_or(0);
+    let picker_items = items.into_iter().map(tree_item).collect();
+    let mut picker = UiPicker::tree("Conversation tree", picker_items)
+        .with_layout(PickerLayout::Overlay)
+        .with_overlay_chrome(OverlayChrome {
+            nav_label: " TREE".into(),
+            detail_label: None,
+            nav_keys_hint: "↑↓ turns".into(),
+        })
+        .with_confirm_verb("restore");
+    picker.selected = selected;
+    picker
+}
+
+fn tree_item(item: SessionTreeItem) -> PickerItem {
+    let preview = tree_preview(&item);
+    PickerItem {
+        badge: item.active.then_some(PickerBadge {
+            text: "active".into(),
+            tone: PickerBadgeTone::Selected,
+        }),
+        ..PickerItem::new(tree_label(&item, &preview), item.id.to_string())
+    }
+}
+
+fn tree_preview(item: &SessionTreeItem) -> String {
+    match item.kind {
+        SessionTreeItemKind::SessionStart => "Session start".into(),
+        SessionTreeItemKind::Turn => item
+            .first_user_text
+            .clone()
+            .unwrap_or_else(|| "turn".into()),
+        SessionTreeItemKind::Compaction => item.compaction_facts.as_ref().map_or_else(
+            || "Compacted context".into(),
+            |facts| {
+                format!(
+                    "Compacted context ({} → {} messages)",
+                    facts.previous_messages, facts.current_messages
+                )
+            },
+        ),
+    }
+}
+
+fn tree_label(item: &SessionTreeItem, preview: &str) -> String {
+    let mut connector = item
+        .ancestor_has_next_sibling
+        .iter()
+        .map(|has_next| if *has_next { "│  " } else { "   " })
+        .collect::<String>();
+    if item.depth > 0 {
+        connector.push_str(if item.is_last_sibling {
+            "└─ "
+        } else {
+            "├─ "
+        });
+    }
+    let path = if item.on_active_path { "◆ " } else { "◇ " };
+    format!("{connector}{path}{preview}")
+}
+
+impl App {
+    pub(super) fn execute_tree_command(
+        &mut self,
+        agent: &InteractiveRuntime,
+    ) -> anyhow::Result<()> {
+        if self.info.session.no_save {
+            self.set_status("conversation tree unavailable with --no-save");
+            return Ok(());
+        }
+        let Some(storage) = agent.stored_session() else {
+            self.set_status("no active session tree; send a message first");
+            return Ok(());
+        };
+        let items = storage.tree_items()?;
+        if items.is_empty() {
+            self.set_status("this session tree has no turns");
+            return Ok(());
+        }
+        self.input_ui
+            .set_composer(ComposerMode::Picker(tree_picker(items)));
+        self.set_status("select conversation state");
+        Ok(())
+    }
+
+    pub(super) async fn submit_tree_selection(
+        &mut self,
+        value: &str,
+        _terminal: &mut DefaultTerminal,
+        agent: &mut InteractiveRuntime,
+    ) -> anyhow::Result<()> {
+        let target_id = NodeId::from_string(value)?;
+        let storage = agent
+            .stored_session()
+            .ok_or_else(|| anyhow::anyhow!("active session storage is unavailable"))?;
+        let histories = storage.histories_for_node(&target_id)?;
+        let entries = self.transcript_entries(&histories.display);
+        agent.select_tree_node(storage, &target_id).await?;
+        self.info.runtime.added_dirs = agent.added_dirs().clone();
+
+        self.present_tree_selection(entries, &target_id, agent);
+        Ok(())
+    }
+
+    pub(super) fn present_tree_selection(
+        &mut self,
+        entries: Vec<Entry>,
+        target_id: &NodeId,
+        agent: &mut InteractiveRuntime,
+    ) {
+        self.input_ui.set_composer(ComposerMode::Input);
+        self.input_ui.clear_text();
+        self.input_ui.clear_paste_segments();
+        self.input_ui.set_shell_mode(None);
+        self.input_ui.set_cursor(0);
+        self.input_ui.set_command_palette_dismissed(false);
+        self.reset_streams();
+        self.goal = None;
+        self.reset_usage();
+        self.usage.current_context = None;
+        self.set_history_entries(entries);
+        self.scroll_history_to_bottom();
+        if let Some(context) = agent.take_context_usage() {
+            self.record_agent_event(ViewModelEvent::ContextUsage(context));
+        }
+        self.insert_runtime_notices(agent);
+        self.set_status(format!(
+            "restored conversation state {}",
+            &target_id.as_str()[..target_id.as_str().len().min(8)]
+        ));
+    }
+}

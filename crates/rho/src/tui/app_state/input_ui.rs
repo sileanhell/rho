@@ -1,0 +1,591 @@
+//! Composer text, paste handling, command/file palettes, and input history.
+
+use std::time::Instant;
+
+use crossterm::event::KeyEvent;
+
+use crate::tui::{
+    click_sequence::ClickSequence,
+    composer_attachments::ComposerAttachmentSlot,
+    composer_buffer::ComposerBuffer,
+    composer_vim::{VimOutcome, VimState},
+    feed_image::FeedImage,
+    inline_shell::InlineShellMode,
+    paste_burst::PasteBurst,
+    ChatMedia, ComposerAttachment, ComposerMode, InputDraft, InputSubmissionMode, MediaAttachId,
+    PasteSegment, PendingAttachmentSource,
+};
+
+#[derive(Debug)]
+pub(in crate::tui) struct AttachmentsPending;
+
+/// Composer text, paste handling, command/file palettes, and input history.
+#[derive(Default)]
+pub(in crate::tui) struct InputUi {
+    /// Text, caret, selection, paste markers, and the painted row window.
+    buffer: ComposerBuffer,
+    /// Vim mode and register; consulted only with `editing_mode = "vim"`.
+    vim: VimState,
+    shell_mode: Option<InlineShellMode>,
+    /// Char offset of the word Tab opened path completion on, in shell mode.
+    /// `None` while completion is closed. The palette itself is derived from
+    /// text and cursor, like the `@` palette.
+    shell_completion_anchor: Option<usize>,
+    attachments: Vec<ComposerAttachmentSlot>,
+    /// Bumped on every attachment mutation so composer layout caches invalidate.
+    attachment_epoch: u64,
+    history: Vec<String>,
+    history_cursor: Option<usize>,
+    history_draft: Option<InputDraft>,
+    paste_burst: PasteBurst,
+    submission_mode: InputSubmissionMode,
+    command_selection: usize,
+    /// Whether arrow keys moved the palette highlight since the palette
+    /// question last changed. Enter folds argument rows into the composer
+    /// only after such a pick; the default highlight stays a suggestion.
+    command_selection_explicit: bool,
+    command_prefix: Option<String>,
+    command_palette_dismissed: bool,
+    file_selection: usize,
+    /// First painted row of whichever palette is open. Kept across frames so
+    /// the window only scrolls when the highlight leaves it.
+    palette_window_start: usize,
+    file_query: Option<String>,
+    file_palette_dismissed: bool,
+    composer: ComposerMode,
+    /// Pointer state scoped to the current composer mode; reset as one value
+    /// whenever the mode changes.
+    pointer: ComposerPointerState,
+}
+
+/// Pointer state that belongs to one composer mode. Replacing the mode resets
+/// all of it at once, which is what keeps a pending [`PointerAction`] from
+/// ever applying to a mode the pointer did not act on.
+#[derive(Default)]
+struct ComposerPointerState {
+    clicks: ClickSequence,
+    hovered_copy: bool,
+    /// Whether this mode has reached the screen. Clicks on composer choices
+    /// wait for this so they never land on rows the user has not seen yet.
+    painted: bool,
+    /// One-shot async follow-up a pointer event asked for. The pointer
+    /// handler is sync and backend-generic, so the event loop takes this right
+    /// after the mouse event and runs it with the terminal and runtime.
+    action: Option<PointerAction>,
+}
+
+/// Async work a pointer event hands to the event loop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::tui) enum PointerAction {
+    /// Confirm the focused inline choice option, like Enter.
+    ConfirmInlineChoice,
+    /// Submit the highlighted picker row, like Enter.
+    SubmitPicker,
+    /// Run a slash command as if typed and submitted, e.g. from a clicked
+    /// statusline field. Carries the full command text (`/permissions`).
+    RunCommand(String),
+}
+
+impl InputUi {
+    /// Clear composer text state after a successful submit.
+    pub(in crate::tui) fn clear_submitted(&mut self) {
+        self.buffer.clear();
+        self.reset_vim();
+        self.shell_mode = None;
+        self.shell_completion_anchor = None;
+        self.pointer.clicks.cancel();
+        self.attachments.clear();
+        self.attachment_epoch = self.attachment_epoch.wrapping_add(1);
+    }
+
+    pub(in crate::tui) fn expanded_text(&self) -> String {
+        self.buffer.expanded_text()
+    }
+
+    pub(in crate::tui) fn has_pending_draft(&self) -> bool {
+        !self.buffer.is_empty()
+            || self.shell_mode.is_some()
+            || !self.attachments.is_empty()
+            || self.paste_burst.has_pending()
+    }
+
+    pub(in crate::tui) fn reset_history_navigation(&mut self) {
+        self.history_cursor = None;
+        self.history_draft = None;
+    }
+
+    /// The editable text model; palettes and shell mode stay on `InputUi`.
+    pub(in crate::tui) fn buffer(&self) -> &ComposerBuffer {
+        &self.buffer
+    }
+
+    pub(in crate::tui) fn buffer_mut(&mut self) -> &mut ComposerBuffer {
+        &mut self.buffer
+    }
+
+    pub(in crate::tui) fn vim(&self) -> &VimState {
+        &self.vim
+    }
+
+    pub(in crate::tui) fn vim_key(&mut self, key: KeyEvent) -> VimOutcome {
+        self.vim.handle_key(key, &mut self.buffer)
+    }
+
+    /// Reset mode and release any insert-session undo group together.
+    pub(in crate::tui) fn reset_vim(&mut self) {
+        self.vim.reset();
+        self.buffer.end_undo_group();
+    }
+
+    pub(in crate::tui) fn set_text_and_cursor(&mut self, text: String, cursor: usize) {
+        self.buffer.set_text_and_cursor(text, cursor);
+        self.pointer.clicks.cancel();
+    }
+
+    pub(in crate::tui) fn apply_input_draft(&mut self, draft: InputDraft) {
+        self.set_shell_mode(draft.shell_mode);
+        self.buffer.replace_all(draft.input, draft.paste_segments);
+        self.submission_mode = draft.submission_mode;
+        self.pointer.clicks.cancel();
+    }
+
+    pub(in crate::tui) fn text(&self) -> &str {
+        self.buffer.text()
+    }
+
+    pub(in crate::tui) fn set_text(&mut self, text: String) {
+        self.buffer.set_text(text);
+        self.pointer.clicks.cancel();
+    }
+
+    pub(in crate::tui) fn clear_text(&mut self) {
+        self.set_text(String::new());
+    }
+
+    pub(in crate::tui) fn char_len(&self) -> usize {
+        self.buffer.char_len()
+    }
+
+    pub(in crate::tui) fn cursor(&self) -> usize {
+        self.buffer.cursor()
+    }
+
+    pub(in crate::tui) fn set_cursor(&mut self, cursor: usize) {
+        self.buffer.set_cursor(cursor);
+    }
+
+    pub(in crate::tui) fn composer_view_start(&self) -> usize {
+        self.buffer.view_start()
+    }
+
+    /// Retain the painted composer window and wrap width (see
+    /// [`ComposerBuffer::retain_paint`]).
+    pub(in crate::tui) fn retain_composer_paint(&mut self, view_start: usize, wrap_width: usize) {
+        self.buffer.retain_paint(view_start, wrap_width);
+    }
+
+    pub(in crate::tui) fn selection_dragging(&self) -> bool {
+        self.buffer.selection_dragging()
+    }
+
+    /// Highlight/edit range when the selection spans at least one character.
+    pub(in crate::tui) fn selection_range(&self) -> Option<std::ops::Range<usize>> {
+        self.buffer.selection_range()
+    }
+
+    /// Keep a non-empty selection after mouse release; drop a collapsed click.
+    pub(in crate::tui) fn finalize_selection(&mut self) {
+        self.buffer.finalize_selection();
+    }
+
+    pub(in crate::tui) fn clear_selection(&mut self) {
+        self.buffer.clear_selection();
+    }
+
+    /// Record a pointer press on `index` and report whether it completes a
+    /// double click (see [`ClickSequence`]).
+    pub(in crate::tui) fn register_pointer_click(
+        &mut self,
+        now: Instant,
+        column: u16,
+        row: u16,
+        index: usize,
+    ) -> bool {
+        self.pointer.clicks.register(now, column, row, index)
+    }
+
+    pub(in crate::tui) fn cancel_pointer_click_sequence(&mut self) {
+        self.pointer.clicks.cancel();
+    }
+
+    pub(in crate::tui) fn composer(&self) -> &ComposerMode {
+        &self.composer
+    }
+
+    pub(in crate::tui) fn composer_mut(&mut self) -> &mut ComposerMode {
+        &mut self.composer
+    }
+
+    pub(in crate::tui) fn set_composer(&mut self, composer: ComposerMode) {
+        self.composer = composer;
+        self.buffer.reset_view_start();
+        self.pointer = ComposerPointerState::default();
+    }
+
+    pub(in crate::tui) fn take_composer(&mut self) -> ComposerMode {
+        self.buffer.reset_view_start();
+        self.pointer = ComposerPointerState::default();
+        std::mem::replace(&mut self.composer, ComposerMode::Input)
+    }
+
+    /// Ask the event loop to run `action` after this pointer event. Changing
+    /// composer modes drops a pending action, so it never applies to a mode
+    /// the pointer did not act on.
+    pub(in crate::tui) fn request_pointer_action(&mut self, action: PointerAction) {
+        self.pointer.action = Some(action);
+    }
+
+    /// Consume the pending pointer action, if any.
+    pub(in crate::tui) fn take_pointer_action(&mut self) -> Option<PointerAction> {
+        self.pointer.action.take()
+    }
+
+    pub(in crate::tui) fn composer_painted(&self) -> bool {
+        self.pointer.painted
+    }
+
+    pub(in crate::tui) fn mark_composer_painted(&mut self) {
+        self.pointer.painted = true;
+    }
+
+    pub(in crate::tui) fn hovered_composer_copy(&self) -> bool {
+        self.pointer.hovered_copy
+    }
+
+    pub(in crate::tui) fn set_hovered_composer_copy(&mut self, hovered: bool) {
+        self.pointer.hovered_copy = hovered;
+    }
+
+    pub(in crate::tui) fn paste_burst(&self) -> &PasteBurst {
+        &self.paste_burst
+    }
+
+    /// Mutable paste-burst access for multi-step burst accumulation APIs.
+    pub(in crate::tui) fn paste_burst_mut(&mut self) -> &mut PasteBurst {
+        &mut self.paste_burst
+    }
+
+    pub(in crate::tui) fn clear_paste_burst(&mut self) {
+        self.paste_burst.clear();
+    }
+
+    /// Clear short-lived edit bookkeeping tied to the composer (paste burst).
+    pub(in crate::tui) fn clear_transient_edit_state(&mut self) {
+        self.clear_paste_burst();
+    }
+
+    pub(in crate::tui) fn paste_segments(&self) -> &[PasteSegment] {
+        self.buffer.paste_segments()
+    }
+
+    pub(in crate::tui) fn set_paste_segments(&mut self, segments: Vec<PasteSegment>) {
+        self.buffer.set_paste_segments(segments);
+    }
+
+    pub(in crate::tui) fn clear_paste_segments(&mut self) {
+        self.buffer.set_paste_segments(Vec::new());
+    }
+
+    pub(in crate::tui) fn shell_mode(&self) -> Option<InlineShellMode> {
+        self.shell_mode
+    }
+
+    pub(in crate::tui) fn set_shell_mode(&mut self, mode: Option<InlineShellMode>) {
+        self.shell_mode = mode;
+        self.shell_completion_anchor = None;
+    }
+
+    pub(in crate::tui) fn take_shell_mode(&mut self) -> Option<InlineShellMode> {
+        self.shell_completion_anchor = None;
+        self.shell_mode.take()
+    }
+
+    pub(in crate::tui) fn shell_completion_anchor(&self) -> Option<usize> {
+        self.shell_completion_anchor
+    }
+
+    pub(in crate::tui) fn set_shell_completion_anchor(&mut self, anchor: Option<usize>) {
+        self.shell_completion_anchor = anchor;
+    }
+
+    pub(in crate::tui) fn attachment_slots(&self) -> &[ComposerAttachmentSlot] {
+        &self.attachments
+    }
+
+    pub(in crate::tui) fn attachment_epoch(&self) -> u64 {
+        self.attachment_epoch
+    }
+
+    fn bump_attachments(&mut self) {
+        self.attachment_epoch = self.attachment_epoch.wrapping_add(1);
+    }
+
+    /// Domain attachment list without render previews (tests and equality checks).
+    pub(in crate::tui) fn attachments(&self) -> Vec<ComposerAttachment> {
+        self.attachments
+            .iter()
+            .map(|slot| slot.attachment.clone())
+            .collect()
+    }
+
+    pub(in crate::tui) fn push_ready_attachment(
+        &mut self,
+        media: ChatMedia,
+        image_preview: Option<FeedImage>,
+    ) {
+        self.attachments
+            .push(ComposerAttachmentSlot::ready(media, image_preview));
+        self.bump_attachments();
+    }
+
+    pub(in crate::tui) fn push_pending_attachment(
+        &mut self,
+        id: MediaAttachId,
+        source: PendingAttachmentSource,
+        name: String,
+    ) {
+        self.attachments
+            .push(ComposerAttachmentSlot::pending(id, source, name));
+        self.bump_attachments();
+    }
+
+    /// Remove the attachment at `index`. Callers go through
+    /// `App::remove_composer_attachment`, which also cancels pending work.
+    pub(in crate::tui) fn remove_attachment(&mut self, index: usize) -> Option<ComposerAttachment> {
+        if index >= self.attachments.len() {
+            return None;
+        }
+        let slot = self.attachments.remove(index);
+        self.bump_attachments();
+        Some(slot.attachment)
+    }
+
+    pub(in crate::tui) fn has_pending_attachments(&self) -> bool {
+        self.attachments
+            .iter()
+            .any(|slot| slot.attachment.pending_id().is_some())
+    }
+
+    pub(in crate::tui) fn pending_attachment_count(&self) -> usize {
+        self.attachments
+            .iter()
+            .filter(|slot| slot.attachment.pending_id().is_some())
+            .count()
+    }
+
+    pub(in crate::tui) fn remove_pending_attachment(&mut self, id: MediaAttachId) -> Option<usize> {
+        let index = self
+            .attachments
+            .iter()
+            .position(|slot| slot.attachment.pending_id() == Some(id))?;
+        self.attachments.remove(index);
+        self.bump_attachments();
+        Some(index)
+    }
+
+    pub(in crate::tui) fn replace_pending_attachment(
+        &mut self,
+        id: MediaAttachId,
+        media: ChatMedia,
+        image_preview: Option<FeedImage>,
+    ) -> Option<usize> {
+        let index = self
+            .attachments
+            .iter()
+            .position(|slot| slot.attachment.pending_id() == Some(id))?;
+        self.attachments[index] = ComposerAttachmentSlot::ready(media, image_preview);
+        self.bump_attachments();
+        Some(index)
+    }
+
+    pub(in crate::tui) fn take_ready_media(
+        &mut self,
+    ) -> Result<Vec<ChatMedia>, AttachmentsPending> {
+        if self.has_pending_attachments() {
+            return Err(AttachmentsPending);
+        }
+        self.bump_attachments();
+        Ok(std::mem::take(&mut self.attachments)
+            .into_iter()
+            .map(|slot| match slot.attachment {
+                ComposerAttachment::Ready(media) => media,
+                ComposerAttachment::Pending { .. } => {
+                    unreachable!("pending attachments checked before submission")
+                }
+            })
+            .collect())
+    }
+
+    pub(in crate::tui) fn clear_attachments(&mut self) {
+        self.attachments.clear();
+        self.bump_attachments();
+    }
+
+    pub(in crate::tui) fn history(&self) -> &[String] {
+        &self.history
+    }
+
+    pub(in crate::tui) fn push_history_if_new(&mut self, prompt: &str) -> bool {
+        if self.history.last().is_some_and(|last| last == prompt) {
+            return false;
+        }
+        self.history.push(prompt.to_string());
+        true
+    }
+
+    pub(in crate::tui) fn seed_history_front(&mut self, mut entries: Vec<String>) {
+        if entries.is_empty() {
+            return;
+        }
+        if let (Some(last_seeded), Some(first_local)) = (entries.last(), self.history.first()) {
+            if last_seeded == first_local {
+                entries.pop();
+            }
+        }
+        let inserted = entries.len();
+        if inserted == 0 {
+            return;
+        }
+        entries.append(&mut self.history);
+        self.history = entries;
+        if let Some(cursor) = &mut self.history_cursor {
+            *cursor += inserted;
+        }
+    }
+
+    pub(in crate::tui) fn clear_history(&mut self) {
+        self.history.clear();
+        self.reset_history_navigation();
+    }
+
+    pub(in crate::tui) fn truncate_history_to_newest(&mut self, max_entries: usize) {
+        if max_entries == 0 || self.history.len() <= max_entries {
+            return;
+        }
+        let drop = self.history.len() - max_entries;
+        self.history.drain(..drop);
+        self.reset_history_navigation();
+    }
+
+    pub(in crate::tui) fn history_cursor(&self) -> Option<usize> {
+        self.history_cursor
+    }
+
+    pub(in crate::tui) fn set_history_cursor(&mut self, cursor: Option<usize>) {
+        self.history_cursor = cursor;
+    }
+
+    pub(in crate::tui) fn set_history_draft(&mut self, draft: Option<InputDraft>) {
+        self.history_draft = draft;
+    }
+
+    pub(in crate::tui) fn take_history_draft(&mut self) -> Option<InputDraft> {
+        self.history_draft.take()
+    }
+
+    pub(in crate::tui) fn submission_mode(&self) -> InputSubmissionMode {
+        self.submission_mode
+    }
+
+    pub(in crate::tui) fn set_submission_mode(&mut self, mode: InputSubmissionMode) {
+        self.submission_mode = mode;
+    }
+
+    pub(in crate::tui) fn take_submission_mode(&mut self) -> InputSubmissionMode {
+        std::mem::take(&mut self.submission_mode)
+    }
+
+    pub(in crate::tui) fn command_selection(&self) -> usize {
+        self.command_selection
+    }
+
+    pub(in crate::tui) fn command_selection_explicit(&self) -> bool {
+        self.command_selection_explicit
+    }
+
+    /// Selection back to the untouched default: the first row, not a pick.
+    pub(in crate::tui) fn reset_command_selection(&mut self) {
+        self.command_selection = 0;
+        self.command_selection_explicit = false;
+    }
+
+    /// Move the palette highlight, recording an explicit pick when the row
+    /// actually changes. A keyboard pick lets Enter take an argument row; the
+    /// default highlight does not.
+    pub(in crate::tui) fn move_command_selection(&mut self, next: usize) {
+        if next != self.command_selection {
+            self.command_selection_explicit = true;
+        }
+        self.command_selection = next;
+    }
+
+    /// Keep the highlight inside a new match list. A question with no rows
+    /// starts over, and the row picked under the old question is gone, so the
+    /// clamped highlight is not a pick anyone made.
+    pub(in crate::tui) fn clamp_command_selection_to(&mut self, match_count: usize) {
+        if match_count == 0 {
+            self.reset_command_selection();
+        } else if self.command_selection >= match_count {
+            self.command_selection = match_count - 1;
+            self.command_selection_explicit = false;
+        }
+    }
+
+    pub(in crate::tui) fn command_prefix(&self) -> Option<&str> {
+        self.command_prefix.as_deref()
+    }
+
+    pub(in crate::tui) fn set_command_prefix(&mut self, prefix: Option<String>) {
+        self.command_prefix = prefix;
+    }
+
+    pub(in crate::tui) fn command_palette_dismissed(&self) -> bool {
+        self.command_palette_dismissed
+    }
+
+    pub(in crate::tui) fn set_command_palette_dismissed(&mut self, dismissed: bool) {
+        self.command_palette_dismissed = dismissed;
+    }
+
+    pub(in crate::tui) fn file_selection(&self) -> usize {
+        self.file_selection
+    }
+
+    pub(in crate::tui) fn set_file_selection(&mut self, selection: usize) {
+        self.file_selection = selection;
+    }
+
+    pub(in crate::tui) fn palette_window_start(&self) -> usize {
+        self.palette_window_start
+    }
+
+    pub(in crate::tui) fn set_palette_window_start(&mut self, start: usize) {
+        self.palette_window_start = start;
+    }
+
+    pub(in crate::tui) fn file_query(&self) -> Option<&str> {
+        self.file_query.as_deref()
+    }
+
+    pub(in crate::tui) fn set_file_query(&mut self, query: Option<String>) {
+        self.file_query = query;
+    }
+
+    pub(in crate::tui) fn file_palette_dismissed(&self) -> bool {
+        self.file_palette_dismissed
+    }
+
+    pub(in crate::tui) fn set_file_palette_dismissed(&mut self, dismissed: bool) {
+        self.file_palette_dismissed = dismissed;
+    }
+}

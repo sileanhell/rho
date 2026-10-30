@@ -1,0 +1,546 @@
+use super::{PickerBadge, PickerBadgeTone, PickerItem, PickerKeyHints, RuntimeModelView, UiPicker};
+use crate::keybindings::Keybindings;
+use rho_providers::model::{catalog, favorites};
+
+/// Which models a conversation or internal-agent picker lists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ModelPickerScope {
+    #[default]
+    All,
+    Pinned,
+}
+
+impl ModelPickerScope {
+    pub(super) fn other(self) -> Self {
+        match self {
+            Self::All => Self::Pinned,
+            Self::Pinned => Self::All,
+        }
+    }
+
+    fn title_suffix(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Pinned => "pinned",
+        }
+    }
+
+    pub(super) fn status_label(self) -> &'static str {
+        match self {
+            Self::All => "all models",
+            Self::Pinned => "pinned models",
+        }
+    }
+}
+
+/// The scope a picker can actually show: `Pinned` degrades to `All` when no
+/// pin has auth.
+///
+/// This is the single place that decides whether the pinned view is usable.
+/// Callers pass the result down; nothing re-derives it.
+pub(super) fn effective_model_picker_scope(
+    scope: ModelPickerScope,
+    favorite_models: &[String],
+    available_auths: &[String],
+) -> ModelPickerScope {
+    if scope == ModelPickerScope::All {
+        return ModelPickerScope::All;
+    }
+    resolve_scope(
+        scope,
+        &favorites::normalized_favorite_models(favorite_models),
+        &catalog::available_models_for_auths(available_auths),
+    )
+}
+
+/// [`effective_model_picker_scope`] for callers that already normalized.
+fn resolve_scope(
+    scope: ModelPickerScope,
+    favorites: &[favorites::FavoriteModel],
+    available: &[catalog::ModelCatalogEntry],
+) -> ModelPickerScope {
+    if scope == ModelPickerScope::Pinned
+        && !favorites::available_favorites(favorites, available).is_empty()
+    {
+        ModelPickerScope::Pinned
+    } else {
+        ModelPickerScope::All
+    }
+}
+
+pub(super) fn model_picker(
+    info: &RuntimeModelView,
+    available_auths: &[String],
+    scope: ModelPickerScope,
+) -> UiPicker {
+    conversation_model_catalog(info, available_auths, scope).into_models()
+}
+
+pub(super) fn conversation_model_catalog(
+    info: &RuntimeModelView,
+    available_auths: &[String],
+    scope: ModelPickerScope,
+) -> ModelCatalogPicker {
+    model_catalog(
+        "select model",
+        CurrentModel {
+            provider: &info.provider,
+            model: &info.model,
+            badge: "selected",
+        },
+        &info.favorite_models,
+        available_auths,
+        scope,
+        &info.keybindings,
+    )
+}
+
+pub(super) fn model_picker_during_run(
+    info: &RuntimeModelView,
+    pending: Option<&rho_providers::model::catalog::ModelSelection>,
+    available_auths: &[String],
+    scope: ModelPickerScope,
+) -> UiPicker {
+    let (provider, model, badge) = pending
+        .map(|selection| {
+            (
+                selection.provider.as_str(),
+                selection.model.as_str(),
+                "pending",
+            )
+        })
+        .unwrap_or((&info.provider, &info.model, "selected"));
+    model_catalog(
+        "select model for next turn",
+        CurrentModel {
+            provider,
+            model,
+            badge,
+        },
+        &info.favorite_models,
+        available_auths,
+        scope,
+        &info.keybindings,
+    )
+    .into_models()
+}
+
+/// Label of the conversation-model row.
+pub(super) const USE_CONVERSATION_MODEL: &str = "Use conversation model";
+
+/// Row value of every row that clears an agent's model override, whatever it
+/// falls back to (see [`FallbackModelRow`] and "Same as classifier").
+const CLEAR_MODEL_OVERRIDE: &str = "clear-override";
+
+/// What a selected internal-agent model row asks for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum InternalAgentModelRow {
+    /// Clear the override: the agent falls back to the conversation model,
+    /// its own file's model, or (for the permission screen) the classifier.
+    ClearOverride,
+    /// A Rho `provider/model` reference to resolve against the catalog.
+    RhoModel(String),
+    /// A decision model, asked over its host's decision API.
+    Decision { provider: String, model: String },
+}
+
+/// Prefix of a decision-model row value, which is not a chat-model reference.
+const DECISION_ROW_PREFIX: &str = "decision:";
+
+/// The row value a decision-model row carries. Inverse of the decision arm of
+/// [`parse_internal_agent_model_row`].
+fn decision_row_value(provider: &str, model: &str) -> String {
+    format!(
+        "{DECISION_ROW_PREFIX}{}",
+        rho_providers::provider::model_reference(provider, model)
+    )
+}
+
+pub(super) fn parse_internal_agent_model_row(value: &str) -> InternalAgentModelRow {
+    if value == CLEAR_MODEL_OVERRIDE {
+        return InternalAgentModelRow::ClearOverride;
+    }
+    if let Some((provider, model)) = value
+        .strip_prefix(DECISION_ROW_PREFIX)
+        .and_then(|reference| reference.split_once('/'))
+    {
+        return InternalAgentModelRow::Decision {
+            provider: provider.into(),
+            model: model.into(),
+        };
+    }
+    InternalAgentModelRow::RhoModel(value.to_string())
+}
+
+/// The row that clears an agent's model override, named for what the agent
+/// falls back to. Every variant's row carries [`CLEAR_MODEL_OVERRIDE`] as
+/// its value, which parses to [`InternalAgentModelRow::ClearOverride`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum FallbackModelRow {
+    /// The agent follows the conversation model when it has no own model.
+    Conversation { selected: bool },
+    /// The agent runs the model its own (read-only) file names, shown as a
+    /// `provider/model` reference or a bare model.
+    AgentDefault { model: String, selected: bool },
+    /// The agent has no conversation-model fallback, so the row would lie.
+    Omitted,
+}
+
+/// Which row an internal agent's picker marks as selected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum InternalAgentSelection {
+    /// A Rho provider and model.
+    RhoModel { provider: String, model: String },
+    /// Nothing configured yet.
+    Unset,
+}
+
+impl InternalAgentSelection {
+    /// The [`PickerItem::value`] of the row this selection marks, or `None`
+    /// when nothing is configured.
+    ///
+    /// Encode half of the row vocabulary; [`parse_internal_agent_model_row`] is
+    /// the decode half. The fallback row is not here because no selection
+    /// names it: the caller offers it, so the caller asks for it by
+    /// [`CLEAR_MODEL_OVERRIDE`].
+    fn row_value(&self) -> Option<String> {
+        match self {
+            Self::RhoModel { provider, model } => {
+                Some(rho_providers::provider::model_reference(provider, model))
+            }
+            Self::Unset => None,
+        }
+    }
+}
+
+pub(super) struct InternalAgentPickerInputs<'a> {
+    pub(super) agent_id: &'a str,
+    pub(super) current: InternalAgentSelection,
+    pub(super) fallback: FallbackModelRow,
+
+    pub(super) favorite_models: &'a [String],
+    pub(super) available_auths: &'a [String],
+    pub(super) scope: ModelPickerScope,
+    pub(super) keybindings: &'a Keybindings,
+}
+
+pub(super) fn internal_agent_model_picker(inputs: InternalAgentPickerInputs<'_>) -> UiPicker {
+    let InternalAgentPickerInputs {
+        agent_id,
+        current,
+        fallback,
+        favorite_models,
+        available_auths,
+        scope,
+        keybindings,
+    } = inputs;
+    let rho_current = match &current {
+        InternalAgentSelection::RhoModel { provider, model } => (provider.as_str(), model.as_str()),
+        InternalAgentSelection::Unset => ("", ""),
+    };
+    let mut catalog = model_catalog(
+        &format!("select model for {agent_id}"),
+        CurrentModel {
+            provider: rho_current.0,
+            model: rho_current.1,
+            badge: "selected",
+        },
+        favorite_models,
+        available_auths,
+        scope,
+        keybindings,
+    );
+
+    let mut leading = Vec::new();
+    let fallback_selected = match &fallback {
+        FallbackModelRow::Conversation { selected } => {
+            leading.push(conversation_model_row(*selected));
+            *selected
+        }
+        FallbackModelRow::AgentDefault { model, selected } => {
+            leading.push(agent_default_row(model, *selected));
+            *selected
+        }
+        FallbackModelRow::Omitted => false,
+    };
+    catalog.items.splice(0..0, leading);
+
+    // A selected fallback row outranks `current`, which then still carries
+    // the fallback model and so may also name a catalog row.
+    let wanted_value = if fallback_selected {
+        Some(CLEAR_MODEL_OVERRIDE.to_string())
+    } else {
+        current.row_value()
+    };
+    catalog.selected = wanted_value
+        .and_then(|value| catalog.items.iter().position(|item| item.value == value))
+        .unwrap_or(0);
+    catalog.into_internal_agent_models()
+}
+
+/// Which row the permission screen's picker marks as selected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ScreenSelection {
+    /// No entry: the classifier's own model answers the screen.
+    Classifier,
+    Decision {
+        provider: String,
+        model: String,
+    },
+    Text {
+        provider: String,
+        model: String,
+    },
+}
+
+pub(super) struct ScreenPickerInputs<'a> {
+    pub(super) current: ScreenSelection,
+    /// The classifier's `provider/model`, which answers the screen by default.
+    pub(super) classifier: Option<String>,
+    /// Discovered decision models, as `(provider, model)`.
+    pub(super) decision_models: Vec<(String, String)>,
+    pub(super) favorite_models: &'a [String],
+    pub(super) available_auths: &'a [String],
+    pub(super) scope: ModelPickerScope,
+    pub(super) keybindings: &'a Keybindings,
+}
+
+/// The permission screen's model picker: the classifier's own model first,
+/// then decision models, then the chat catalog as text models.
+pub(super) fn screen_model_picker(inputs: ScreenPickerInputs<'_>) -> UiPicker {
+    let ScreenPickerInputs {
+        current,
+        classifier,
+        decision_models,
+        favorite_models,
+        available_auths,
+        scope,
+        keybindings,
+    } = inputs;
+    let (text_provider, text_model) = match &current {
+        ScreenSelection::Text { provider, model } => (provider.as_str(), model.as_str()),
+        ScreenSelection::Classifier | ScreenSelection::Decision { .. } => ("", ""),
+    };
+    let mut catalog = model_catalog(
+        "Select permission screen model",
+        CurrentModel {
+            provider: text_provider,
+            model: text_model,
+            badge: "selected",
+        },
+        favorite_models,
+        available_auths,
+        scope,
+        keybindings,
+    );
+    for item in &mut catalog.items {
+        item.section = Some("Text models".into());
+    }
+    let selected_badge = |selected: bool| {
+        selected.then(|| PickerBadge {
+            text: "selected".into(),
+            tone: PickerBadgeTone::Selected,
+        })
+    };
+    let mut leading = vec![PickerItem {
+        detail: Some(
+            match &classifier {
+                Some(classifier) => format!("The classifier model, {classifier}, answers the screen at low reasoning and shares its prompt cache with the review."),
+                None => "The classifier model answers the screen at low reasoning and shares its prompt cache with the review.".into(),
+            }
+            .into(),
+        ),
+        badge: selected_badge(current == ScreenSelection::Classifier),
+        allow_filter_completion: false,
+        ..PickerItem::new("Same as classifier".into(), CLEAR_MODEL_OVERRIDE.into())
+    }];
+    leading.extend(decision_models.iter().map(|(provider, model)| {
+        let selected = matches!(
+            &current,
+            ScreenSelection::Decision { provider: p, model: m } if p == provider && m == model
+        );
+        PickerItem {
+            section: Some("Decision models".into()),
+            detail: Some(
+                "Answers with a probability for each option, without writing a review.".into(),
+            ),
+            badge: selected_badge(selected),
+            ..PickerItem::new(
+                rho_providers::provider::model_reference(provider, model),
+                decision_row_value(provider, model),
+            )
+        }
+    }));
+    catalog.items.splice(0..0, leading);
+    let wanted = match &current {
+        ScreenSelection::Classifier => CLEAR_MODEL_OVERRIDE.to_string(),
+        ScreenSelection::Decision { provider, model } => decision_row_value(provider, model),
+        ScreenSelection::Text { provider, model } => {
+            rho_providers::provider::model_reference(provider, model)
+        }
+    };
+    // A configured model that is not listed (an empty or logged-out decision
+    // host, a model gone from the catalog) keeps its own row, so Enter on the
+    // row the picker opens on never clears the entry.
+    let selected = match catalog.items.iter().position(|item| item.value == wanted) {
+        Some(index) => index,
+        None => {
+            let (section, label) = match &current {
+                ScreenSelection::Decision { provider, model } => (
+                    "Decision models",
+                    rho_providers::provider::model_reference(provider, model),
+                ),
+                ScreenSelection::Text { .. } | ScreenSelection::Classifier => {
+                    ("Text models", wanted.clone())
+                }
+            };
+            // Last in its section: after the decision rows, or first of the
+            // text rows.
+            let index = 1 + decision_models.len();
+            catalog.items.insert(
+                index,
+                PickerItem {
+                    section: Some(section.into()),
+                    detail: Some("Configured, but not listed by its provider now.".into()),
+                    badge: selected_badge(true),
+                    ..PickerItem::new(label, wanted)
+                },
+            );
+            index
+        }
+    };
+    catalog.selected = selected;
+    catalog.into_internal_agent_models()
+}
+
+fn conversation_model_row(selected: bool) -> PickerItem {
+    PickerItem {
+        detail: Some("Follow the active conversation provider, model, and auth.".into()),
+        badge: selected.then_some(PickerBadge {
+            text: "selected".into(),
+            tone: PickerBadgeTone::Selected,
+        }),
+        allow_filter_completion: false,
+        ..PickerItem::new(USE_CONVERSATION_MODEL.into(), CLEAR_MODEL_OVERRIDE.into())
+    }
+}
+
+fn agent_default_row(model: &str, selected: bool) -> PickerItem {
+    PickerItem {
+        detail: Some(format!("Run {model}, the model the agent's file names.").into()),
+        badge: selected.then_some(PickerBadge {
+            text: "selected".into(),
+            tone: PickerBadgeTone::Selected,
+        }),
+        allow_filter_completion: false,
+        ..PickerItem::new("Use agent default".into(), CLEAR_MODEL_OVERRIDE.into())
+    }
+}
+
+struct CurrentModel<'a> {
+    provider: &'a str,
+    model: &'a str,
+    badge: &'a str,
+}
+
+pub(super) struct ModelCatalogPicker {
+    pub title: String,
+    pub items: Vec<PickerItem>,
+    pub selected: usize,
+    pub key_hints: PickerKeyHints,
+}
+
+impl ModelCatalogPicker {
+    fn into_picker(self, ctor: impl FnOnce(String, Vec<PickerItem>) -> UiPicker) -> UiPicker {
+        let mut picker = ctor(self.title, self.items).with_key_hints(self.key_hints);
+        picker.selected = self.selected;
+        picker
+    }
+
+    pub(super) fn into_models(self) -> UiPicker {
+        self.into_picker(UiPicker::models)
+    }
+
+    fn into_internal_agent_models(self) -> UiPicker {
+        self.into_picker(UiPicker::internal_agent_models)
+    }
+
+    pub(super) fn into_edit_agent(self) -> UiPicker {
+        self.into_picker(UiPicker::edit_agent)
+    }
+}
+
+fn model_catalog(
+    title: &str,
+    current: CurrentModel<'_>,
+    favorite_models: &[String],
+    available_auths: &[String],
+    scope: ModelPickerScope,
+    keybindings: &Keybindings,
+) -> ModelCatalogPicker {
+    let CurrentModel {
+        provider: current_provider,
+        model: current_model,
+        badge: selected_badge,
+    } = current;
+    let current = rho_providers::provider::model_reference(current_provider, current_model);
+    let favorites = favorites::normalized_favorite_models(favorite_models);
+    let mut available = catalog::available_models_for_auths(available_auths);
+    let effective_scope = resolve_scope(scope, &favorites, &available);
+    if effective_scope == ModelPickerScope::Pinned {
+        available.retain(|entry| favorites::is_favorite(&favorites, &entry.provider, &entry.model));
+    }
+    let pin_key = keybindings.cycle_pinned_model.chrome_label();
+    let scope_key = keybindings.toggle_tool_output.chrome_label();
+    let items = favorites::reorder_models_by_favorites(available, &favorites)
+        .into_iter()
+        .map(|entry| {
+            let value = rho_providers::provider::model_reference(&entry.provider, &entry.model);
+            let pinned = favorites::is_favorite(&favorites, &entry.provider, &entry.model);
+            let selected = entry.provider == current_provider && entry.model == current_model;
+            let badge = match (pinned, selected) {
+                (true, true) => Some(PickerBadge {
+                    text: format!("pinned, {selected_badge}"),
+                    tone: PickerBadgeTone::Selected,
+                }),
+                (true, false) => Some(PickerBadge {
+                    text: "pinned".into(),
+                    tone: PickerBadgeTone::Favorite,
+                }),
+                (false, true) => Some(PickerBadge {
+                    text: selected_badge.into(),
+                    tone: PickerBadgeTone::Selected,
+                }),
+                (false, false) => None,
+            };
+            PickerItem {
+                detail: Some(
+                    if pinned {
+                        format!("Press {pin_key} to unpin this model.")
+                    } else {
+                        format!("Press {pin_key} to pin this model to the top of model pickers.")
+                    }
+                    .into(),
+                ),
+                badge,
+                ..PickerItem::new(value.clone(), value)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let selected = items
+        .iter()
+        .position(|item| item.value == current)
+        .unwrap_or(0);
+    ModelCatalogPicker {
+        title: format!("{title} · {}", effective_scope.title_suffix()),
+        items,
+        selected,
+        key_hints: PickerKeyHints {
+            pin_toggle: Some(pin_key),
+            scope_toggle: Some(scope_key),
+            tab: super::TabKey::CompleteFilter,
+            ..Default::default()
+        },
+    }
+}

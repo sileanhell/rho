@@ -1,0 +1,72 @@
+use {crate::commands::CommandInvocation, crate::export};
+
+use super::{App, Entry, Session};
+
+impl App {
+    pub(super) fn execute_export_command(
+        &mut self,
+        invocation: &CommandInvocation,
+    ) -> anyhow::Result<()> {
+        if self.info.session.no_save {
+            self.set_status(
+                "session export unavailable with --no-save; use /copy to copy an answer",
+            );
+            return Ok(());
+        }
+        let Some(session_id) = self.info.session.session_id.clone() else {
+            self.set_status("no active session to export; send a message first");
+            return Ok(());
+        };
+        match export::write_session_export(
+            &self.info.runtime.cwd,
+            &session_id,
+            &export::ExportWriteOptions {
+                path_arg: &invocation.args,
+                format: None,
+                force: false,
+            },
+        ) {
+            Ok(path) => {
+                self.set_status(format!("session transcript exported to {}", path.display()));
+            }
+            Err(error) => {
+                self.insert_entry(&Entry::Error(format!("unable to export session: {error}")));
+                self.set_status("export failed");
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn execute_title_command(
+        &mut self,
+        invocation: &CommandInvocation,
+    ) -> anyhow::Result<()> {
+        if self.info.session.no_save {
+            self.set_status("session titles unavailable with --no-save");
+            return Ok(());
+        }
+        let title = invocation.args.trim();
+        if title.is_empty() {
+            self.set_status("usage: /title <name>");
+            return Ok(());
+        }
+        let Some(session_id) = self.info.session.session_id.clone() else {
+            self.set_status("no active session to rename; send a message first");
+            return Ok(());
+        };
+        // Only cancel pending auto-title after the manual write succeeds so a
+        // failed rename leaves generation in place.
+        match Session::set_title(&self.info.runtime.cwd, &session_id, title) {
+            Ok(updated) => {
+                self.pending_session_title = None;
+                self.session_title_locked = true;
+                self.set_status(format!("session titled: {}", updated.title));
+            }
+            Err(error) => {
+                self.insert_entry(&Entry::Error(format!("unable to rename session: {error}")));
+                self.set_status("rename failed");
+            }
+        }
+        Ok(())
+    }
+}

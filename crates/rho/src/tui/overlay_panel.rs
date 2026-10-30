@@ -1,0 +1,480 @@
+//! Single-pane overlay chrome: title, scrollable body, footer.
+//!
+//! Draws a bordered popup with one scrolling region and no search field or
+//! detail split, and defines [`PanelBody`], the contract each panel overlay
+//! implements. Feature policy (what the body means, extra keys, close
+//! cleanup) stays with each panel; `panel_overlay.rs` drives the shared path.
+
+use ratatui::{
+    layout::{Position, Rect},
+    text::{Line, Span},
+};
+
+use super::{
+    copy_interaction::CopyHit,
+    display_width,
+    drag_selection::SelectionBody,
+    panel_pointer::PanelPointer,
+    picker::{clamp_overlay_scroll, OverlayScrollbarState},
+    render::{fit_line, truncate_one_line},
+    scrollbar::{track_span, HistoryScrollbar},
+    styled_line, LineFill, Theme,
+};
+
+const TOP_BORDER_ROWS: usize = 1;
+const BOTTOM_BORDER_ROWS: usize = 1;
+/// Footer rule + footer hint.
+const FOOTER_CHROME_ROWS: usize = 2;
+const INNER_CHROME_ROWS: usize = FOOTER_CHROME_ROWS;
+const MIN_BODY_ROWS: usize = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OverlayPanelLayout {
+    pub(super) outer: Rect,
+    pub(super) inner_width: usize,
+    pub(super) body_rows: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct OverlayPanelFrame {
+    pub(super) outer: Rect,
+    pub(super) lines: Vec<Line<'static>>,
+    /// Caret inside the panel. `None` for dismiss-only chrome with no text field.
+    pub(super) cursor: Option<Position>,
+    /// Targets in panel-body coordinates, before scrolling.
+    pub(super) copy_hits: Vec<CopyHit>,
+    body: Rect,
+    /// Rows pinned under the scrolled body, outside its scroll and scrollbar.
+    pinned: Rect,
+    scroll: usize,
+    /// Every body row, unscrolled, so a selection can copy the rows it spans.
+    body_lines: Vec<Line<'static>>,
+    /// Hitbox of the painted scrollbar column; `None` when the body fits.
+    scrollbar: Option<HistoryScrollbar>,
+}
+
+impl OverlayPanelFrame {
+    pub(super) fn body(&self) -> Rect {
+        self.body
+    }
+
+    pub(super) fn scroll(&self) -> usize {
+        self.scroll
+    }
+
+    pub(super) fn pinned(&self) -> Rect {
+        self.pinned
+    }
+
+    /// The painted body, for drag-to-select. Its lines are every body row in
+    /// body-line coordinates (line 0 is the first row, not the first visible
+    /// one).
+    pub(super) fn selection_body(&self) -> SelectionBody<'_> {
+        SelectionBody {
+            area: self.body,
+            top_line: self.scroll,
+            lines: &self.body_lines,
+        }
+    }
+
+    pub(super) fn scrollbar(&self) -> Option<HistoryScrollbar> {
+        self.scrollbar
+    }
+
+    /// The copy target under the pointer, as painted.
+    pub(super) fn copy_hit_at(&self, column: u16, row: u16) -> Option<&CopyHit> {
+        self.copy_hits
+            .iter()
+            .find(|hit| hit.text_at(self.body, self.scroll, column, row).is_some())
+    }
+}
+
+pub(super) fn overlay_panel_layout(area: Rect, body_line_count: usize) -> OverlayPanelLayout {
+    layout_for_outer(outer_rect(area, body_line_count))
+}
+
+/// Inner content width for `area`. Independent of body length; outer width never
+/// depends on how many body rows the panel will draw.
+pub(super) fn overlay_panel_inner_width(area: Rect) -> usize {
+    (overlay_outer_width(area) as usize)
+        .saturating_sub(2)
+        .max(1)
+}
+
+/// Body width for wrapped text with the panel's scrollbar column reserved,
+/// so right-aligned text is not clipped when the body scrolls.
+pub(super) fn overlay_panel_body_width(area: Rect) -> usize {
+    overlay_panel_inner_width(area).saturating_sub(1)
+}
+
+/// The full terminal as a panel layout area, when its size is readable.
+pub(super) fn terminal_area(terminal: &crate::tui::DefaultTerminal) -> Option<Rect> {
+    let size = terminal.size().ok()?;
+    Some(Rect::new(0, 0, size.width, size.height))
+}
+
+/// `c` / `C`: copy the panel's report as plain text.
+pub(super) fn is_copy_key(key: crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    matches!(
+        (key.modifiers, key.code),
+        (
+            KeyModifiers::NONE | KeyModifiers::SHIFT,
+            KeyCode::Char('c' | 'C')
+        )
+    )
+}
+
+/// Draws the panel chrome around `body` scrolled to `scroll`, with `pinned`
+/// rows (such as a text field) fixed below it at full width. The frame keeps
+/// `body` so pointer selection can copy rows outside the viewport.
+pub(super) fn render_overlay_panel(
+    title: &str,
+    footer: &str,
+    body: Vec<Line<'static>>,
+    pinned: Vec<Line<'static>>,
+    scroll: usize,
+    area: Rect,
+) -> OverlayPanelFrame {
+    let layout = overlay_panel_layout(area, body.len() + pinned.len());
+    let inner_width = layout.inner_width;
+    let pinned_rows = pinned.len().min(layout.body_rows);
+    let body_rows = layout.body_rows - pinned_rows;
+    let scroll = clamp_overlay_scroll(scroll, body.len(), body_rows);
+    let scrollbar = OverlayScrollbarState::detail(body.len(), body_rows, scroll);
+    let content_width = inner_width.saturating_sub(usize::from(scrollbar.is_some()));
+    // The track is the last inner column, beside the clipped content.
+    let track = Rect::new(
+        layout.outer.x.saturating_add(1),
+        layout.outer.y.saturating_add(1),
+        as_u16(inner_width),
+        as_u16(body_rows),
+    );
+
+    let mut lines = Vec::with_capacity(layout.outer.height as usize);
+    lines.push(border_line(
+        layout.outer.width as usize,
+        '┌',
+        '┐',
+        Some(title),
+    ));
+
+    let mut body_view = body
+        .iter()
+        .skip(scroll)
+        .take(body_rows)
+        .cloned()
+        .map(|line| fit_line(line, content_width))
+        .collect::<Vec<_>>();
+    body_view.resize_with(body_rows, || padded_plain("", content_width));
+    if let Some(scrollbar) = scrollbar {
+        append_scrollbar_column(&mut body_view, scrollbar);
+    }
+    for row in body_view {
+        lines.push(content_row(inner_width, row));
+    }
+    for row in pinned.into_iter().take(pinned_rows) {
+        lines.push(content_row(inner_width, fit_line(row, inner_width)));
+    }
+
+    lines.push(horizontal_rule(layout.outer.width as usize));
+    let footer_text = format!(" {footer}");
+    lines.push(content_row(
+        inner_width,
+        styled_line(
+            truncate_one_line(&footer_text, inner_width),
+            inner_width,
+            Theme::dim(),
+            LineFill::PadToWidth,
+        ),
+    ));
+    lines.push(border_line(layout.outer.width as usize, '└', '┘', None));
+    lines.truncate(layout.outer.height as usize);
+    while lines.len() < layout.outer.height as usize {
+        lines.push(Line::raw(""));
+    }
+
+    OverlayPanelFrame {
+        cursor: None,
+        outer: layout.outer,
+        lines,
+        copy_hits: Vec::new(),
+        body: Rect::new(track.x, track.y, content_width as u16, track.height),
+        pinned: Rect::new(
+            track.x,
+            track.y.saturating_add(track.height),
+            track.width,
+            as_u16(pinned_rows),
+        ),
+        scroll,
+        body_lines: body,
+        scrollbar: scrollbar.map(|scrollbar| scrollbar.hitbox(track)),
+    }
+}
+
+pub(super) fn clamp_panel_scroll(scroll: usize, body_len: usize, body_rows: usize) -> usize {
+    clamp_overlay_scroll(scroll, body_len, body_rows)
+}
+
+/// Scroll intent shared by single-pane overlays. Call sites supply body length
+/// and viewport height; this type owns the offset math.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PanelScrollTarget {
+    Delta(isize),
+    Page(isize),
+    Absolute(usize),
+}
+
+/// Per-panel state every single-pane overlay embeds: body scroll plus
+/// selection, scrollbar drag, and hover.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct PanelState {
+    pub(super) scroll: PanelScroll,
+    pub(super) pointer: PanelPointer,
+}
+
+/// Content and feature keys of one single-pane overlay.
+///
+/// Implementors own what the body shows and what their own keys do. The
+/// panel dispatcher (`panel_overlay.rs`) owns everything shared: chrome,
+/// scrolling, pointer input, the copy key, and the close/scroll key table.
+/// `body_lines` must be a pure function of the panel's state, `width`, and
+/// `now`, since scroll math re-renders it to measure the body.
+pub(super) trait PanelBody {
+    fn state(&self) -> &PanelState;
+    fn state_mut(&mut self) -> &mut PanelState;
+    fn title(&self) -> &str;
+    fn footer(&self) -> &str;
+    /// Every body row at `width`, which already reserves the scrollbar column.
+    fn body_lines(&self, width: usize, now: std::time::Instant) -> Vec<Line<'static>>;
+    /// Plain text for the copy key; `None` when there is nothing to copy.
+    fn copy_text(&self) -> Option<String> {
+        None
+    }
+    /// Feature keys, checked before the shared keys.
+    fn handle_key(&mut self, _key: crossterm::event::KeyEvent) -> PanelKeyOutcome {
+        PanelKeyOutcome::Unhandled
+    }
+    /// Runs after the panel left the composer, which is plain input by
+    /// then. Override to drop background work or restore a parent view.
+    fn close(self: Box<Self>, _app: &mut super::App) {}
+}
+
+/// What a panel did with a key in [`PanelBody::handle_key`].
+pub(super) enum PanelKeyOutcome {
+    /// Consumed by the panel.
+    Handled,
+    /// Consumed; run this app-level action next (the panel cannot reach
+    /// app state through `&mut self`).
+    Run(fn(&mut super::App)),
+    /// Fall through to the shared copy, scroll, and close keys.
+    Unhandled,
+}
+
+/// The panel's frame at `area`, body wrapped with the scrollbar column reserved.
+pub(super) fn panel_frame(
+    panel: &dyn PanelBody,
+    area: Rect,
+    now: std::time::Instant,
+) -> OverlayPanelFrame {
+    let lines = panel.body_lines(overlay_panel_body_width(area), now);
+    render_overlay_panel(
+        panel.title(),
+        panel.footer(),
+        lines,
+        Vec::new(),
+        panel.state().scroll.offset(),
+        area,
+    )
+}
+
+/// Moves the panel's scroll toward `target`, clamped to its body at `area`.
+pub(super) fn scroll_panel(panel: &mut dyn PanelBody, area: Rect, target: PanelScrollTarget) {
+    let body_len = panel
+        .body_lines(overlay_panel_body_width(area), std::time::Instant::now())
+        .len();
+    let body_rows = overlay_panel_layout(area, body_len).body_rows;
+    panel.state_mut().scroll.apply(target, body_len, body_rows);
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct PanelScroll {
+    offset: usize,
+}
+
+impl PanelScroll {
+    pub(super) fn offset(self) -> usize {
+        self.offset
+    }
+
+    pub(super) fn apply(&mut self, target: PanelScrollTarget, body_len: usize, body_rows: usize) {
+        let next = match target {
+            PanelScrollTarget::Delta(delta) if delta < 0 => {
+                self.offset.saturating_sub(delta.unsigned_abs())
+            }
+            PanelScrollTarget::Delta(delta) => self.offset.saturating_add(delta as usize),
+            PanelScrollTarget::Page(direction) => {
+                let delta = direction.saturating_mul(body_rows.max(1) as isize);
+                if delta < 0 {
+                    self.offset.saturating_sub(delta.unsigned_abs())
+                } else {
+                    self.offset.saturating_add(delta as usize)
+                }
+            }
+            PanelScrollTarget::Absolute(scroll) => scroll,
+        };
+        self.offset = clamp_panel_scroll(next, body_len, body_rows);
+    }
+}
+
+/// Shared key table for dismiss-only single-pane overlays. Close vs spawn
+/// policy stays at the call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PanelKey {
+    Close,
+    Scroll(PanelScrollTarget),
+    Passthrough,
+    Swallow,
+}
+
+pub(super) fn classify_panel_key(key: crossterm::event::KeyEvent) -> PanelKey {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    match (key.modifiers, key.code) {
+        (KeyModifiers::NONE, KeyCode::Esc)
+        | (KeyModifiers::NONE, KeyCode::Enter)
+        | (KeyModifiers::NONE, KeyCode::Char('q')) => PanelKey::Close,
+        (KeyModifiers::NONE, KeyCode::Up) | (KeyModifiers::NONE, KeyCode::Char('k')) => {
+            PanelKey::Scroll(PanelScrollTarget::Delta(-1))
+        }
+        (KeyModifiers::NONE, KeyCode::Down) | (KeyModifiers::NONE, KeyCode::Char('j')) => {
+            PanelKey::Scroll(PanelScrollTarget::Delta(1))
+        }
+        (_, KeyCode::PageUp) => PanelKey::Scroll(PanelScrollTarget::Page(-1)),
+        (_, KeyCode::PageDown) => PanelKey::Scroll(PanelScrollTarget::Page(1)),
+        (_, KeyCode::Home) => PanelKey::Scroll(PanelScrollTarget::Absolute(0)),
+        (_, KeyCode::End) => PanelKey::Scroll(PanelScrollTarget::Absolute(usize::MAX)),
+        (KeyModifiers::CONTROL, KeyCode::Char('c')) => PanelKey::Passthrough,
+        _ => PanelKey::Swallow,
+    }
+}
+
+fn overlay_outer_width(area: Rect) -> u16 {
+    if area.width == 0 {
+        return 0;
+    }
+    let horizontal_margin = ((area.width as usize) / 20).clamp(1, 4) as u16;
+    area.width
+        .saturating_sub(horizontal_margin.saturating_mul(2))
+        .max(1)
+}
+
+fn outer_rect(area: Rect, body_line_count: usize) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    let vertical_margin = ((area.height as usize) / 12).clamp(1, 3) as u16;
+    let width = overlay_outer_width(area);
+    let max_height = area
+        .height
+        .saturating_sub(vertical_margin.saturating_mul(2))
+        .max(1);
+    let desired_height = as_u16(
+        body_line_count
+            .max(MIN_BODY_ROWS)
+            .saturating_add(INNER_CHROME_ROWS)
+            .saturating_add(TOP_BORDER_ROWS)
+            .saturating_add(BOTTOM_BORDER_ROWS),
+    );
+    let height = desired_height.min(max_height);
+    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
+    let y = area
+        .y
+        .saturating_add(area.height.saturating_sub(height) / 2);
+    Rect::new(x, y, width, height)
+}
+
+fn layout_for_outer(outer: Rect) -> OverlayPanelLayout {
+    let inner_width = (outer.width as usize).saturating_sub(2).max(1);
+    let inner_height = (outer.height as usize).saturating_sub(2).max(1);
+    let body_rows = inner_height.saturating_sub(INNER_CHROME_ROWS).max(1);
+    OverlayPanelLayout {
+        outer,
+        inner_width,
+        body_rows,
+    }
+}
+
+fn append_scrollbar_column(rows: &mut [Line<'static>], scrollbar: OverlayScrollbarState) {
+    let thumb = scrollbar.thumb();
+    for (row, line) in rows.iter_mut().enumerate() {
+        line.spans.push(track_span(thumb, row, Theme::accent()));
+    }
+}
+
+fn border_line(width: usize, left: char, right: char, title: Option<&str>) -> Line<'static> {
+    if width == 0 {
+        return Line::raw("");
+    }
+    if width == 1 {
+        return Line::from(Span::styled(left.to_string(), Theme::dim()));
+    }
+    let mut text = left.to_string();
+    if let Some(title) = title.filter(|title| !title.is_empty()) {
+        let label = format!(" {title} ");
+        let label = truncate_one_line(&label, width.saturating_sub(2));
+        text.push_str(&label);
+        let fill = width.saturating_sub(display_width(&text)).saturating_sub(1);
+        text.push_str(&"─".repeat(fill));
+    } else {
+        text.push_str(&"─".repeat(width.saturating_sub(2)));
+    }
+    text.push(right);
+    if display_width(&text) > width {
+        text = truncate_one_line(&text, width);
+    }
+    Line::from(Span::styled(text, Theme::dim()))
+}
+
+fn horizontal_rule(width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::raw("");
+    }
+    if width == 1 {
+        return Line::from(Span::styled("├".to_string(), Theme::dim()));
+    }
+    let mut text = String::with_capacity(width);
+    text.push('├');
+    text.push_str(&"─".repeat(width.saturating_sub(2)));
+    text.push('┤');
+    if display_width(&text) > width {
+        text = truncate_one_line(&text, width);
+    }
+    Line::from(Span::styled(text, Theme::dim()))
+}
+
+fn content_row(inner_width: usize, content: Line<'static>) -> Line<'static> {
+    let mut spans = vec![Span::styled("│", Theme::dim())];
+    let content_width = content
+        .spans
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum::<usize>();
+    spans.extend(content.spans);
+    if content_width < inner_width {
+        spans.push(Span::raw(" ".repeat(inner_width - content_width)));
+    }
+    spans.push(Span::styled("│", Theme::dim()));
+    Line::from(spans)
+}
+
+fn padded_plain(text: &str, width: usize) -> Line<'static> {
+    let width = width.max(1);
+    let text = truncate_one_line(text, width);
+    let pad = width.saturating_sub(display_width(&text));
+    Line::from(Span::raw(format!("{text}{}", " ".repeat(pad))))
+}
+
+fn as_u16(value: usize) -> u16 {
+    value.min(u16::MAX as usize) as u16
+}

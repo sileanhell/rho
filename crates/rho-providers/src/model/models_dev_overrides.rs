@@ -1,0 +1,294 @@
+//! TOML model overrides parsing for models.dev catalog entries.
+//!
+//! Handles built-in `model_overrides.toml` and user-configured local `models.toml`.
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::SystemTime,
+};
+
+use crate::reasoning::ReasoningLevel;
+
+use super::{ImageInput, ModelCost, ModelMetadata};
+
+const BUILTIN_MODEL_OVERRIDES_TOML: &str = include_str!("model_overrides.toml");
+
+pub(super) fn apply_builtin_overrides(
+    provider: &str,
+    model: &str,
+    metadata: ModelMetadata,
+) -> ModelMetadata {
+    match builtin_override_table(provider, model) {
+        Some(table) => merge_toml_override(metadata, table),
+        None => metadata,
+    }
+}
+
+pub(super) fn builtin_override_table(provider: &str, model: &str) -> Option<&'static toml::Table> {
+    // Parse as a document (`Table`): in toml 1.x, `Value::from_str` parses a single value.
+    static OVERRIDES: OnceLock<toml::Table> = OnceLock::new();
+    let overrides = OVERRIDES.get_or_init(|| {
+        BUILTIN_MODEL_OVERRIDES_TOML
+            .parse()
+            .expect("built-in model overrides must be valid TOML")
+    });
+    let key = format!("{provider}/{model}");
+    overrides
+        .get("models")
+        .and_then(|models| models.get(&key))
+        .and_then(toml::Value::as_table)
+}
+
+pub(super) fn apply_local_overrides(
+    provider: &str,
+    model: &str,
+    metadata: ModelMetadata,
+) -> ModelMetadata {
+    match local_override_table(provider, model) {
+        Some(table) => merge_toml_override(metadata, &table),
+        None => metadata,
+    }
+}
+
+/// Resolves `catalog` from one `~/.rho/models.toml` model table.
+///
+/// `anthropic` keeps the same model id under that slug. `anthropic/claude-sonnet-4-5`
+/// remaps both the models.dev provider and the catalog model id.
+pub(super) fn local_catalog_source(
+    table: &toml::map::Map<String, toml::Value>,
+    model: &str,
+) -> Option<(String, String)> {
+    parse_catalog_ref(table.get("catalog")?.as_str()?, model)
+}
+
+/// Splits `provider/model` on the first slash. Extra slashes stay in the model.
+pub(super) fn split_provider_model(value: &str) -> Option<(String, String)> {
+    let value = value.trim();
+    let (provider, model) = value.split_once('/')?;
+    if provider.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some((provider.to_string(), model.to_string()))
+}
+
+pub(super) fn parse_catalog_ref(catalog: &str, fallback_model: &str) -> Option<(String, String)> {
+    let catalog = catalog.trim();
+    if catalog.is_empty() {
+        return None;
+    }
+    if let Some(source) = split_provider_model(catalog) {
+        return Some(source);
+    }
+    if catalog.contains('/') {
+        return None;
+    }
+    Some((catalog.to_string(), fallback_model.to_string()))
+}
+
+pub(super) fn local_override_table(
+    provider: &str,
+    model: &str,
+) -> Option<toml::map::Map<String, toml::Value>> {
+    let path = local_overrides_path()?;
+    local_override_table_at(&path, provider, model)
+}
+
+struct LocalOverrides {
+    path: PathBuf,
+    stamp: FileStamp,
+    document: Option<toml::Table>,
+}
+
+#[derive(PartialEq, Eq)]
+struct FileStamp {
+    modified: SystemTime,
+    created: Option<SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    identity: (u64, u64),
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl FileStamp {
+    fn from_metadata(metadata: &fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            modified: metadata.modified().ok()?,
+            created: metadata.created().ok(),
+            len: metadata.len(),
+            #[cfg(unix)]
+            identity: (metadata.dev(), metadata.ino()),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+
+    fn read(path: &Path) -> Option<Self> {
+        Self::from_metadata(&fs::metadata(path).ok()?)
+    }
+}
+
+fn local_override_table_at(path: &Path, provider: &str, model: &str) -> Option<toml::Table> {
+    // Only the active file is retained. Re-check metadata for every lookup so
+    // editing, deleting, or atomically replacing models.toml takes effect without
+    // restarting. Invalid documents are cached too, until their metadata changes.
+    static CACHE: OnceLock<Mutex<Option<LocalOverrides>>> = OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Ok(metadata) = fs::metadata(path) else {
+        *cache = None;
+        return None;
+    };
+    let Some(stamp) = FileStamp::from_metadata(&metadata) else {
+        *cache = None;
+        return fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| model_override_from_document(&contents, provider, model));
+    };
+    if let Some(cached) = cache
+        .as_ref()
+        .filter(|cached| cached.path == path && cached.stamp == stamp)
+    {
+        return override_from_table(cached.document.as_ref()?, provider, model);
+    }
+    *cache = None;
+    let contents = fs::read_to_string(path).ok()?;
+    let document = contents.parse::<toml::Table>().ok();
+    let table = document
+        .as_ref()
+        .and_then(|document| override_from_table(document, provider, model));
+    // Do not associate a concurrent edit's metadata with the document just read.
+    if FileStamp::read(path).as_ref() == Some(&stamp) {
+        *cache = Some(LocalOverrides {
+            path: path.to_path_buf(),
+            stamp,
+            document,
+        });
+    }
+    table
+}
+
+/// Returns the `[models."provider/model"]` table from a `models.toml` document.
+///
+/// Unparseable documents yield `None` so a broken user file cannot block model loading.
+pub(super) fn model_override_from_document(
+    contents: &str,
+    provider: &str,
+    model: &str,
+) -> Option<toml::Table> {
+    // Parse as a document (`Table`): in toml 1.x, `Value::from_str` parses a single value.
+    let document = contents.parse::<toml::Table>().ok()?;
+    override_from_table(&document, provider, model)
+}
+
+fn override_from_table(document: &toml::Table, provider: &str, model: &str) -> Option<toml::Table> {
+    let key = format!("{provider}/{model}");
+    document
+        .get("models")
+        .and_then(|models| models.get(&key))
+        .and_then(toml::Value::as_table)
+        .cloned()
+}
+
+fn local_overrides_path() -> Option<PathBuf> {
+    // Unit tests must not read the developer's own models.toml; they pass
+    // fixture paths to `local_override_table_at` instead.
+    if cfg!(test) {
+        return None;
+    }
+    if let Some(path) = std::env::var_os("RHO_MODELS_PATH") {
+        return Some(path.into());
+    }
+    Some(crate::paths::rho_dir().ok()?.join("models.toml"))
+}
+
+pub(super) fn merge_toml_override(
+    mut metadata: ModelMetadata,
+    table: &toml::map::Map<String, toml::Value>,
+) -> ModelMetadata {
+    metadata.display_name = table
+        .get("display_name")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .or(metadata.display_name);
+    metadata.advertised_context_window =
+        toml_u64(table, "advertised_context_window").or(metadata.advertised_context_window);
+    metadata.effective_context_window =
+        toml_u64(table, "effective_context_window").or(metadata.effective_context_window);
+    metadata.usable_context_window =
+        toml_u64(table, "usable_context_window").or(metadata.usable_context_window);
+    metadata.long_context_threshold =
+        toml_u64(table, "long_context_threshold").or(metadata.long_context_threshold);
+    metadata.max_output_tokens =
+        toml_u64(table, "max_output_tokens").or(metadata.max_output_tokens);
+    metadata.cost_default = toml_cost(table, "cost_default").or(metadata.cost_default);
+    metadata.cost_long_context =
+        toml_cost(table, "cost_long_context").or(metadata.cost_long_context);
+    if let Some(levels) = toml_reasoning_levels(table, "supported_reasoning_levels") {
+        metadata.supported_reasoning_levels = Some(levels);
+        metadata.reasoning_capabilities_known = true;
+    }
+    metadata
+}
+
+/// `image_input = true|false` from one `models.toml` model table.
+pub(super) fn local_image_input(table: &toml::map::Map<String, toml::Value>) -> Option<ImageInput> {
+    let supported = table.get("image_input")?.as_bool()?;
+    Some(if supported {
+        ImageInput::Supported
+    } else {
+        ImageInput::Unsupported
+    })
+}
+
+pub(super) fn toml_reasoning_levels(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+) -> Option<Vec<ReasoningLevel>> {
+    let mut levels = table
+        .get(key)?
+        .as_array()?
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .filter_map(|value| value.parse().ok())
+        .collect::<Vec<_>>();
+    levels.sort_unstable();
+    levels.dedup();
+    Some(levels)
+}
+
+fn toml_u64(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<u64> {
+    table
+        .get(key)
+        .and_then(|value| value.as_integer())
+        .and_then(|value| u64::try_from(value).ok())
+}
+
+fn toml_cost(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<ModelCost> {
+    let table = table.get(key)?.as_table()?;
+    Some(ModelCost {
+        input_micros_per_m: toml_cost_value(table, "input"),
+        output_micros_per_m: toml_cost_value(table, "output"),
+        cache_read_micros_per_m: toml_cost_value(table, "cache_read"),
+        cache_write_micros_per_m: toml_cost_value(table, "cache_write"),
+    })
+}
+
+fn toml_cost_value(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<u64> {
+    let dollars = table.get(key).and_then(|value| {
+        value
+            .as_float()
+            .or_else(|| value.as_integer().map(|v| v as f64))
+    })?;
+    dollars
+        .is_finite()
+        .then(|| (dollars.max(0.0) * 1_000_000.0).round() as u64)
+}

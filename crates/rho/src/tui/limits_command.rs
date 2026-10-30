@@ -1,0 +1,715 @@
+use std::{collections::BTreeMap, time::Instant};
+
+use ratatui::{
+    style::Style,
+    text::{Line, Span},
+};
+use rho_providers::credentials::CredentialStore;
+
+use super::{
+    activity::LoadingSpinner,
+    background_tasks::{TaskId, UiOutput},
+    overlay_panel::{PanelBody, PanelState},
+    panel_text::{heading_with_status, indented_wrapped_lines, truncate_to},
+    render::display_width,
+    theme::Theme,
+    App, ComposerMode, PanelOverlay,
+};
+use crate::usage_limits::{
+    fetch_usage_provider, now_unix, usage_provider_is_connected, UsageFailure, UsageLimitWindow,
+    UsageProviderKind,
+};
+use crate::usage_limits_cache::{self, UsageLimitsCache};
+
+const BAR_WIDTH: usize = 10;
+const RELATIVE_RESET_CUTOFF_SECONDS: i64 = 24 * 60 * 60;
+const TITLE: &str = "Usage limits";
+const FOOTER: &str = "Enter/Esc close";
+
+pub(super) enum LimitsFetchResult {
+    ProviderReady {
+        limits: crate::usage_limits::ProviderUsageLimits,
+    },
+    Unavailable,
+    Failed {
+        reason: UsageFailure,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum LiveUsage {
+    Ready {
+        limits: crate::usage_limits::ProviderUsageLimits,
+        fetched_at_unix: i64,
+    },
+    Failed(UsageFailure),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LimitsSectionId {
+    Provider(UsageProviderKind),
+}
+
+impl LimitsSectionId {
+    fn provider_kind(self) -> Option<UsageProviderKind> {
+        match self {
+            Self::Provider(kind) => Some(kind),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LimitsSectionStatus {
+    Checking {
+        cached_at_unix: Option<i64>,
+    },
+    Live,
+    Failed {
+        cached_at_unix: Option<i64>,
+        reason: UsageFailure,
+    },
+    Empty,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LimitsSection {
+    id: LimitsSectionId,
+    label: String,
+    status: LimitsSectionStatus,
+    windows: Vec<UsageLimitWindow>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct LimitsOverlay {
+    sections: Vec<LimitsSection>,
+    empty_note: Option<String>,
+    panel: PanelState,
+    checking_started: Instant,
+}
+
+impl PanelBody for LimitsOverlay {
+    fn state(&self) -> &PanelState {
+        &self.panel
+    }
+
+    fn state_mut(&mut self) -> &mut PanelState {
+        &mut self.panel
+    }
+
+    fn title(&self) -> &str {
+        TITLE
+    }
+
+    fn footer(&self) -> &str {
+        FOOTER
+    }
+
+    fn body_lines(&self, width: usize, now: Instant) -> Vec<Line<'static>> {
+        let spinner = self
+            .is_checking()
+            .then(|| LoadingSpinner::frame_since(self.checking_started, now));
+        overlay_body_lines(self, width, spinner, now_unix())
+    }
+}
+
+impl LimitsOverlay {
+    pub(super) fn is_checking(&self) -> bool {
+        self.sections
+            .iter()
+            .any(|section| matches!(section.status, LimitsSectionStatus::Checking { .. }))
+    }
+
+    fn apply_live(&mut self, id: LimitsSectionId, label: &str, windows: Vec<UsageLimitWindow>) {
+        self.upsert(id, label, windows, LimitsSectionStatus::Live);
+    }
+
+    fn apply_failed(
+        &mut self,
+        id: LimitsSectionId,
+        cached_at_unix: Option<i64>,
+        reason: UsageFailure,
+        insert_label: Option<&str>,
+    ) {
+        let status = LimitsSectionStatus::Failed {
+            cached_at_unix,
+            reason,
+        };
+        if let Some(section) = self.section_mut(id) {
+            section.status = status;
+            return;
+        }
+        if let Some(label) = insert_label {
+            self.sections.push(LimitsSection {
+                id,
+                label: label.into(),
+                status,
+                windows: Vec::new(),
+            });
+            self.empty_note = None;
+        }
+    }
+
+    fn section_mut(&mut self, id: LimitsSectionId) -> Option<&mut LimitsSection> {
+        self.sections.iter_mut().find(|section| section.id == id)
+    }
+
+    fn remove_id(&mut self, id: LimitsSectionId) {
+        self.sections.retain(|section| section.id != id);
+        if self.sections.is_empty() {
+            self.empty_note = Some(empty_note());
+        }
+    }
+
+    fn upsert(
+        &mut self,
+        id: LimitsSectionId,
+        label: &str,
+        windows: Vec<UsageLimitWindow>,
+        status: LimitsSectionStatus,
+    ) {
+        let status = if windows.is_empty() && matches!(status, LimitsSectionStatus::Live) {
+            LimitsSectionStatus::Empty
+        } else {
+            status
+        };
+        if let Some(section) = self.section_mut(id) {
+            section.windows = windows;
+            section.status = status;
+            return;
+        }
+        self.sections.push(LimitsSection {
+            id,
+            label: label.into(),
+            status,
+            windows,
+        });
+        self.empty_note = None;
+    }
+}
+
+impl App {
+    pub(super) fn execute_limits_command(
+        &mut self,
+        terminal: &mut crate::tui::DefaultTerminal,
+    ) -> anyhow::Result<()> {
+        self.start_limits_command();
+        terminal.draw(|frame| self.draw(frame))?;
+        Ok(())
+    }
+
+    pub(super) fn start_limits_command(&mut self) {
+        self.open_limits_overlay();
+        self.spawn_missing_usage_fetches();
+        self.set_status("usage limits");
+    }
+
+    pub(super) async fn cancel_limits_command(&mut self) {
+        self.tasks
+            .cancel(|id| matches!(id, TaskId::UsageLimits(_)))
+            .await;
+    }
+
+    /// Section ids with a usage fetch in flight.
+    fn pending_limits_sections(&self) -> Vec<LimitsSectionId> {
+        self.tasks
+            .ids()
+            .filter_map(|id| match id {
+                TaskId::UsageLimits(section) => Some(*section),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Spawn a usage fetch for one section. A join error reads as a failure.
+    pub(super) fn spawn_limits_fetch(
+        &mut self,
+        section: LimitsSectionId,
+        fetch: impl std::future::Future<Output = LimitsFetchResult> + Send + 'static,
+    ) {
+        self.tasks
+            .spawn(TaskId::UsageLimits(section), fetch, move |result| {
+                let result = result.unwrap_or(LimitsFetchResult::Failed {
+                    reason: UsageFailure::Other,
+                });
+                UiOutput::UsageLimits(section, result).into()
+            });
+    }
+
+    fn limits_overlay_mut(&mut self) -> Option<&mut LimitsOverlay> {
+        match self.input_ui.composer_mut() {
+            ComposerMode::Panel(PanelOverlay::Limits(overlay)) => Some(overlay),
+            _ => None,
+        }
+    }
+
+    fn open_limits_overlay(&mut self) {
+        let pending = self.pending_limits_sections();
+        let overlay = build_limits_overlay(
+            self.credential_store.as_ref(),
+            &self.usage_limits_live,
+            pending
+                .iter()
+                .filter_map(|section| section.provider_kind())
+                .collect::<Vec<_>>()
+                .as_slice(),
+            usage_limits_cache::load(),
+            now_unix(),
+        );
+        self.input_ui
+            .set_composer(ComposerMode::Panel(PanelOverlay::Limits(overlay)));
+    }
+
+    fn spawn_missing_usage_fetches(&mut self) {
+        let pending: Vec<UsageProviderKind> = self
+            .pending_limits_sections()
+            .into_iter()
+            .filter_map(LimitsSectionId::provider_kind)
+            .collect();
+        let kinds = connected_kinds(self.credential_store.as_ref());
+        for kind in kinds {
+            if pending.contains(&kind) {
+                continue;
+            }
+            let store = self.credential_store.clone();
+            let client = self
+                .usage_limits_client
+                .get_or_init(crate::reqwest_client)
+                .clone();
+            self.spawn_limits_fetch(LimitsSectionId::Provider(kind), async move {
+                match fetch_usage_provider(kind, store.as_ref(), client).await {
+                    Ok(Some(limits)) => LimitsFetchResult::ProviderReady { limits },
+                    Ok(None) => LimitsFetchResult::Unavailable,
+                    Err(error) => LimitsFetchResult::Failed {
+                        reason: error.failure(),
+                    },
+                }
+            });
+            let live_fetched_at = match self.usage_limits_live.get(&kind) {
+                Some(LiveUsage::Ready {
+                    fetched_at_unix, ..
+                }) => Some(*fetched_at_unix),
+                _ => None,
+            };
+            if let Some(overlay) = self.limits_overlay_mut() {
+                if let Some(section) = overlay.section_mut(LimitsSectionId::Provider(kind)) {
+                    let cached_at_unix = match section.status {
+                        LimitsSectionStatus::Live => live_fetched_at,
+                        LimitsSectionStatus::Checking { cached_at_unix }
+                        | LimitsSectionStatus::Failed { cached_at_unix, .. } => cached_at_unix,
+                        LimitsSectionStatus::Empty => None,
+                    };
+                    section.status = LimitsSectionStatus::Checking { cached_at_unix };
+                }
+            }
+        }
+    }
+
+    /// Apply one finished usage fetch. Always changes the screen.
+    pub(super) fn apply_limits_fetch(
+        &mut self,
+        id: LimitsSectionId,
+        result: LimitsFetchResult,
+    ) -> bool {
+        self.apply_limits_result(id, result);
+        // Rows may have moved under a selection anchored by line.
+        if let Some(overlay) = self.limits_overlay_mut() {
+            overlay.panel.pointer.clear_selection();
+        }
+        true
+    }
+
+    fn apply_limits_result(&mut self, id: LimitsSectionId, result: LimitsFetchResult) {
+        match result {
+            LimitsFetchResult::ProviderReady { limits } => {
+                if let Some(kind) = id.provider_kind() {
+                    self.apply_provider_ready(kind, limits);
+                }
+            }
+            LimitsFetchResult::Unavailable => match id {
+                LimitsSectionId::Provider(kind) => {
+                    self.usage_limits_live.remove(&kind);
+                    if let Some(overlay) = self.limits_overlay_mut() {
+                        overlay.remove_id(LimitsSectionId::Provider(kind));
+                    }
+                }
+            },
+            LimitsFetchResult::Failed { reason } => match id {
+                LimitsSectionId::Provider(kind) => self.mark_usage_failed(kind, reason),
+            },
+        }
+    }
+
+    fn apply_provider_ready(
+        &mut self,
+        kind: UsageProviderKind,
+        limits: crate::usage_limits::ProviderUsageLimits,
+    ) {
+        let fetched_at_unix = now_unix();
+        let windows = limits.windows.clone();
+        let mut cache = usage_limits_cache::load();
+        cache.upsert(kind, limits.windows.clone(), fetched_at_unix);
+        let _ = usage_limits_cache::save(&cache);
+        self.usage_limits_live.insert(
+            kind,
+            LiveUsage::Ready {
+                limits,
+                fetched_at_unix,
+            },
+        );
+        if let Some(overlay) = self.limits_overlay_mut() {
+            overlay.apply_live(LimitsSectionId::Provider(kind), kind.label(), windows);
+        }
+    }
+
+    fn mark_usage_failed(&mut self, kind: UsageProviderKind, reason: UsageFailure) {
+        self.usage_limits_live
+            .insert(kind, LiveUsage::Failed(reason));
+        let cached_at = usage_limits_cache::load()
+            .get(kind)
+            .map(|entry| entry.fetched_at_unix);
+        if let Some(overlay) = self.limits_overlay_mut() {
+            overlay.apply_failed(LimitsSectionId::Provider(kind), cached_at, reason, None);
+        }
+    }
+}
+
+fn connected_kinds(store: &dyn CredentialStore) -> Vec<UsageProviderKind> {
+    UsageProviderKind::ALL
+        .into_iter()
+        .filter(|kind| usage_provider_is_connected(*kind, store).unwrap_or(false))
+        .collect()
+}
+
+fn empty_note() -> String {
+    "no supported providers are connected; connect Claude with /login anthropic-oauth, Codex with /login openai-codex, Kimi Code with /login kimi-code, SpaceXAI with /login xai-oauth, or OpenCode Go with /login opencode-go"
+        .into()
+}
+
+fn build_limits_overlay(
+    store: &dyn CredentialStore,
+    live: &BTreeMap<UsageProviderKind, LiveUsage>,
+    pending: &[UsageProviderKind],
+    cache: UsageLimitsCache,
+    _now_unix: i64,
+) -> LimitsOverlay {
+    let mut sections = Vec::new();
+    for kind in UsageProviderKind::ALL {
+        match usage_provider_is_connected(kind, store) {
+            Ok(false) => {}
+            Ok(true) => sections.push(provider_section(kind, live, pending, &cache)),
+            Err(_) => {
+                let cached = cache.get(kind);
+                sections.push(LimitsSection {
+                    id: LimitsSectionId::Provider(kind),
+                    label: kind.label().into(),
+                    status: LimitsSectionStatus::Failed {
+                        cached_at_unix: cached.map(|entry| entry.fetched_at_unix),
+                        reason: UsageFailure::Other,
+                    },
+                    windows: cached
+                        .map(|entry| entry.windows.clone())
+                        .unwrap_or_default(),
+                });
+            }
+        }
+    }
+    let empty_note = sections.is_empty().then(empty_note);
+    LimitsOverlay {
+        sections,
+        empty_note,
+        panel: PanelState::default(),
+        checking_started: Instant::now(),
+    }
+}
+
+fn provider_section(
+    kind: UsageProviderKind,
+    live: &BTreeMap<UsageProviderKind, LiveUsage>,
+    pending: &[UsageProviderKind],
+    cache: &UsageLimitsCache,
+) -> LimitsSection {
+    let cached = cache.get(kind);
+    let checking = pending.contains(&kind);
+    match live.get(&kind) {
+        Some(LiveUsage::Ready { limits, .. }) if !checking => LimitsSection {
+            id: LimitsSectionId::Provider(kind),
+            label: kind.label().into(),
+            status: if limits.windows.is_empty() {
+                LimitsSectionStatus::Empty
+            } else {
+                LimitsSectionStatus::Live
+            },
+            windows: limits.windows.clone(),
+        },
+        Some(LiveUsage::Failed(reason)) if !checking => LimitsSection {
+            id: LimitsSectionId::Provider(kind),
+            label: kind.label().into(),
+            status: LimitsSectionStatus::Failed {
+                cached_at_unix: cached.map(|entry| entry.fetched_at_unix),
+                reason: *reason,
+            },
+            windows: cached
+                .map(|entry| entry.windows.clone())
+                .unwrap_or_default(),
+        },
+        _ => LimitsSection {
+            id: LimitsSectionId::Provider(kind),
+            label: kind.label().into(),
+            status: LimitsSectionStatus::Checking {
+                cached_at_unix: cached.map(|entry| entry.fetched_at_unix),
+            },
+            windows: cached
+                .map(|entry| entry.windows.clone())
+                .unwrap_or_default(),
+        },
+    }
+}
+
+fn overlay_body_lines(
+    overlay: &LimitsOverlay,
+    width: usize,
+    spinner: Option<&str>,
+    now_unix: i64,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(note) = &overlay.empty_note {
+        lines.extend(indented_wrapped_lines(note, 2, width, Theme::dim()));
+        return lines;
+    }
+
+    let label_width = overlay
+        .sections
+        .iter()
+        .flat_map(|section| section.windows.iter())
+        .map(|window| display_width(&window.label))
+        .max()
+        .unwrap_or(0)
+        .max(display_width("Usage"));
+
+    for (index, section) in overlay.sections.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::default());
+        }
+        lines.push(heading_with_status(
+            &section.label,
+            &heading_status(section, spinner, now_unix),
+            width,
+        ));
+        if section.windows.is_empty() {
+            match section.status {
+                LimitsSectionStatus::Checking { .. } => {
+                    lines.push(placeholder_window_line(label_width, width));
+                }
+                LimitsSectionStatus::Empty
+                | LimitsSectionStatus::Failed { .. }
+                | LimitsSectionStatus::Live => {
+                    lines.push(Line::from(Span::styled(
+                        "  no active usage limit windows reported",
+                        Theme::dim(),
+                    )));
+                }
+            }
+            continue;
+        }
+        lines.extend(section.windows.iter().flat_map(|window| {
+            usage_limit_window_lines(window, label_width, width, now_unix, Theme::text())
+        }));
+    }
+    lines
+}
+
+fn format_age(seconds: i64) -> String {
+    if seconds < 60 {
+        return format!("{seconds}s ago");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m ago");
+    }
+    let hours = minutes / 60;
+    if hours < 48 {
+        return format!("{hours}h ago");
+    }
+    format!("{}d ago", hours / 24)
+}
+
+fn format_age_since(at_unix: i64, now_unix: i64) -> Option<String> {
+    (at_unix > 0).then(|| format_age(now_unix.saturating_sub(at_unix).max(0)))
+}
+
+fn heading_status(section: &LimitsSection, spinner: Option<&str>, now_unix: i64) -> String {
+    match section.status {
+        LimitsSectionStatus::Checking { cached_at_unix } => {
+            let spin = spinner.unwrap_or("⠙");
+            match cached_at_unix.and_then(|cached_at| format_age_since(cached_at, now_unix)) {
+                Some(age) => format!("{spin} updating · {age}"),
+                None => format!("{spin} checking"),
+            }
+        }
+        LimitsSectionStatus::Live => String::new(),
+        LimitsSectionStatus::Failed {
+            cached_at_unix,
+            reason,
+        } => match (reason, cached_at_unix) {
+            (UsageFailure::RateLimited, Some(_)) => "rate limited · showing last known".into(),
+            (UsageFailure::RateLimited, None) => "rate limited · try again in a moment".into(),
+            (UsageFailure::Other, Some(_)) => "update failed".into(),
+            (UsageFailure::Other, None) => "unavailable".into(),
+        },
+        LimitsSectionStatus::Empty => String::new(),
+    }
+}
+
+fn placeholder_window_line(label_width: usize, width: usize) -> Line<'static> {
+    let prefix = format!("  {:label_width$}   ", "—");
+    let bar = "░".repeat(BAR_WIDTH);
+    let text = format!("{prefix}{bar}");
+    Line::from(Span::styled(truncate_to(&text, width), Theme::dim()))
+}
+
+fn usage_limit_window_lines(
+    window: &UsageLimitWindow,
+    label_width: usize,
+    width: usize,
+    now: i64,
+    block_style: Style,
+) -> Vec<Line<'static>> {
+    let reset = window
+        .resets_at_unix
+        .map(|resets_at| format!("resets {}", format_reset_at(resets_at, now)));
+    let note = window.note.as_deref();
+
+    if let Some(remaining) = window.remaining_percent {
+        return usage_window_lines(
+            &window.label,
+            label_width,
+            remaining.round().clamp(0.0, 100.0) as u8,
+            reset.as_deref(),
+            note,
+            width,
+            block_style,
+        );
+    }
+
+    let mut detail = String::new();
+    if let Some(note) = note {
+        detail.push_str(note);
+    }
+    if let Some(reset) = &reset {
+        if !detail.is_empty() {
+            detail.push_str("  · ");
+        }
+        detail.push_str(reset);
+    }
+    let text = if detail.is_empty() {
+        format!("  {:label_width$}", window.label)
+    } else {
+        format!("  {:label_width$}   {detail}", window.label)
+    };
+    vec![Line::from(Span::styled(
+        truncate_to(&text, width),
+        block_style,
+    ))]
+}
+
+/// Renders the bar as percent used: `remaining` still picks the color, so a
+/// nearly-exhausted window reads as a mostly-full red bar like Claude's own
+/// /usage display.
+fn usage_window_lines(
+    label: &str,
+    label_width: usize,
+    remaining: u8,
+    reset: Option<&str>,
+    note: Option<&str>,
+    width: usize,
+    block_style: Style,
+) -> Vec<Line<'static>> {
+    let used = 100u8.saturating_sub(remaining);
+    let filled = (usize::from(used) * BAR_WIDTH + 50) / 100;
+    let bar_style = block_style.patch(remaining_style(remaining));
+    let prefix = format!("  {label:label_width$}   ");
+    let percent = format!("  {used}% used");
+    let mut suffix = String::new();
+    if let Some(reset) = reset {
+        suffix.push_str("  · ");
+        suffix.push_str(reset);
+    }
+    if let Some(note) = note {
+        suffix.push_str("  · ");
+        suffix.push_str(note);
+    }
+    let show_suffix =
+        display_width(&prefix) + BAR_WIDTH + display_width(&percent) + display_width(&suffix)
+            <= width;
+    let main_line = Line::from(vec![
+        Span::styled(prefix, block_style),
+        Span::styled("█".repeat(filled), bar_style),
+        Span::styled(
+            "░".repeat(BAR_WIDTH - filled),
+            block_style.patch(Theme::dim()),
+        ),
+        Span::styled(percent, block_style),
+        Span::styled(
+            if show_suffix {
+                suffix.clone()
+            } else {
+                String::new()
+            },
+            block_style,
+        ),
+    ]);
+    if show_suffix {
+        return vec![main_line];
+    }
+    let mut lines = vec![main_line];
+    if let Some(reset) = reset {
+        lines.push(Line::from(Span::styled(
+            format!("  {reset}"),
+            block_style.patch(Theme::dim()),
+        )));
+    }
+    if let Some(note) = note {
+        lines.extend(indented_wrapped_lines(
+            note,
+            2,
+            width,
+            block_style.patch(Theme::dim()),
+        ));
+    }
+    lines
+}
+
+fn remaining_style(remaining: u8) -> Style {
+    if remaining > 50 {
+        Theme::success()
+    } else if remaining >= 20 {
+        Theme::warning()
+    } else {
+        Theme::error()
+    }
+}
+
+fn format_reset_at(resets_at_unix: i64, now: i64) -> String {
+    let seconds = resets_at_unix.saturating_sub(now);
+    if seconds <= 0 {
+        return "now".into();
+    }
+    if seconds < RELATIVE_RESET_CUTOFF_SECONDS {
+        let hours = seconds / 3600;
+        let minutes = seconds % 3600 / 60;
+        return if hours > 0 {
+            format!("in {hours}h {minutes}m")
+        } else {
+            format!("in {minutes}m")
+        };
+    }
+
+    chrono::DateTime::from_timestamp(resets_at_unix, 0)
+        .map(|reset| {
+            reset
+                .with_timezone(&chrono::Local)
+                .format("%b %d at %-I:%M %p")
+                .to_string()
+        })
+        .unwrap_or_else(|| format!("at Unix time {resets_at_unix}"))
+}

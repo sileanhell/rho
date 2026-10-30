@@ -1,0 +1,59 @@
+[workspace]
+members = ["crates/rho", "crates/rho-providers", "crates/rho-sdk", "crates/rho-tools"]
+exclude = ["fixtures/downstream", "fixtures/publish-boundary"]
+resolver = "2"
+
+[workspace.dependencies]
+# 0.13 defaults to rustls + aws-lc. rustls-no-provider plus an explicit rustls
+# ring dependency keep one crypto provider; the rustls feature would compile
+# aws-lc alongside ring. query/form are optional in 0.13; charset/http2/
+# system-proxy replace the 0.12 defaults we still want.
+reqwest = { version = "0.13", default-features = false, features = [
+    "charset",
+    "form",
+    "http2",
+    "json",
+    "query",
+    "rustls-no-provider",
+    "stream",
+    "system-proxy",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+
+[profile.dev]
+debug = 1
+
+# Startup syntax warmup loads the bundled syntect dump and compiles grammar
+# regexes on every launch. Unoptimized, that roughly doubled the CPU of a debug
+# `rho` start (0.71 s -> 0.34 s user measured), which made the PTY suite
+# CPU-bound. Optimizing only these leaf crates keeps our own code debuggable.
+[profile.dev.package.regex-automata]
+opt-level = 3
+
+[profile.dev.package.regex-syntax]
+opt-level = 3
+
+[profile.dev.package.fancy-regex]
+opt-level = 3
+
+[profile.dev.package.syntect]
+opt-level = 3
+
+[profile.dev.package.bincode]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.dev.package.zlib-rs]
+opt-level = 3
+
+[profile.dev.package.serde_json]
+opt-level = 3
+
+[profile.test]
+debug = 1

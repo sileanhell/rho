@@ -1,0 +1,696 @@
+use std::{
+    collections::BTreeMap,
+    num::NonZeroUsize,
+    sync::{Arc, Mutex},
+};
+
+use crate::{
+    model::Message,
+    persistence::SessionSnapshot,
+    provider::ModelProvider,
+    session::{Session, SessionCore},
+    tool::{Tool, ToolRegistry},
+    Error, SessionId,
+};
+
+pub(crate) const DEFAULT_EVENT_CAPACITY: usize = 64;
+const DEFAULT_MAX_STEPS: usize = 32;
+
+#[derive(Debug, Default)]
+struct LifecycleState {
+    shutdown: bool,
+    runs: BTreeMap<crate::RunId, crate::CancellationToken>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RuntimeLifecycle {
+    state: Mutex<LifecycleState>,
+}
+
+impl RuntimeLifecycle {
+    pub(crate) fn register(
+        &self,
+        run_id: crate::RunId,
+        cancellation: crate::CancellationToken,
+    ) -> Result<(), Error> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.shutdown {
+            return Err(Error::RuntimeShutdown);
+        }
+        state.runs.insert(run_id, cancellation);
+        Ok(())
+    }
+
+    pub(crate) fn unregister(&self, run_id: &crate::RunId) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .runs
+            .remove(run_id);
+    }
+
+    fn shutdown(&self) -> ShutdownOutcome {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.shutdown {
+            return ShutdownOutcome::default();
+        }
+        state.shutdown = true;
+        let cancelled_runs = state.runs.len();
+        for cancellation in state.runs.values() {
+            cancellation.cancel();
+        }
+        ShutdownOutcome { cancelled_runs }
+    }
+
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .shutdown
+    }
+}
+
+/// Result of explicitly shutting down an SDK runtime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShutdownOutcome {
+    cancelled_runs: usize,
+}
+
+impl ShutdownOutcome {
+    pub fn cancelled_runs(&self) -> usize {
+        self.cancelled_runs
+    }
+}
+
+/// Explicit system-prompt policy for a runtime.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SystemPrompt {
+    #[default]
+    None,
+    Custom(String),
+}
+
+/// Options used to create an in-memory SDK session.
+#[derive(Clone, Debug)]
+pub struct SessionOptions {
+    id: SessionId,
+    history: Vec<Message>,
+    revision: crate::Revision,
+    compaction: crate::CompactionState,
+    metadata: BTreeMap<String, String>,
+    prompt_cache_key: Option<String>,
+    apply_system_prompt: bool,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            id: SessionId::default(),
+            history: Vec::new(),
+            revision: crate::Revision::INITIAL,
+            compaction: crate::CompactionState::default(),
+            metadata: BTreeMap::new(),
+            prompt_cache_key: None,
+            apply_system_prompt: true,
+        }
+    }
+}
+
+impl SessionOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn id(mut self, id: SessionId) -> Self {
+        self.id = id;
+        self
+    }
+
+    pub fn history(mut self, history: Vec<Message>) -> Self {
+        self.history = history;
+        self
+    }
+
+    /// Sets an opaque, non-secret cache key forwarded to supporting providers.
+    pub fn prompt_cache_key(mut self, prompt_cache_key: impl Into<String>) -> Self {
+        self.prompt_cache_key = Some(prompt_cache_key.into());
+        self
+    }
+
+    pub fn from_snapshot(snapshot: SessionSnapshot) -> Self {
+        Self {
+            id: snapshot.session_id().clone(),
+            history: snapshot.history().to_vec(),
+            revision: snapshot.revision(),
+            compaction: snapshot.compaction().clone(),
+            metadata: snapshot.metadata().clone(),
+            prompt_cache_key: snapshot.prompt_cache_key().map(str::to_owned),
+            apply_system_prompt: false,
+        }
+    }
+}
+
+/// Builder for the headless Rho runtime.
+#[derive(Default)]
+pub struct RhoBuilder {
+    provider: Option<Arc<dyn ModelProvider>>,
+    tools: Vec<Arc<dyn Tool>>,
+    system_prompt: SystemPrompt,
+    event_capacity: Option<NonZeroUsize>,
+    max_steps: Option<NonZeroUsize>,
+    max_parallel_tools: Option<NonZeroUsize>,
+    workspace: Option<crate::Workspace>,
+    workspace_policy: Option<Arc<dyn crate::WorkspacePolicy>>,
+    approval_handler: Option<Arc<dyn crate::ApprovalHandler>>,
+    approval_session: Option<crate::ApprovalSession>,
+    compactor: Option<Arc<dyn crate::Compactor>>,
+    compaction_policy: Option<crate::CompactionPolicy>,
+    reasoning_level: crate::ReasoningLevel,
+    service_tier: Option<crate::model::ServiceTier>,
+    usage_recording: Option<crate::ProviderRequestUsageRecording>,
+    usage_purpose: Option<String>,
+    usage_parent_session_id: Option<crate::SessionId>,
+    hook_observer: Option<Arc<dyn crate::hooks::HookObserver>>,
+    pre_tool_gate: Option<Arc<dyn crate::hooks::PreToolUseGate>>,
+    hook_payload_bounds: crate::hooks::HookPayloadBounds,
+    hook_delegation: crate::hooks::HookDelegation,
+    hook_host_labels: crate::hooks::HookHostLabels,
+    force_publish_live_history: bool,
+    tool_visibility: Option<Arc<dyn crate::tool::ToolVisibility>>,
+    request_context: Option<Arc<dyn crate::RequestContext>>,
+}
+
+impl RhoBuilder {
+    pub fn provider<P>(mut self, provider: P) -> Self
+    where
+        P: ModelProvider + 'static,
+    {
+        self.provider = Some(Arc::new(provider));
+        self
+    }
+
+    pub fn provider_shared(mut self, provider: Arc<dyn ModelProvider>) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    /// Supplies live host context appended only to model requests. The source
+    /// owns persistence; conversation history and compaction input stay unchanged.
+    pub fn request_context(mut self, source: impl crate::RequestContext + 'static) -> Self {
+        self.request_context = Some(Arc::new(source));
+        self
+    }
+
+    pub fn tool<T>(mut self, tool: T) -> Self
+    where
+        T: Tool + 'static,
+    {
+        self.tools.push(Arc::new(tool));
+        self
+    }
+
+    /// Registers an already shared tool implementation on the runtime.
+    pub fn tool_shared(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
+    pub fn system_prompt(mut self, system_prompt: SystemPrompt) -> Self {
+        self.system_prompt = system_prompt;
+        self
+    }
+
+    pub fn event_capacity(mut self, capacity: NonZeroUsize) -> Self {
+        self.event_capacity = Some(capacity);
+        self
+    }
+
+    pub fn max_steps(mut self, max_steps: NonZeroUsize) -> Self {
+        self.max_steps = Some(max_steps);
+        self
+    }
+
+    /// Sets the maximum number of tool calls that may execute at once.
+    ///
+    /// The default is one, which preserves sequential execution unless the
+    /// embedding host opts in to parallel tool calls.
+    pub fn max_parallel_tools(mut self, max_parallel_tools: NonZeroUsize) -> Self {
+        self.max_parallel_tools = Some(max_parallel_tools);
+        self
+    }
+
+    /// Supplies an explicit filesystem scope without granting capabilities.
+    pub fn workspace(mut self, workspace: crate::Workspace) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
+    pub fn workspace_policy<P>(mut self, policy: P) -> Self
+    where
+        P: crate::WorkspacePolicy + 'static,
+    {
+        self.workspace_policy = Some(Arc::new(policy));
+        self
+    }
+
+    pub fn approval_handler<A>(mut self, handler: A) -> Self
+    where
+        A: crate::ApprovalHandler + 'static,
+    {
+        self.approval_handler = Some(Arc::new(handler));
+        self.approval_session = None;
+        self
+    }
+
+    pub fn approval_handler_shared(mut self, handler: Arc<dyn crate::ApprovalHandler>) -> Self {
+        self.approval_handler = Some(handler);
+        self.approval_session = None;
+        self
+    }
+
+    /// Shares one exact-request approval session across every SDK session
+    /// created by this runtime and any other host given the same value.
+    pub fn approval_session(mut self, session: crate::ApprovalSession) -> Self {
+        self.approval_session = Some(session);
+        self.approval_handler = None;
+        self
+    }
+
+    pub fn compactor<C>(mut self, compactor: C) -> Self
+    where
+        C: crate::Compactor + 'static,
+    {
+        self.compactor = Some(Arc::new(compactor));
+        self
+    }
+
+    pub fn compaction_policy(mut self, policy: crate::CompactionPolicy) -> Self {
+        self.compaction_policy = Some(policy);
+        self
+    }
+
+    pub fn reasoning_level(mut self, reasoning_level: crate::ReasoningLevel) -> Self {
+        self.reasoning_level = reasoning_level;
+        self
+    }
+
+    /// Sets the service class used by sessions created from this runtime.
+    pub fn service_tier(mut self, service_tier: crate::model::ServiceTier) -> Self {
+        self.service_tier = Some(service_tier);
+        self
+    }
+
+    pub fn usage_recorder<R>(mut self, recorder: R) -> Self
+    where
+        R: crate::ProviderRequestUsageRecorder + 'static,
+    {
+        self.usage_recording = Some(crate::ProviderRequestUsageRecording::new(recorder));
+        self
+    }
+
+    pub fn usage_recorder_shared(
+        mut self,
+        recorder: Arc<dyn crate::ProviderRequestUsageRecorder>,
+    ) -> Self {
+        self.usage_recording = Some(crate::ProviderRequestUsageRecording::new_shared(recorder));
+        self
+    }
+
+    /// Uses a shared recorder and diagnostic store for all runtime-owned model requests.
+    pub fn usage_recording(mut self, recording: crate::ProviderRequestUsageRecording) -> Self {
+        self.usage_recording = Some(recording);
+        self
+    }
+
+    /// Labels provider requests for host accounting. Defaults to `"agent"`.
+    pub fn usage_purpose(mut self, purpose: impl Into<String>) -> Self {
+        self.usage_purpose = Some(purpose.into());
+        self
+    }
+
+    pub fn usage_parent_session_id(mut self, session_id: crate::SessionId) -> Self {
+        self.usage_parent_session_id = Some(session_id);
+        self
+    }
+
+    /// Receives observational lifecycle events. See [`crate::hooks`].
+    pub fn hook_observer_shared(mut self, observer: Arc<dyn crate::hooks::HookObserver>) -> Self {
+        self.hook_observer = Some(observer);
+        self
+    }
+
+    /// Installs the deny-only gate consulted before a capability is authorized.
+    pub fn pre_tool_gate_shared(mut self, gate: Arc<dyn crate::hooks::PreToolUseGate>) -> Self {
+        self.pre_tool_gate = Some(gate);
+        self
+    }
+
+    /// Overrides the field and envelope size limits applied to hook payloads.
+    pub fn hook_payload_bounds(mut self, bounds: crate::hooks::HookPayloadBounds) -> Self {
+        self.hook_payload_bounds = bounds;
+        self
+    }
+
+    /// Records the parent identity a delegated runtime reports in hook envelopes.
+    pub fn hook_delegation(mut self, delegation: crate::hooks::HookDelegation) -> Self {
+        self.hook_delegation = delegation;
+        self
+    }
+
+    /// Adds generic, non-secret labels to hook envelopes from this runtime.
+    pub fn hook_host_labels(mut self, labels: crate::hooks::HookHostLabels) -> Self {
+        self.hook_host_labels = labels;
+        self
+    }
+
+    /// Chooses the advertised tool subset per model request.
+    ///
+    /// Without one, every registered tool is advertised on every request.
+    pub fn tool_visibility_shared(
+        mut self,
+        visibility: Arc<dyn crate::tool::ToolVisibility>,
+    ) -> Self {
+        self.tool_visibility = Some(visibility);
+        self
+    }
+
+    /// Publishes the turn in flight for [`crate::Session::live_history`] even
+    /// when no registered tool or approval handler declares it reads live history.
+    /// Prefer [`crate::ApprovalHandler::reads_live_history`] for approval handlers.
+    /// Keep this escape hatch for non-handler host logic.
+    pub fn force_publish_live_history(mut self, force: bool) -> Self {
+        self.force_publish_live_history = force;
+        self
+    }
+
+    pub fn build(self) -> Result<Rho, Error> {
+        let provider = self.provider.ok_or_else(|| Error::InvalidConfiguration {
+            message: "a model provider is required".into(),
+        })?;
+        let tool_reads_live_history = self.tools.iter().any(|tool| tool.reads_live_history());
+        let mut tools = ToolRegistry::new();
+        for tool in self.tools {
+            tools
+                .register_shared(tool)
+                .map_err(|error| Error::InvalidConfiguration {
+                    message: error.to_string(),
+                })?;
+        }
+        if self.compaction_policy.is_some() && self.compactor.is_none() {
+            return Err(Error::InvalidConfiguration {
+                message: "automatic compaction policy requires a compactor".into(),
+            });
+        }
+        let usage_purpose = self.usage_purpose.unwrap_or_else(|| "agent".into());
+        if usage_purpose.trim().is_empty() {
+            return Err(Error::InvalidConfiguration {
+                message: "usage purpose must not be empty".into(),
+            });
+        }
+        let (approval_handler, approvals, approval_audit) = match self.approval_session {
+            Some(session) => (
+                session.handler(),
+                Some(session.remembered()),
+                session.audit_log(),
+            ),
+            None => (
+                self.approval_handler
+                    .unwrap_or_else(|| Arc::new(crate::DenyApprovals)),
+                None,
+                Arc::default(),
+            ),
+        };
+        let publish_live_history = self.force_publish_live_history
+            || approval_handler.reads_live_history()
+            || tool_reads_live_history;
+        Ok(Rho {
+            provider,
+            tools,
+            system_prompt: self.system_prompt,
+            event_capacity: self
+                .event_capacity
+                .unwrap_or_else(|| NonZeroUsize::new(DEFAULT_EVENT_CAPACITY).unwrap()),
+            max_steps: self
+                .max_steps
+                .unwrap_or_else(|| NonZeroUsize::new(DEFAULT_MAX_STEPS).unwrap()),
+            max_parallel_tools: self
+                .max_parallel_tools
+                .unwrap_or_else(|| NonZeroUsize::new(1).unwrap()),
+            workspace: self.workspace,
+            workspace_policy: self
+                .workspace_policy
+                .unwrap_or_else(|| Arc::new(crate::DenyAllPolicy)),
+            approval_handler,
+            approvals,
+            compactor: self.compactor,
+            compaction_policy: self.compaction_policy,
+            reasoning_level: self.reasoning_level,
+            service_tier: self.service_tier,
+            usage_recording: self.usage_recording.unwrap_or_default(),
+            usage_purpose,
+            usage_parent_session_id: self.usage_parent_session_id,
+            approval_audit,
+            hooks: crate::hooks::HookWiring::new(
+                self.hook_observer,
+                self.pre_tool_gate,
+                self.hook_payload_bounds,
+                self.hook_delegation,
+            )
+            .with_host_labels(self.hook_host_labels),
+            publish_live_history,
+            lifecycle: Arc::new(RuntimeLifecycle::default()),
+            boundary_inputs: None,
+            tool_visibility: self.tool_visibility,
+            checkpoint_store: None,
+            request_context: self.request_context,
+        })
+    }
+}
+
+/// Headless runtime configuration shared by SDK sessions.
+#[derive(Clone)]
+pub struct Rho {
+    pub(crate) boundary_inputs: Option<crate::BoundaryInputSource>,
+    pub(crate) provider: Arc<dyn ModelProvider>,
+    pub(crate) tools: ToolRegistry,
+    pub(crate) system_prompt: SystemPrompt,
+    pub(crate) event_capacity: NonZeroUsize,
+    pub(crate) max_steps: NonZeroUsize,
+    pub(crate) max_parallel_tools: NonZeroUsize,
+    pub(crate) workspace: Option<crate::Workspace>,
+    pub(crate) workspace_policy: Arc<dyn crate::WorkspacePolicy>,
+    pub(crate) approval_handler: Arc<dyn crate::ApprovalHandler>,
+    pub(crate) approvals: Option<Arc<crate::workspace::SessionApprovals>>,
+    pub(crate) compactor: Option<Arc<dyn crate::Compactor>>,
+    pub(crate) compaction_policy: Option<crate::CompactionPolicy>,
+    pub(crate) reasoning_level: crate::ReasoningLevel,
+    pub(crate) service_tier: Option<crate::model::ServiceTier>,
+    pub(crate) usage_recording: crate::ProviderRequestUsageRecording,
+    pub(crate) usage_purpose: String,
+    pub(crate) usage_parent_session_id: Option<crate::SessionId>,
+    pub(crate) approval_audit: Arc<crate::workspace::ApprovalAuditLog>,
+    pub(crate) hooks: crate::hooks::HookWiring,
+    /// True when a registered tool or approval handler declared live-history
+    /// reads, or the host forced publication, so runs publish the turn in flight
+    /// for [`crate::Session::live_history`].
+    pub(crate) publish_live_history: bool,
+    pub(crate) lifecycle: Arc<RuntimeLifecycle>,
+    /// Advertised subset per model request; `None` advertises every tool.
+    pub(crate) tool_visibility: Option<Arc<dyn crate::tool::ToolVisibility>>,
+    /// Per-session step checkpoints; see [`crate::Session::set_checkpoint_store`].
+    pub(crate) checkpoint_store: Option<Arc<dyn crate::SessionStore>>,
+    pub(crate) request_context: Option<Arc<dyn crate::RequestContext>>,
+}
+
+impl Rho {
+    pub fn builder() -> RhoBuilder {
+        RhoBuilder::default()
+    }
+
+    /// Filters registry specs to the subset advertised right now.
+    ///
+    /// Borrows `all` unchanged when no visibility is installed, so the common
+    /// case keeps the once-per-run schema snapshot without per-step clones.
+    pub(crate) fn advertised_specs<'a>(
+        &self,
+        all: &'a [crate::model::ToolSpec],
+    ) -> std::borrow::Cow<'a, [crate::model::ToolSpec]> {
+        let Some(visibility) = self.tool_visibility.as_ref() else {
+            return std::borrow::Cow::Borrowed(all);
+        };
+        std::borrow::Cow::Owned(crate::tool::advertised_specs(all, visibility.as_ref()))
+    }
+
+    /// Owned advertised specs for estimates and compaction outside a run loop.
+    pub(crate) fn advertised_tool_specs(&self) -> Vec<crate::model::ToolSpec> {
+        self.advertised_specs(&self.tools.specs()).into_owned()
+    }
+
+    pub fn shutdown(&self) -> ShutdownOutcome {
+        self.lifecycle.shutdown()
+    }
+
+    pub fn diagnostics(&self) -> crate::DiagnosticsSnapshot {
+        let prompt_sources = match &self.system_prompt {
+            SystemPrompt::None => Vec::new(),
+            SystemPrompt::Custom(_) => vec![crate::diagnostics::PromptSource::custom()],
+        };
+        crate::DiagnosticsSnapshot::new(
+            self.provider.identity(),
+            crate::diagnostics::SecuritySettings {
+                tool_names: self
+                    .tools
+                    .specs()
+                    .into_iter()
+                    .map(|spec| spec.name)
+                    .collect(),
+                tool_security: self.tools.diagnostics(),
+                workspace_root: self
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.root().to_path_buf()),
+                granted_workspace_roots: self
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.granted_roots().to_vec())
+                    .unwrap_or_default(),
+                unrestricted_file_access: self
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|workspace| workspace.has_unrestricted_file_access()),
+                prompt_sources,
+                approval_audit: self.approval_audit.snapshot(),
+            },
+            crate::diagnostics::ExecutionSettings {
+                event_capacity: self.event_capacity.get(),
+                max_steps: self.max_steps.get(),
+                max_parallel_tools: self.max_parallel_tools.get(),
+                compaction_trigger_messages: self.compaction_policy.as_ref().and_then(|policy| {
+                    match policy.threshold() {
+                        crate::CompactionThreshold::Messages(trigger) => Some(trigger.get()),
+                        crate::CompactionThreshold::ContextTokens(_) => None,
+                    }
+                }),
+                compaction_trigger_tokens: self.compaction_policy.as_ref().and_then(|policy| {
+                    match policy.threshold() {
+                        crate::CompactionThreshold::ContextTokens(trigger) => Some(trigger.get()),
+                        crate::CompactionThreshold::Messages(_) => None,
+                    }
+                }),
+                reasoning_level: self.reasoning_level,
+                service_tier: self.service_tier,
+                usage_recorder_diagnostics: self.usage_recording.diagnostics(),
+            },
+        )
+    }
+
+    pub fn usage_recording(&self) -> crate::ProviderRequestUsageRecording {
+        self.usage_recording.clone()
+    }
+
+    /// Handle for the session-boundary events only the host can observe.
+    ///
+    /// The runtime dispatches everything inside a session's lifetime. An
+    /// interactive session ends when the host says so, which can be long after
+    /// its last run, so `session_completed` and `session_failed` are host calls.
+    pub fn hooks(&self) -> crate::hooks::HookDispatcher {
+        crate::hooks::HookDispatcher::new(
+            self.hooks.clone(),
+            self.workspace
+                .as_ref()
+                .map(|workspace| workspace.root().to_path_buf()),
+        )
+    }
+
+    pub async fn session(&self, options: SessionOptions) -> Result<Session, Error> {
+        self.create_session(options, SessionLifecycle::Started)
+    }
+
+    /// Reconstructs the SDK object for an already-live logical session.
+    ///
+    /// Hosts use this while replacing runtime infrastructure around a session,
+    /// for example after a policy change. Unlike [`Rho::session`], this does not
+    /// emit `session_started`; the logical session has already started.
+    pub async fn rebind_session(&self, options: SessionOptions) -> Result<Session, Error> {
+        self.create_session(options, SessionLifecycle::Rebound)
+    }
+
+    fn create_session(
+        &self,
+        options: SessionOptions,
+        lifecycle: SessionLifecycle,
+    ) -> Result<Session, Error> {
+        if self.lifecycle.is_shutdown() {
+            return Err(Error::RuntimeShutdown);
+        }
+        let mut history = options.history;
+        if options.apply_system_prompt {
+            if let SystemPrompt::Custom(prompt) = &self.system_prompt {
+                history.insert(0, Message::System(prompt.clone()));
+            }
+        }
+        let session = Session::from_core(SessionCore::new(
+            options.id,
+            history,
+            options.revision,
+            options.compaction,
+            options.metadata,
+            options.prompt_cache_key,
+            self.clone(),
+        ));
+        match lifecycle {
+            SessionLifecycle::Started => self.hooks.observe(
+                Some(session.id()),
+                None,
+                self.workspace.as_ref().map(crate::Workspace::root),
+                |builder| {
+                    let identity = self.provider.identity();
+                    let model = builder.bounded_string(
+                        format!("{}/{}", identity.provider, identity.model),
+                        "payload.model",
+                    );
+                    crate::hooks::HookPayload::SessionStarted(crate::hooks::SessionStartedPayload {
+                        model,
+                    })
+                },
+            ),
+            SessionLifecycle::Rebound => {}
+        }
+        Ok(session)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionLifecycle {
+    Started,
+    Rebound,
+}
+
+impl std::fmt::Debug for Rho {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Rho")
+            .field("provider", &self.provider.identity())
+            .field("tools", &self.tools)
+            .field("system_prompt", &self.system_prompt)
+            .field("event_capacity", &self.event_capacity)
+            .field("max_steps", &self.max_steps)
+            .field("workspace", &self.workspace)
+            .field("workspace_policy", &self.workspace_policy)
+            .field("approval_handler", &self.approval_handler)
+            .field("compactor", &self.compactor.is_some())
+            .field("compaction_policy", &self.compaction_policy)
+            .field("reasoning_level", &self.reasoning_level)
+            .field("service_tier", &self.service_tier)
+            .field("usage_recorder", &self.usage_recording.is_enabled())
+            .field("usage_purpose", &self.usage_purpose)
+            .finish()
+    }
+}

@@ -1,0 +1,964 @@
+//! Stable provider identity, descriptor table, and runtime construction metadata.
+//!
+//! Credential-store access and HTTP adapters live elsewhere. Each
+//! [`ProviderDescriptor`] owns its runtime shape and optional default model so
+//! new providers are table rows rather than parallel match arms.
+
+pub const OPENAI_API_KEY_ACCOUNT: &str = "provider:openai:api-key";
+pub const ANTHROPIC_TOKENS_ACCOUNT: &str = "provider:anthropic:tokens";
+pub const GOOGLE_API_KEY_ACCOUNT: &str = "provider:google:api-key";
+pub const CODEX_TOKENS_ACCOUNT: &str = "provider:openai-codex:tokens";
+pub const GITHUB_COPILOT_TOKENS_ACCOUNT: &str = "provider:github-copilot:tokens";
+pub const XAI_API_KEY_ACCOUNT: &str = "provider:xai:api-key";
+pub const XAI_TOKENS_ACCOUNT: &str = "provider:xai:tokens";
+pub const MOONSHOT_API_KEY_ACCOUNT: &str = "provider:moonshot:api-key";
+pub const OLLAMA_API_KEY_ACCOUNT: &str = "provider:ollama:api-key";
+pub const OLLAMA_CLOUD_API_KEY_ACCOUNT: &str = "provider:ollama-cloud:api-key";
+pub const POOLSIDE_API_KEY_ACCOUNT: &str = "provider:poolside:api-key";
+pub const OPENROUTER_API_KEY_ACCOUNT: &str = "provider:openrouter:api-key";
+pub const OPENROUTER_OAUTH_KEY_ACCOUNT: &str = "provider:openrouter:oauth-key";
+pub const KIMI_TOKENS_ACCOUNT: &str = "provider:kimi-code:tokens";
+pub const QWEN_TOKEN_PLAN_API_KEY_ACCOUNT: &str = "provider:qwen-token-plan:api-key";
+pub const META_API_KEY_ACCOUNT: &str = "provider:meta:api-key";
+pub const META_MUSE_TOKENS_ACCOUNT: &str = "provider:meta:muse";
+pub const OPENCODE_GO_API_KEY_ACCOUNT: &str = "provider:opencode-go:api-key";
+pub const OPENCODE_API_KEY_ACCOUNT: &str = "provider:opencode:api-key";
+pub const MINIMAX_API_KEY_ACCOUNT: &str = "provider:minimax:api-key";
+pub const TYPESAFE_API_KEY_ACCOUNT: &str = "provider:typesafe:api-key";
+
+/// Auth profile id meaning "this provider needs no credential".
+pub const KEYLESS_AUTH: &str = "none";
+
+pub const OLLAMA_API_BASE: &str = "http://127.0.0.1:11434/v1";
+pub const OLLAMA_CLOUD_API_BASE: &str = "https://ollama.com/v1";
+pub const MOONSHOT_API_BASE: &str = "https://api.moonshot.ai/v1";
+pub const POOLSIDE_API_BASE: &str = "https://inference.poolside.ai/v1";
+pub const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
+pub const KIMI_CODE_API_BASE: &str = "https://api.kimi.com/coding/v1";
+/// Default OpenAI-compatible Token Plan base (Singapore / international).
+pub const QWEN_TOKEN_PLAN_API_BASE: &str =
+    "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+/// Meta Model API OpenAI-compatible base (Chat Completions and `/models`).
+pub const META_API_BASE: &str = "https://api.meta.ai/v1";
+/// OpenCode Go base (Chat Completions, Responses, Messages, Gemini
+/// `generateContent`, `/models`). The older `/zen/go/v1` base serves the first
+/// three but returns 404 for Gemini.
+pub const OPENCODE_GO_API_BASE: &str = "https://opencode.ai/inference/go/v1";
+/// OpenCode Zen pay-as-you-go base (Chat Completions, Responses, Messages,
+/// Gemini `generateContent`, `/models`).
+pub const OPENCODE_API_BASE: &str = "https://opencode.ai/zen/v1";
+/// MiniMax Anthropic-compatible base (`/messages` and `/models`).
+pub const MINIMAX_API_BASE: &str = "https://api.minimax.io/anthropic/v1";
+/// TypeSafe System One base (`/systemone`), which serves the Jev decision models.
+pub const TYPESAFE_API_BASE: &str = "https://api.typesafe.ai/v1";
+/// Placeholder only. Config-defined hosts must take their API base from application config.
+pub const OPENAI_COMPATIBLE_API_BASE: &str = "http://127.0.0.1:0/v1";
+
+/// Ollama's OpenAI-compatible API accepts only these effort values.
+pub const OLLAMA_UNKNOWN_REASONING_LEVELS: &[crate::reasoning::ReasoningLevel] = &[
+    crate::reasoning::ReasoningLevel::Off,
+    crate::reasoning::ReasoningLevel::Low,
+    crate::reasoning::ReasoningLevel::Medium,
+    crate::reasoning::ReasoningLevel::High,
+    crate::reasoning::ReasoningLevel::Max,
+];
+
+/// OpenAI API-key vs Codex OAuth runtime auth selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenAiRuntimeAuth {
+    ApiKey,
+    Codex,
+}
+
+/// How a registered provider is constructed at runtime.
+///
+/// Owned on [`ProviderDescriptor`] so adding a provider is a single table row
+/// rather than a parallel match arm in the registry.
+///
+/// # Next major
+///
+/// NEXT_MAJOR(rho-providers): mark ProviderRuntime `#[non_exhaustive]` so new runtimes are minor-compatible.
+///
+/// New runtimes land in minor releases, as the repo has added providers since
+/// 1.x; an exhaustive match outside this crate breaks on each one until then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderRuntime {
+    OpenAi {
+        auth_mode: OpenAiRuntimeAuth,
+    },
+    /// Hosts that need a default API base, including first-party Anthropic
+    /// Messages hosts such as MiniMax.
+    ///
+    /// `ProviderRuntime::Anthropic` is pinned to `api.anthropic.com` and has
+    /// no `default_api_base`. Until that runtime grows one, Anthropic-compatible
+    /// vendors stay on this variant so they share endpoint resolution with
+    /// other first-party compatible hosts. `dialect` is only read on the Chat
+    /// Completions construction path.
+    OpenAiCompatible {
+        dialect: crate::openai_compatible_dialect::OpenAiCompatibleDialect,
+        default_api_base: &'static str,
+        /// Whether Chat Completions construction may follow the catalog's
+        /// models.dev `npm` mapping. Declared Responses and Anthropic Messages
+        /// ignore this and construct as [`OpenAiCompatibleApi`].
+        catalog_construction: CatalogConstruction,
+    },
+    Anthropic,
+    Google,
+    GithubCopilot,
+    Xai,
+    /// A decision-model host: it serves the System One API
+    /// ([`crate::system_one`]) at `{default_api_base}/systemone`, and no chat
+    /// models, so chat model selection and construction refuse it.
+    SystemOne {
+        default_api_base: &'static str,
+    },
+}
+
+impl ProviderRuntime {
+    /// Only Chat Completions runtimes can defer their wire adapter to the
+    /// catalog; every other runtime constructs as declared.
+    pub fn catalog_construction(self) -> CatalogConstruction {
+        match self {
+            Self::OpenAiCompatible {
+                catalog_construction,
+                ..
+            } => catalog_construction,
+            Self::OpenAi { .. }
+            | Self::Anthropic
+            | Self::Google
+            | Self::GithubCopilot
+            | Self::Xai
+            | Self::SystemOne { .. } => CatalogConstruction::Runtime,
+        }
+    }
+}
+
+/// Provider families that share one backend for auth-profile switching.
+///
+/// OpenAI API-key and Codex OAuth are two auth modes on the same backend;
+/// all other providers are isolated families. Add new groupings here rather
+/// than hiding them in runtime equality.
+///
+/// Next-major intent: collapse `openai` + `codex` into one provider with two
+/// auth modes (like `openrouter`/`xai` already do) so family grouping becomes
+/// unnecessary; similarly `kimi-code` wants to be an auth mode on `moonshot`
+/// rather than a separate provider with a different API base, which is why
+/// `catalog::CROSS_PROVIDER_LOGIN_GROUPS` exists.
+const AUTH_FAMILY_GROUPS: &[&[ProviderId]] = &[&[ProviderId::OpenAi, ProviderId::OpenAiCodex]];
+
+/// API-key auth profiles that one key unlocks. OpenCode's console issues a
+/// single key for Zen and Go.
+///
+/// Login offers a sibling's stored key instead of asking for it again. Each
+/// profile still stores its own copy, so a provider's models appear only
+/// after the user logs in to that provider.
+const SHARED_API_KEY_AUTHS: &[&[&str]] = &[&["opencode-api-key", "opencode-go-api-key"]];
+
+/// Other auth profiles whose API key also works for `auth`.
+pub(crate) fn shared_api_key_auths(auth: &str) -> impl Iterator<Item = &'static str> + '_ {
+    SHARED_API_KEY_AUTHS
+        .iter()
+        .filter(move |group| group.contains(&auth))
+        .flat_map(|group| group.iter().copied())
+        .filter(move |sibling| *sibling != auth)
+}
+
+/// Stable provider identity.
+///
+/// Config-defined OpenAI-compatible hosts share [`Self::OpenAiCompatible`].
+/// Distinguish those hosts by [`ProviderDescriptor::name`].
+///
+/// # Next major
+///
+/// NEXT_MAJOR(rho-providers): mark ProviderId `#[non_exhaustive]` so new providers are minor-compatible.
+///
+/// New providers land in minor releases, as the repo has added providers since
+/// 1.x; an exhaustive match outside this crate breaks on each one until then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProviderId {
+    Ollama,
+    OllamaCloud,
+    OpenAi,
+    OpenAiCodex,
+    Anthropic,
+    Google,
+    GithubCopilot,
+    Xai,
+    Moonshot,
+    Poolside,
+    OpenRouter,
+    KimiCode,
+    QwenTokenPlan,
+    Meta,
+    OpenCodeGo,
+    OpenCode,
+    MiniMax,
+    TypeSafe,
+    OpenAiCompatible,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserOAuthFlow {
+    OpenRouter,
+}
+
+impl BrowserOAuthFlow {
+    pub const fn provider_label(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "OpenRouter",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BearerCredentialAcquisition {
+    BrowserOAuth(BrowserOAuthFlow),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderModelSource {
+    StaticCatalog,
+    CachedProviderModels,
+}
+
+/// Defines how raw models.dev reasoning controls become application capabilities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogReasoningPolicy {
+    /// Provider-specific protocol details cannot yet be represented safely.
+    Unknown,
+    /// This provider path does not forward a user reasoning control.
+    NotConfigurable,
+    /// Only controls explicitly advertised by the catalog are selectable.
+    ExactAdvertised,
+    /// A catalog toggle is a supported way to select `Off` for this protocol.
+    OffByAdvertisedToggle,
+    /// A reasoning model exposes a binary provider control as `Off` or `Max`.
+    OffOrMax,
+    /// The provider serializes `Off` as a provider-owned `none` control.
+    OffAsNone,
+}
+
+/// How an OpenAI-compatible table row chooses its HTTP adapter.
+///
+/// [`Self::Runtime`] uses [`ProviderRuntime`] only. [`Self::PreferModelsDevNpm`]
+/// may construct Responses or Anthropic adapters when models.dev names a
+/// different AI SDK package for the selected model.
+///
+/// A host's wire API is [`OpenAiCompatibleApi`] on the descriptor, not a
+/// construction policy. [`PreferModelsDevNpm`] is the only path that consults
+/// catalog npm mapping, and only as a Chat Completions fallback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CatalogConstruction {
+    #[default]
+    Runtime,
+    PreferModelsDevNpm,
+}
+
+/// What to serialize when a Standard-dialect model is missing catalog metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnknownEffortPolicy {
+    /// Omit the field so the host applies its own default.
+    Omit,
+    /// Send the requested level, including `Off` as `"none"`.
+    SendRequested,
+    /// Map the request onto this fixed vocabulary.
+    Constrain(&'static [crate::reasoning::ReasoningLevel]),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderModelRefreshKind {
+    OpenAi,
+    Anthropic,
+    Google,
+    GithubCopilot,
+    OpenAiCompatible,
+    /// [`Self::OpenAiCompatible`] minus models models.dev prices at $0 for
+    /// input and output. OpenCode Zen lists its free models to everyone but
+    /// serves them only to the OpenCode client (`403 FreeTierError`).
+    OpenAiCompatiblePaid,
+    /// Anthropic `/models` against the descriptor's resolved API base.
+    ///
+    /// Unlike [`Self::Anthropic`], this does not pin `api.anthropic.com` or
+    /// drop non-`claude-` ids.
+    AnthropicCompatible,
+    /// Native Ollama `/api/tags` + `/api/show`, falling back to `/v1/models`.
+    Ollama,
+}
+
+impl ProviderModelRefreshKind {
+    /// True when `/doctor` and health probes hit `/v1/models`.
+    pub(crate) fn probes_openai_compatible_models(self) -> bool {
+        matches!(
+            self,
+            Self::OpenAiCompatible | Self::OpenAiCompatiblePaid | Self::Ollama
+        )
+    }
+}
+
+/// How a provider encodes model IDs on the wire versus in Rho cache/config.
+///
+/// Discovery, selection, and request construction should use this policy instead
+/// of hard-coding provider names at call sites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ModelIdCodec {
+    /// Cache, config, identity, and wire IDs all use the same model string.
+    #[default]
+    Plain,
+    /// Wire IDs are `{provider_name}/{internal_id}`; cache and config store the
+    /// internal id only. User-facing references remain `provider/internal_id`.
+    ProviderPrefixed,
+}
+
+/// How a custom OpenAI-compatible host rematches models.dev catalog rows.
+///
+/// Built-in providers always use [`Self::Slug`]. Config-defined hosts may
+/// instead keep the selected `slug/model` id and read a shared ExactAdvertised
+/// tree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CatalogLookupMode {
+    /// Look up `{catalog or host name}/{same model id}`.
+    #[default]
+    Slug,
+    /// Look up the unsplit `slug/model` id in the shared models.dev tree.
+    ///
+    /// A bare id with no slash misses catalog metadata. Extra slashes stay in
+    /// the id (`foo/bar/baz`). The miss diagnostic still splits on the first
+    /// slash to name the models.dev pair.
+    ModelId,
+}
+
+impl CatalogLookupMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Slug => "slug",
+            Self::ModelId => "model-id",
+        }
+    }
+
+    /// Parse policy for the shared `slug/model` tree [`Self::ModelId`] reads.
+    ///
+    /// [`Self::Slug`] uses the host descriptor's `catalog_reasoning` instead,
+    /// because a borrowed slug follows that host's protocol.
+    pub(crate) const MODEL_ID_HYDRATE_REASONING: CatalogReasoningPolicy =
+        CatalogReasoningPolicy::ExactAdvertised;
+}
+
+impl std::str::FromStr for CatalogLookupMode {
+    type Err = CatalogLookupModeParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "" | "slug" => Ok(Self::Slug),
+            "model-id" => Ok(Self::ModelId),
+            _ => Err(CatalogLookupModeParseError),
+        }
+    }
+}
+
+/// Unknown `catalog_mode` value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogLookupModeParseError;
+
+impl std::fmt::Display for CatalogLookupModeParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("must be \"slug\" or \"model-id\"")
+    }
+}
+
+impl std::error::Error for CatalogLookupModeParseError {}
+
+/// Wire API an OpenAI-compatible table row speaks.
+///
+/// Custom hosts persist Chat Completions or Responses via `api`.
+/// [`Self::AnthropicMessages`] is the declared Messages path for first-party
+/// Anthropic-compatible bases. It is not a custom-host config value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OpenAiCompatibleApi {
+    /// POST `{base}/chat/completions`.
+    #[default]
+    ChatCompletions,
+    /// POST `{base}/responses`.
+    Responses,
+    /// POST `{base}/messages` with Anthropic `x-api-key` auth.
+    AnthropicMessages,
+}
+
+impl OpenAiCompatibleApi {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat-completions",
+            Self::Responses => "responses",
+            Self::AnthropicMessages => "anthropic-messages",
+        }
+    }
+
+    /// Value written to custom-host `api` config.
+    ///
+    /// First-party [`Self::AnthropicMessages`] is table-declared only, so it is
+    /// omitted the same way as the Chat Completions default.
+    pub fn persisted_custom_host_value(self) -> Option<&'static str> {
+        match self {
+            Self::ChatCompletions | Self::AnthropicMessages => None,
+            Self::Responses => Some(self.as_str()),
+        }
+    }
+}
+
+impl std::str::FromStr for OpenAiCompatibleApi {
+    type Err = OpenAiCompatibleApiParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "" | "chat-completions" => Ok(Self::ChatCompletions),
+            "responses" => Ok(Self::Responses),
+            _ => Err(OpenAiCompatibleApiParseError),
+        }
+    }
+}
+
+/// Unknown `api` value for a custom OpenAI-compatible host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenAiCompatibleApiParseError;
+
+impl std::fmt::Display for OpenAiCompatibleApiParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("must be \"chat-completions\" or \"responses\"")
+    }
+}
+
+impl std::error::Error for OpenAiCompatibleApiParseError {}
+
+#[path = "provider_auth_kind.rs"]
+mod provider_auth_kind;
+
+pub use provider_auth_kind::ProviderAuthKind;
+
+impl ProviderDescriptor {
+    /// Normalizes a model id for cache, config, and identity storage.
+    ///
+    /// For [`ModelIdCodec::ProviderPrefixed`], strips leading `{name}/` segments
+    /// so legacy wire ids and double-prefixed favorites collapse to one internal id.
+    pub fn canonicalize_model_id(&self, model: &str) -> String {
+        match self.model_id_codec {
+            ModelIdCodec::Plain => model.to_string(),
+            ModelIdCodec::ProviderPrefixed => {
+                let prefix = format!("{}/", self.name);
+                let mut model = model;
+                while let Some(rest) = model.strip_prefix(prefix.as_str()) {
+                    if rest.is_empty() {
+                        break;
+                    }
+                    model = rest;
+                }
+                model.to_string()
+            }
+        }
+    }
+
+    /// Expands an internal model id to the id sent on this provider's HTTP API.
+    pub fn wire_model_id(&self, model: &str) -> String {
+        match self.model_id_codec {
+            ModelIdCodec::Plain => model.to_string(),
+            ModelIdCodec::ProviderPrefixed => {
+                let internal = self.canonicalize_model_id(model);
+                format!("{}/{internal}", self.name)
+            }
+        }
+    }
+
+    /// Resolves a provider-facing model ID to its models.dev catalog ID.
+    ///
+    /// Provider model discovery remains authoritative. This only bridges model
+    /// names when the provider API and metadata catalog use different IDs.
+    pub fn metadata_model<'a>(&self, model: &'a str) -> &'a str {
+        match (self.id, model) {
+            (ProviderId::KimiCode, "k3") => "kimi-k3",
+            (ProviderId::OpenRouter, model) => model
+                .split_once('/')
+                .map(|(_, upstream_model)| upstream_model)
+                .unwrap_or(model),
+            _ => model,
+        }
+    }
+
+    /// Resolves an aggregator model ID to its models.dev provider.
+    pub fn metadata_upstream_for_model<'a>(&self, model: &'a str) -> &'a str {
+        match self.id {
+            ProviderId::OpenRouter => model
+                .split_once('/')
+                .map(|(upstream, _)| upstream)
+                .unwrap_or(self.metadata_upstream),
+            _ => self.metadata_upstream,
+        }
+    }
+
+    /// Returns a safe effective context when account-scoped model metadata is unavailable.
+    pub fn effective_context_fallback(&self, model: &str) -> Option<u64> {
+        match (self.id, model) {
+            (ProviderId::KimiCode, "k3") => Some(262_144),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthMode {
+    pub id: &'static str,
+    pub login_label: &'static str,
+    pub auth_kind: ProviderAuthKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderDescriptor {
+    pub id: ProviderId,
+    /// Runtime construction shape (dialect, default API base, backend kind).
+    pub runtime: ProviderRuntime,
+    pub name: &'static str,
+    pub display_name: &'static str,
+    /// Non-empty. First entry is the default auth mode.
+    pub auth_modes: &'static [AuthMode],
+    pub model_source: ProviderModelSource,
+    pub(crate) model_refresh: Option<ProviderModelRefreshKind>,
+    pub model_id_codec: ModelIdCodec,
+    pub metadata_upstream: &'static str,
+    /// How this host rematches models.dev rows. Built-ins are always [`CatalogLookupMode::Slug`].
+    ///
+    /// `pub(crate)` so adding the field stays minor-compatible; external
+    /// construction is already blocked by [`Self::model_refresh`].
+    pub(crate) catalog_lookup: CatalogLookupMode,
+    /// Wire API a custom OpenAI-compatible host speaks. Built-ins are Chat Completions.
+    ///
+    /// `pub(crate)` for the same 1.x reason as [`Self::catalog_lookup`].
+    pub(crate) openai_compatible_api: OpenAiCompatibleApi,
+    pub catalog_reasoning: CatalogReasoningPolicy,
+    /// Preferred model when the cache is empty or contains this id.
+    pub default_model: Option<&'static str>,
+}
+
+/// Provider identity plus the selected auth mode after profile resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedProviderProfile {
+    pub provider: &'static ProviderDescriptor,
+    pub auth: AuthMode,
+}
+
+impl ResolvedProviderProfile {
+    pub fn provider_name(self) -> &'static str {
+        self.provider.name
+    }
+
+    pub fn auth_id(self) -> &'static str {
+        self.auth.id
+    }
+
+    pub fn auth_kind(self) -> ProviderAuthKind {
+        self.auth.auth_kind
+    }
+}
+
+impl ProviderDescriptor {
+    /// First registered auth mode; every descriptor has at least one.
+    pub fn default_auth(self) -> AuthMode {
+        self.auth_modes[0]
+    }
+
+    /// Iterates registered auth modes in declaration order.
+    pub fn auth_modes(self) -> impl Iterator<Item = AuthMode> {
+        self.auth_modes.iter().copied()
+    }
+
+    pub fn auth_mode(self, auth: &str) -> Option<AuthMode> {
+        self.auth_modes().find(|mode| mode.id == auth)
+    }
+
+    /// True when every registered mode is keyless.
+    pub fn is_keyless(self) -> bool {
+        self.auth_modes()
+            .all(|mode| matches!(mode.auth_kind, ProviderAuthKind::None))
+    }
+
+    /// True when the provider can run without credentials.
+    pub fn has_none_auth(self) -> bool {
+        self.auth_modes()
+            .any(|mode| matches!(mode.auth_kind, ProviderAuthKind::None))
+    }
+
+    /// False for a decision-model host, which serves no chat models.
+    pub fn serves_chat(self) -> bool {
+        !matches!(self.runtime, ProviderRuntime::SystemOne { .. })
+    }
+
+    /// Config-defined OpenAI-compatible hosts are named providers, not a single built-in.
+    pub fn is_custom_openai_compatible(self) -> bool {
+        self.id == ProviderId::OpenAiCompatible
+    }
+
+    /// Whether these descriptors share one backend for auth-profile switching.
+    ///
+    /// Custom OpenAI-compatible hosts all use [`ProviderId::OpenAiCompatible`]
+    /// but are distinct backends, so this is false when either side is custom.
+    pub fn shares_auth_family(self, other: Self) -> bool {
+        if self.is_custom_openai_compatible() || other.is_custom_openai_compatible() {
+            return false;
+        }
+        if self.id == other.id {
+            return true;
+        }
+        AUTH_FAMILY_GROUPS
+            .iter()
+            .any(|group| group.contains(&self.id) && group.contains(&other.id))
+    }
+
+    /// How this host rematches models.dev rows.
+    pub fn catalog_lookup(self) -> CatalogLookupMode {
+        self.catalog_lookup
+    }
+
+    /// Wire API this OpenAI-compatible host speaks.
+    pub fn openai_compatible_api(self) -> OpenAiCompatibleApi {
+        self.openai_compatible_api
+    }
+
+    /// Whether `/doctor` and `/config` can reach this host's `/v1/models`.
+    ///
+    /// A configured endpoint plus OpenAI-compatible discovery is enough; the
+    /// probe supplies whatever credentials the host has, so a stored key does
+    /// not disqualify it.
+    pub fn probes_configured_endpoint(self) -> bool {
+        self.has_none_auth()
+            && self
+                .model_refresh
+                .is_some_and(ProviderModelRefreshKind::probes_openai_compatible_models)
+    }
+
+    /// True when this provider can refresh a live model list.
+    pub fn supports_model_refresh(self) -> bool {
+        self.model_refresh.is_some()
+    }
+
+    /// `/login` collects and persists this host's API base before the optional key.
+    ///
+    /// Built-in Ollama stores `[providers.ollama]`. Named custom hosts already
+    /// collected a URL when they were created.
+    pub fn collects_login_endpoint(self) -> bool {
+        self.name == "ollama"
+    }
+
+    /// Auth mode used for unattended model discovery.
+    ///
+    /// Prefers a mode whose credentials are present so a keyed custom host is
+    /// probed with its key instead of anonymously; falls back to the default.
+    pub fn discovery_auth(self, store: &dyn crate::credentials::CredentialStore) -> AuthMode {
+        self.auth_modes()
+            .find(|mode| {
+                !matches!(mode.auth_kind, ProviderAuthKind::None)
+                    && crate::credentials::auth_has_credentials(store, mode.id).unwrap_or(false)
+            })
+            .unwrap_or_else(|| self.default_auth())
+    }
+
+    /// Wire policy for Standard-dialect hosts when models.dev has no row.
+    pub fn unknown_effort(self) -> UnknownEffortPolicy {
+        match self.id {
+            ProviderId::OpenAiCompatible => UnknownEffortPolicy::SendRequested,
+            ProviderId::Ollama | ProviderId::OllamaCloud => {
+                UnknownEffortPolicy::Constrain(OLLAMA_UNKNOWN_REASONING_LEVELS)
+            }
+            ProviderId::OpenAi
+            | ProviderId::OpenAiCodex
+            | ProviderId::Anthropic
+            | ProviderId::Google
+            | ProviderId::GithubCopilot
+            | ProviderId::Xai
+            | ProviderId::Moonshot
+            | ProviderId::Poolside
+            | ProviderId::OpenRouter
+            | ProviderId::KimiCode
+            | ProviderId::QwenTokenPlan
+            | ProviderId::Meta
+            | ProviderId::OpenCodeGo
+            | ProviderId::OpenCode
+            | ProviderId::MiniMax
+            | ProviderId::TypeSafe => UnknownEffortPolicy::Omit,
+        }
+    }
+}
+
+#[path = "provider_table.rs"]
+mod provider_table;
+
+#[path = "custom_openai_compatible.rs"]
+mod custom_openai_compatible;
+
+pub(crate) use custom_openai_compatible::interned_custom_providers;
+pub use custom_openai_compatible::{
+    custom_provider_api_key_auth_id, custom_provider_registry_test_lock,
+    install_custom_openai_compatible_providers, intern_custom_openai_compatible_providers,
+    interned_custom_provider, is_custom_provider_api_key_auth,
+    reset_custom_openai_compatible_providers_for_tests, scope_custom_openai_compatible_providers,
+    validate_custom_provider_name, CustomProviderSpec, CustomProviderThreadScope,
+};
+pub use provider_table::PROVIDERS;
+
+/// Built-in provider table, excluding config-defined hosts.
+pub fn builtin_providers() -> &'static [ProviderDescriptor] {
+    PROVIDERS
+}
+
+/// Built-in providers plus the currently visible custom OpenAI-compatible hosts.
+pub fn providers() -> Vec<&'static ProviderDescriptor> {
+    let mut providers = PROVIDERS.iter().collect::<Vec<_>>();
+    providers.extend(custom_openai_compatible::custom_openai_compatible_providers());
+    providers
+}
+
+/// Environment variable names used as provider credential overrides.
+///
+/// Built-in auth kinds, interned custom hosts, and any currently set
+/// `RHO_*_API_KEY`. Callers typically snapshot this into
+/// [`rho_sdk::ProcessEnvironment::inherit_except`] at tool-set construction;
+/// scanning the live environment covers an override for a host that `/login`
+/// interns later in the same session.
+///
+/// Intern config-defined hosts before calling this: a host that has never been
+/// interned has no descriptor and therefore no override name to report, unless
+/// its `RHO_*_API_KEY` is already set.
+pub fn credential_env_vars() -> Vec<String> {
+    credential_env_vars_from(std::env::vars().map(|(name, _)| name))
+}
+
+pub(crate) fn credential_env_vars_from(
+    env: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Vec<String> {
+    let mut vars: Vec<String> = builtin_providers()
+        .iter()
+        .chain(custom_openai_compatible::interned_custom_providers())
+        .flat_map(|descriptor| descriptor.auth_modes())
+        .filter_map(|mode| mode.auth_kind.env_var())
+        .map(str::to_owned)
+        .collect();
+    // Accepted alongside the declared `ANTHROPIC_TOKEN`: Claude Code sets it,
+    // not the user configuring rho.
+    vars.push("CLAUDE_CODE_OAUTH_TOKEN".into());
+    vars.extend(
+        crate::credentials::WebSearchCredential::ALL
+            .iter()
+            .flat_map(|credential| credential.env_vars().iter().copied())
+            .map(str::to_owned),
+    );
+    vars.extend(env.into_iter().filter_map(|name| {
+        let name = name.as_ref();
+        custom_openai_compatible::is_provider_api_key_env_var(name).then(|| name.to_owned())
+    }));
+    vars.sort_unstable();
+    vars.dedup();
+    vars
+}
+
+/// Auth profile names accepted by CLI `--auth` and config `auth`.
+///
+/// Derived from [`PROVIDERS`] so newly registered profiles are included
+/// automatically. Keyless providers use `auth = "none"` and are omitted.
+pub fn auth_profiles() -> &'static [&'static str] {
+    use std::sync::OnceLock;
+
+    static PROFILES: OnceLock<Vec<&'static str>> = OnceLock::new();
+    PROFILES
+        .get_or_init(|| {
+            PROVIDERS
+                .iter()
+                .flat_map(|descriptor| descriptor.auth_modes())
+                .map(|mode| mode.id)
+                .filter(|auth| *auth != "none")
+                .collect()
+        })
+        .as_slice()
+}
+
+/// Maps a retired same-API provider name to its provider and auth mode.
+///
+/// The auth mode is fixed so legacy config such as `provider = "xai-oauth"`
+/// keeps its old meaning even when paired with a stale or default `auth` value.
+pub fn legacy_provider_alias(provider: &str) -> Option<(&'static str, &'static str)> {
+    match provider {
+        "openrouter-oauth" => Some(("openrouter", "openrouter-oauth")),
+        "xai-oauth" => Some(("xai", "xai-oauth")),
+        _ => None,
+    }
+}
+
+/// Looks up a canonical provider name.
+///
+/// Legacy provider references carry an auth-mode choice, so callers handling
+/// external input must use [`resolve_provider_reference`] or [`resolve_profile`]
+/// rather than discarding that choice here.
+pub fn provider_descriptor(provider: &str) -> Option<&'static ProviderDescriptor> {
+    PROVIDERS
+        .iter()
+        .find(|descriptor| descriptor.name == provider)
+        .or_else(|| custom_openai_compatible::custom_openai_compatible_provider(provider))
+}
+
+pub fn interned_custom_openai_compatible_provider(
+    provider: &str,
+) -> Option<&'static ProviderDescriptor> {
+    custom_openai_compatible::interned_custom_provider(provider)
+}
+
+/// Formats a provider-qualified model reference for user input and display.
+pub fn model_reference(provider: &str, model: &str) -> String {
+    format!("{provider}/{model}")
+}
+
+pub fn provider_descriptor_for_auth(auth: &str) -> Option<&'static ProviderDescriptor> {
+    builtin_providers()
+        .iter()
+        .find(|descriptor| descriptor.auth_mode(auth).is_some())
+        .or_else(|| custom_openai_compatible::interned_custom_provider_for_auth(auth))
+}
+
+/// Resolves an auth profile id to its provider and mode.
+pub fn resolve_auth_mode(auth: &str) -> Option<(&'static ProviderDescriptor, AuthMode)> {
+    let descriptor = provider_descriptor_for_auth(auth)?;
+    let mode = descriptor.auth_mode(auth)?;
+    Some((descriptor, mode))
+}
+
+fn legacy_provider_profile(provider_name: &str) -> Option<ResolvedProviderProfile> {
+    let (provider, auth) = legacy_provider_alias(provider_name)?;
+    let provider = provider_descriptor(provider).expect("alias provider must be registered");
+    let auth = provider
+        .auth_mode(auth)
+        .expect("alias auth mode must be registered on its provider");
+    Some(ResolvedProviderProfile { provider, auth })
+}
+
+/// Resolves a provider reference without a separately supplied auth mode.
+///
+/// Canonical names select their default auth mode. Retired provider names keep
+/// selecting the auth mode that was implicit in the old provider identity.
+pub fn resolve_provider_reference(
+    provider_name: &str,
+) -> Result<ResolvedProviderProfile, ProfileResolutionError> {
+    if let Some(profile) = legacy_provider_profile(provider_name) {
+        return Ok(profile);
+    }
+    let provider = provider_descriptor(provider_name)
+        .ok_or_else(|| ProfileResolutionError::UnknownProvider(provider_name.into()))?;
+    Ok(ResolvedProviderProfile {
+        provider,
+        auth: provider.default_auth(),
+    })
+}
+
+/// Resolves a provider reference, preferring an auth mode with credentials.
+///
+/// Retired provider names retain their implicit auth pin. Canonical names use
+/// [`ProviderDescriptor::discovery_auth`], including environment overrides.
+pub fn resolve_provider_reference_with_credentials(
+    provider_name: &str,
+    store: &dyn crate::credentials::CredentialStore,
+) -> Result<ResolvedProviderProfile, ProfileResolutionError> {
+    if let Some(profile) = legacy_provider_profile(provider_name) {
+        return Ok(profile);
+    }
+    let provider = provider_descriptor(provider_name)
+        .ok_or_else(|| ProfileResolutionError::UnknownProvider(provider_name.into()))?;
+    Ok(ResolvedProviderProfile {
+        provider,
+        auth: provider.discovery_auth(store),
+    })
+}
+
+/// Resolves a provider/auth pair to one registered provider identity and auth mode.
+///
+/// Soft resolution: when the requested auth belongs to a different provider
+/// family, falls back to the named provider's default auth mode. Prefer
+/// [`resolve_profile_exact`] when a caller must reject incompatible pairs
+/// (agent pins, catalog validation).
+pub fn resolve_profile(
+    provider_name: &str,
+    auth: &str,
+) -> Result<ResolvedProviderProfile, ProfileResolutionError> {
+    match resolve_profile_exact(provider_name, auth) {
+        Err(ProfileResolutionError::AuthNotValidForProvider { provider, .. }) => {
+            let provider = provider_descriptor(&provider)
+                .ok_or(ProfileResolutionError::UnknownProvider(provider))?;
+            Ok(ResolvedProviderProfile {
+                provider,
+                auth: provider.default_auth(),
+            })
+        }
+        other => other,
+    }
+}
+
+/// Resolves a provider/auth pair only when the auth mode belongs to that provider.
+///
+/// Unlike [`resolve_profile`], incompatible pairs error instead of falling back
+/// to the provider default. Legacy provider aliases still resolve to their
+/// fixed auth mode (the alias is the identity).
+pub fn resolve_profile_exact(
+    provider_name: &str,
+    auth: &str,
+) -> Result<ResolvedProviderProfile, ProfileResolutionError> {
+    if let Some(profile) = legacy_provider_profile(provider_name) {
+        return Ok(profile);
+    }
+    let provider = provider_descriptor(provider_name)
+        .ok_or_else(|| ProfileResolutionError::UnknownProvider(provider_name.into()))?;
+    if let Some(mode) = provider.auth_mode(auth) {
+        return Ok(ResolvedProviderProfile {
+            provider,
+            auth: mode,
+        });
+    }
+    let auth_profile = provider_descriptor_for_auth(auth)
+        .ok_or_else(|| ProfileResolutionError::UnknownAuth(auth.into()))?;
+    if provider.shares_auth_family(*auth_profile) {
+        let mode = auth_profile
+            .auth_mode(auth)
+            .expect("auth exists on auth_profile");
+        Ok(ResolvedProviderProfile {
+            provider: auth_profile,
+            auth: mode,
+        })
+    } else {
+        Err(ProfileResolutionError::AuthNotValidForProvider {
+            provider: provider_name.into(),
+            auth: auth.into(),
+        })
+    }
+}
+
+/// Returns whether `auth` is a registered mode for `provider_name`.
+///
+/// Uses exact membership ([`resolve_profile_exact`]), not soft default fallback.
+pub fn provider_accepts_auth(provider_name: &str, auth: &str) -> bool {
+    resolve_profile_exact(provider_name, auth).is_ok()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ProfileResolutionError {
+    #[error("unknown provider '{0}'")]
+    UnknownProvider(String),
+    #[error("unknown auth profile '{0}'")]
+    UnknownAuth(String),
+    #[error("auth '{auth}' is not valid for provider '{provider}'")]
+    AuthNotValidForProvider { provider: String, auth: String },
+}
+
+/// Table-backed descriptor for `id`.
+///
+/// Custom OpenAI-compatible hosts share [`ProviderId::OpenAiCompatible`] and
+/// have no table row; resolve those by name instead.
+///
+/// # Panics
+///
+/// Panics if `id` is not a table-backed provider.
+pub fn provider_descriptor_by_id(id: ProviderId) -> &'static ProviderDescriptor {
+    builtin_providers()
+        .iter()
+        .find(|descriptor| descriptor.id == id)
+        .expect("table-backed provider IDs have a descriptor; custom hosts resolve by name")
+}

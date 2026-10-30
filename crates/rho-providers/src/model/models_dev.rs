@@ -1,0 +1,845 @@
+use std::{cell::RefCell, collections::HashSet, path::PathBuf, time::Duration};
+
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use serde_json::Value;
+
+use crate::{
+    model::ReasoningCapabilities,
+    provider::{CatalogLookupMode, CatalogReasoningPolicy},
+    reasoning::ReasoningLevel,
+};
+
+#[path = "models_dev_controls.rs"]
+mod controls;
+#[path = "models_dev_document.rs"]
+mod document;
+use controls::CachedRow;
+pub(crate) use controls::{current_reasoning_metadata, ReasoningControl};
+#[path = "models_dev_hydrate.rs"]
+mod hydrate;
+#[path = "models_dev_overrides.rs"]
+mod overrides;
+#[path = "models_dev_sdk.rs"]
+mod sdk;
+pub use hydrate::{
+    ensure_models_dev_catalog, force_refresh_models_dev_catalog, prefetch_model_metadata,
+};
+
+/// Holds the catalog hydrate mutex so tests can prove a caller does not await it.
+#[doc(hidden)]
+pub fn catalog_hydrate_lock_for_tests() -> &'static tokio::sync::Mutex<()> {
+    hydrate::catalog_hydrate_lock_for_parent()
+}
+pub use sdk::CatalogSdkAdapter;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ModelMetadata {
+    /// Catalog name for people, such as `GPT-5.6 Sol`. Absent when the catalog
+    /// has no name for the model; callers then show the model id alone rather
+    /// than inventing a name from it.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    pub advertised_context_window: Option<u64>,
+    pub effective_context_window: Option<u64>,
+    pub usable_context_window: Option<u64>,
+    pub long_context_threshold: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub cost_default: Option<ModelCost>,
+    pub cost_long_context: Option<ModelCost>,
+    pub supported_reasoning_levels: Option<Vec<ReasoningLevel>>,
+    #[serde(default)]
+    pub reasoning_off_behavior: ReasoningOffBehavior,
+    /// Whether the resolved capability itself is exact. This is intentionally
+    /// separate from metadata completeness because some provider policies
+    /// resolve complete catalog data to `Unknown`.
+    #[serde(default)]
+    pub reasoning_capabilities_known: bool,
+    /// True once the catalog reasoning fields have been fully parsed and the
+    /// provider policy has been applied. A complete row may intentionally have
+    /// unknown capabilities.
+    #[serde(default)]
+    pub reasoning_metadata_complete: bool,
+    /// Resolved models.dev AI SDK package (`npm` or `provider.npm`).
+    #[serde(default)]
+    pub sdk_package: Option<String>,
+}
+
+/// Image input support for one model, read with [`image_input`].
+///
+/// `Unknown` means no catalog row or override said either way. Request
+/// shaping treats it like `Supported` so uncatalogued hosts keep today's
+/// behavior; only an explicit `Unsupported` strips images.
+///
+/// # Next major
+///
+/// NEXT_MAJOR(rho-providers): add `image_input: ImageInput` to ModelMetadata and remove the separate models_dev::image_input lookup and its sidecar cache key.
+///
+/// `ModelMetadata` has only public fields, so any new field breaks callers
+/// that build it with a struct literal. Until the major, the value lives
+/// beside the metadata in the same cache row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageInput {
+    #[default]
+    Unknown,
+    Supported,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningOffBehavior {
+    #[default]
+    Omit,
+    EffortNone,
+}
+
+impl ModelMetadata {
+    pub fn display_context_window(&self) -> Option<u64> {
+        self.usable_context_window
+            .or(self.effective_context_window)
+            .or(self.advertised_context_window)
+    }
+
+    pub fn cost_for_input_tokens(&self, input_tokens: u64) -> Option<ModelCost> {
+        if self
+            .long_context_threshold
+            .is_some_and(|threshold| input_tokens > threshold)
+        {
+            self.cost_long_context.or(self.cost_default)
+        } else {
+            self.cost_default
+        }
+    }
+
+    pub fn reasoning_capabilities(&self) -> ReasoningCapabilities {
+        ReasoningCapabilities::from_metadata(
+            self.supported_reasoning_levels.clone(),
+            self.reasoning_capabilities_known,
+        )
+    }
+
+    pub fn reasoning_effort(&self, reasoning: ReasoningLevel) -> Option<&'static str> {
+        match (reasoning, self.reasoning_off_behavior) {
+            (ReasoningLevel::Off, ReasoningOffBehavior::Omit) => None,
+            (ReasoningLevel::Off, ReasoningOffBehavior::EffortNone) => Some("none"),
+            _ => reasoning.effort(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ModelCost {
+    pub input_micros_per_m: Option<u64>,
+    pub output_micros_per_m: Option<u64>,
+    pub cache_read_micros_per_m: Option<u64>,
+    pub cache_write_micros_per_m: Option<u64>,
+}
+
+pub fn current_model_metadata(provider: &str, model: &str) -> Option<ModelMetadata> {
+    load_model_metadata(provider, model, CacheFreshness::CurrentOnly)
+        .or_else(|| override_metadata(provider, model))
+}
+
+pub fn current_reasoning_capabilities(provider: &str, model: &str) -> ReasoningCapabilities {
+    if let Some(capabilities) = provider_fixed_reasoning_capabilities(provider) {
+        return capabilities;
+    }
+    current_model_metadata(provider, model)
+        .map(|metadata| metadata.reasoning_capabilities())
+        .unwrap_or_default()
+}
+
+pub fn cached_reasoning_capabilities(provider: &str, model: &str) -> ReasoningCapabilities {
+    if let Some(capabilities) = provider_fixed_reasoning_capabilities(provider) {
+        return capabilities;
+    }
+    cached_model_metadata(provider, model)
+        .map(|metadata| metadata.reasoning_capabilities())
+        .unwrap_or_default()
+}
+
+/// Prefer a current row with known reasoning; fall back to a stale-but-known cache row.
+///
+/// Wire encoding and UI pickers use this so a previously fetched models.dev
+/// entry still constrains levels when the current row is missing or incomplete.
+/// Preference is reasoning-known-ness, not freshness of other metadata fields.
+pub fn known_reasoning_metadata(provider: &str, model: &str) -> Option<ModelMetadata> {
+    let current = current_model_metadata(provider, model);
+    if current
+        .as_ref()
+        .is_some_and(|metadata| metadata.reasoning_capabilities().is_known())
+    {
+        return current;
+    }
+    let cached = cached_model_metadata(provider, model);
+    if cached
+        .as_ref()
+        .is_some_and(|metadata| metadata.reasoning_capabilities().is_known())
+    {
+        return cached;
+    }
+    current.or(cached)
+}
+
+/// Prefer current-known capabilities; fall back to a stale-but-known cache row.
+///
+/// UI surfaces use this so a previously fetched catalog entry still constrains
+/// pickers when the current row is missing or incomplete.
+pub fn known_reasoning_capabilities(provider: &str, model: &str) -> ReasoningCapabilities {
+    if let Some(capabilities) = provider_fixed_reasoning_capabilities(provider) {
+        return capabilities;
+    }
+    known_reasoning_metadata(provider, model)
+        .map(|metadata| metadata.reasoning_capabilities())
+        .unwrap_or_default()
+}
+
+fn provider_fixed_reasoning_capabilities(provider: &str) -> Option<ReasoningCapabilities> {
+    let policy = crate::provider::provider_descriptor(provider)?.catalog_reasoning;
+    match policy {
+        CatalogReasoningPolicy::NotConfigurable => Some(ReasoningCapabilities::NotConfigurable),
+        CatalogReasoningPolicy::OffOrMax => Some(ReasoningCapabilities::Levels(
+            crate::model::ReasoningLevelSet::new(vec![ReasoningLevel::Off, ReasoningLevel::Max]),
+        )),
+        CatalogReasoningPolicy::Unknown
+        | CatalogReasoningPolicy::ExactAdvertised
+        | CatalogReasoningPolicy::OffByAdvertisedToggle
+        | CatalogReasoningPolicy::OffAsNone => None,
+    }
+}
+
+fn provider_reasoning_is_not_configurable(provider: &str) -> bool {
+    crate::provider::provider_descriptor(provider).is_some_and(|descriptor| {
+        descriptor.catalog_reasoning == CatalogReasoningPolicy::NotConfigurable
+    })
+}
+
+pub fn model_metadata_needs_refresh(provider: &str, model: &str) -> bool {
+    if provider_reasoning_is_not_configurable(provider) {
+        return false;
+    }
+    load_model_metadata(provider, model, CacheFreshness::CurrentOnly)
+        .or_else(|| override_metadata(provider, model))
+        .is_none_or(|metadata| !metadata.reasoning_metadata_complete)
+}
+
+pub fn cached_model_metadata(provider: &str, model: &str) -> Option<ModelMetadata> {
+    load_model_metadata(provider, model, CacheFreshness::AllowStale)
+        .or_else(|| override_metadata(provider, model))
+}
+
+pub async fn fetch_model_metadata(provider: &str, model: &str) -> Option<ModelMetadata> {
+    if let Some(metadata) = load_model_metadata(provider, model, CacheFreshness::CurrentOnly) {
+        return Some(metadata);
+    }
+
+    // One full catalog hydrate fills every provider-facing row. After that, the
+    // requested model is either current in sqlite or genuinely absent.
+    ensure_models_dev_catalog().await;
+    if let Some(metadata) = load_model_metadata(provider, model, CacheFreshness::CurrentOnly) {
+        return Some(metadata);
+    }
+
+    override_metadata(provider, model)
+}
+
+/// Cache provider for the shared `slug/model` tree.
+///
+/// The slash keeps this out of custom host names and `catalog` slugs, so
+/// model-id lookup never aliases into built-in extract (Anthropic stores
+/// Unknown; `api.json` tree rows are ExactAdvertised). Canonical
+/// `models.json` rows fill ids no serving provider publishes; their reasoning
+/// stays unknown unless the row says the model does not reason.
+pub(super) const MODEL_ID_CATALOG_CACHE_PROVIDER: &str = "models.dev/tree";
+
+/// Why a custom host with `catalog_mode = "model-id"` has no models.dev row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CatalogLookupMiss {
+    /// The selected model id has no `provider/model` slash.
+    BareModelId,
+    /// The id split, but that models.dev pair is absent.
+    MissingRow {
+        source_provider: String,
+        source_model: String,
+    },
+}
+
+/// Some when this model-id host has no catalog row for the selected model.
+///
+/// The id is split here only to name the models.dev pair in the diagnostic;
+/// lookup itself reads the shared tree with the unsplit id.
+pub fn custom_model_id_catalog_miss(provider: &str, model: &str) -> Option<CatalogLookupMiss> {
+    let descriptor = crate::provider::provider_descriptor(provider)?;
+    if !descriptor.is_custom_openai_compatible() {
+        return None;
+    }
+    if descriptor.catalog_lookup() != CatalogLookupMode::ModelId {
+        return None;
+    }
+    if cached_model_metadata(provider, model).is_some() {
+        return None;
+    }
+    Some(match overrides::split_provider_model(model) {
+        None => CatalogLookupMiss::BareModelId,
+        Some((source_provider, source_model)) => {
+            if !hydrate::catalog_snapshot_is_ready() {
+                return None;
+            }
+            CatalogLookupMiss::MissingRow {
+                source_provider,
+                source_model,
+            }
+        }
+    })
+}
+
+/// Cache provider and model id used for the sqlite catalog row.
+///
+/// Custom hosts can borrow another slug (`catalog = "llmgateway"`) or read the
+/// shared model-id tree with unsplit `slug/model` ids
+/// (`catalog_mode = "model-id"`). A models.toml
+/// `catalog` value wins and may also remap the model id (`anthropic/claude-sonnet-4-5`).
+///
+/// Built-in providers are deliberately left on their provider-facing name:
+/// hydrate writes their rows under that name, not under `metadata_upstream`
+/// (`openai-codex` rows, not `openai`), so borrowing the upstream slug here
+/// would miss the cache. Only config-defined hosts redirect, and only when
+/// that slug is not itself a built-in cache key. `catalog = "openrouter"`
+/// rows live under the custom host so they cannot replace Rho OpenRouter.
+fn catalog_source_for(
+    provider: &str,
+    model: &str,
+    local: Option<&toml::map::Map<String, toml::Value>>,
+) -> (String, String) {
+    if let Some(source) = local.and_then(|table| overrides::local_catalog_source(table, model)) {
+        return source;
+    }
+    let Some(descriptor) = crate::provider::provider_descriptor(provider)
+        .filter(|descriptor| descriptor.is_custom_openai_compatible())
+    else {
+        return (provider.to_string(), model.to_string());
+    };
+    match descriptor.catalog_lookup() {
+        CatalogLookupMode::ModelId => (
+            MODEL_ID_CATALOG_CACHE_PROVIDER.to_string(),
+            model.to_string(),
+        ),
+        CatalogLookupMode::Slug => {
+            // The catalog string is the models.dev provider key. Do not run built-in
+            // remappers (OpenRouter's owner/model split) on a borrowed slug. A slug
+            // that is also a built-in cache key *and* that provider's document
+            // (`openrouter`) is keyed by the host so extract is untouched.
+            // `openai-codex` is a built-in name whose document is `openai`, so those
+            // hosts still rematch the Codex extract rows.
+            let upstream = descriptor.metadata_upstream;
+            if upstream != provider && !borrowed_slug_collides_with_builtin_extract(upstream) {
+                (upstream.to_string(), model.to_string())
+            } else {
+                (provider.to_string(), model.to_string())
+            }
+        }
+    }
+}
+
+/// True when writing borrowed rows under `slug` would collide with a built-in
+/// provider's extract keys (`openrouter`). Those rows go under the host name.
+/// `openai-codex` is a built-in name whose document is `openai`, so it still
+/// rematches extract rows and is not a collision.
+fn borrowed_slug_collides_with_builtin_extract(slug: &str) -> bool {
+    crate::provider::builtin_providers()
+        .iter()
+        .any(|descriptor| descriptor.name == slug && descriptor.metadata_upstream == slug)
+}
+
+/// Built-in override identity for a cached catalog row.
+///
+/// Model-id rows live under [`MODEL_ID_CATALOG_CACHE_PROVIDER`] with unsplit
+/// `slug/model` ids. Override lookup still uses the real models.dev pair
+/// (`openai-codex` + `gpt-5.5`), not the cache namespace.
+fn builtin_override_identity(cache_provider: &str, cache_model: &str) -> (String, String) {
+    if cache_provider == MODEL_ID_CATALOG_CACHE_PROVIDER {
+        if let Some(pair) = overrides::split_provider_model(cache_model) {
+            return pair;
+        }
+    }
+    (cache_provider.to_string(), cache_model.to_string())
+}
+
+/// These ids are not published in models.dev. Always borrow `source` and scale
+/// its token prices. A cached row for the alias id is ignored on purpose.
+fn priced_catalog_alias(provider: &str, model: &str) -> Option<(&'static str, u64)> {
+    use crate::providers::fast_mode::{GROK_4_7, GROK_4_7_BUILD_FAST, GROK_4_7_FAST_PRICE_SCALE};
+    match (provider, model) {
+        // `/fast` sends this id for OAuth grok-4.7. It is not a catalog row.
+        // Public /v1/models omits it.
+        ("xai", GROK_4_7_BUILD_FAST) => Some((GROK_4_7, GROK_4_7_FAST_PRICE_SCALE)),
+        _ => None,
+    }
+}
+
+fn scale_model_cost(mut metadata: ModelMetadata, scale: u64) -> ModelMetadata {
+    metadata.cost_default = metadata.cost_default.map(|cost| scale_cost(cost, scale));
+    metadata.cost_long_context = metadata
+        .cost_long_context
+        .map(|cost| scale_cost(cost, scale));
+    metadata
+}
+
+fn scale_cost(cost: ModelCost, scale: u64) -> ModelCost {
+    ModelCost {
+        input_micros_per_m: cost
+            .input_micros_per_m
+            .map(|value| value.saturating_mul(scale)),
+        output_micros_per_m: cost
+            .output_micros_per_m
+            .map(|value| value.saturating_mul(scale)),
+        cache_read_micros_per_m: cost
+            .cache_read_micros_per_m
+            .map(|value| value.saturating_mul(scale)),
+        cache_write_micros_per_m: cost
+            .cache_write_micros_per_m
+            .map(|value| value.saturating_mul(scale)),
+    }
+}
+
+fn load_model_metadata(
+    provider: &str,
+    model: &str,
+    freshness: CacheFreshness,
+) -> Option<ModelMetadata> {
+    load_cached_row(provider, model, freshness).map(|row| row.metadata)
+}
+
+/// Resolved cache row for the selected model: the single key-resolution path
+/// behind both [`load_model_metadata`] and [`image_input`].
+fn load_cached_row(provider: &str, model: &str, freshness: CacheFreshness) -> Option<CachedRow> {
+    let local = overrides::local_override_table(provider, model);
+    if let Some((source_model, scale)) = priced_catalog_alias(provider, model) {
+        let mut row = row_from_catalog_source(provider, source_model, None, freshness)?;
+        row.metadata = scale_model_cost(row.metadata, scale);
+        // The source name belongs to grok-4.7. Keep the fast id unlabeled
+        // until this id's own local table sets one.
+        row.metadata.display_name = None;
+        return Some(row.with_toml_overrides(local.as_ref()));
+    }
+    row_from_catalog_source(provider, model, local.as_ref(), freshness)
+}
+
+/// Cache row for `model`, including builtin overrides, provider capabilities,
+/// and `local` when this id has its own table. `local` is `None` when borrowing
+/// another id so that id's user overrides are not inherited.
+fn row_from_catalog_source(
+    provider: &str,
+    model: &str,
+    local: Option<&toml::map::Map<String, toml::Value>>,
+    freshness: CacheFreshness,
+) -> Option<CachedRow> {
+    let (cache_provider, cache_model) = catalog_source_for(provider, model, local);
+    let mut row = cached_upstream_row(&cache_provider, &cache_model, freshness)?;
+    let (override_provider, override_model) =
+        builtin_override_identity(&cache_provider, &cache_model);
+    row = row.with_toml_overrides(overrides::builtin_override_table(
+        &override_provider,
+        &override_model,
+    ));
+    Some(
+        row.with_provider_capabilities(provider, model)
+            .with_toml_overrides(local),
+    )
+}
+
+fn upstream_row_from_api(
+    api: &document::ModelsDevCatalog,
+    provider: &str,
+    model: &str,
+) -> Option<CachedRow> {
+    let descriptor = crate::provider::provider_descriptor(provider)?;
+    document::cached_row_from_catalog(
+        api,
+        descriptor.metadata_upstream_for_model(model),
+        descriptor.metadata_model(model),
+        descriptor.catalog_reasoning,
+    )
+}
+
+fn apply_overrides(provider: &str, model: &str, metadata: ModelMetadata) -> ModelMetadata {
+    let metadata = overrides::apply_builtin_overrides(provider, model, metadata);
+    let metadata = apply_provider_capabilities(provider, model, metadata);
+    overrides::apply_local_overrides(provider, model, metadata)
+}
+
+fn apply_provider_capabilities(
+    provider: &str,
+    model: &str,
+    metadata: ModelMetadata,
+) -> ModelMetadata {
+    CachedRow {
+        metadata,
+        ..CachedRow::default()
+    }
+    .with_provider_capabilities(provider, model)
+    .metadata
+}
+
+fn override_metadata(provider: &str, model: &str) -> Option<ModelMetadata> {
+    let metadata = apply_overrides(provider, model, ModelMetadata::default());
+    metadata_has_values(&metadata).then_some(metadata)
+}
+
+fn metadata_has_values(metadata: &ModelMetadata) -> bool {
+    metadata.display_name.is_some()
+        || metadata.advertised_context_window.is_some()
+        || metadata.effective_context_window.is_some()
+        || metadata.usable_context_window.is_some()
+        || metadata.long_context_threshold.is_some()
+        || metadata.max_output_tokens.is_some()
+        || metadata.cost_default.is_some()
+        || metadata.cost_long_context.is_some()
+        || metadata.supported_reasoning_levels.is_some()
+        || metadata.reasoning_capabilities_known
+        || metadata.reasoning_metadata_complete
+        || metadata.reasoning_off_behavior != ReasoningOffBehavior::Omit
+}
+
+/// Image input support for the selected model.
+///
+/// Resolves the same cache row as [`cached_model_metadata`], stale or not:
+/// modalities rarely change, and an offline session should still avoid
+/// sending images to a text-only model. A `models.toml` `image_input` value
+/// wins, including for models with no catalog row.
+pub fn image_input(provider: &str, model: &str) -> ImageInput {
+    if let Some(row) = load_cached_row(provider, model, CacheFreshness::AllowStale) {
+        return row.image_input;
+    }
+    overrides::local_override_table(provider, model)
+        .as_ref()
+        .and_then(overrides::local_image_input)
+        .unwrap_or_default()
+}
+
+pub(crate) async fn fetch_deprecated_provider_models(provider: &str) -> Option<HashSet<String>> {
+    let response = fetch_models_dev_api().await?;
+    // Reuse the document for a full hydrate when this process has not already
+    // marked the snapshot current, so a deprecation check also warms names.
+    hydrate::hydrate_from_fetched_api(&response).await;
+    Some(document::deprecated_provider_models(&response, provider))
+}
+
+async fn fetch_models_dev_api() -> Option<document::ModelsDevCatalog> {
+    fetch_models_dev_document("https://models.dev/api.json").await
+}
+
+/// Canonical `lab/model` rows; see [`document::ModelsDevCanonicalCatalog`].
+async fn fetch_models_dev_canonical() -> Option<document::ModelsDevCanonicalCatalog> {
+    fetch_models_dev_document("https://models.dev/models.json").await
+}
+
+async fn fetch_models_dev_document<T: serde::de::DeserializeOwned>(url: &str) -> Option<T> {
+    crate::reqwest_client_builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?
+        .get(url)
+        .header("User-Agent", crate::rho_user_agent())
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<T>()
+        .await
+        .ok()
+}
+
+/// Bump when the models.dev parser gains fields that older cache rows omit.
+/// Older or incomplete rows remain available as stale offline fallback, while
+/// explicit fetch paths rehydrate and write them from a catalog snapshot.
+///
+/// v7: Qwen Token Plan switched from Unknown to ExactAdvertised. Rows written
+/// under Unknown stored `reasoning_metadata_complete = true` with no levels, so
+/// fetch short-circuited forever. Bump forces rehydrate from models.dev.
+///
+/// v8: `display_name` added. Older rows are complete without it, so only a bump
+/// makes them refetch and pick up the catalog name.
+///
+/// v9: hydrate also writes non-Rho models.dev slugs so custom hosts can set
+/// `catalog = "llmgateway"` and borrow those rows. A version match on an older
+/// snapshot would otherwise skip the download forever.
+///
+/// `sdk_package` was added without a bump: only opencode-go reads it, and that
+/// provider registered in the same release, so no older rows can miss it. Bump
+/// when an already-registered provider switches to `PreferModelsDevNpm`.
+///
+/// v10: model-id hosts stopped splitting ids for lookup. They now read the
+/// unsplit `slug/model` id from a shared ExactAdvertised tree keyed
+/// `models.dev/tree`. Older snapshots hold slug-keyed rows at the wrong keys
+/// and parse policy, so they must refetch.
+///
+/// v11: rows gained a sidecar `image_input` key from models.dev
+/// `modalities.input`. Older rows would read `Unknown` forever without a
+/// refetch.
+///
+/// v12: the `rho` binary parses numbers with serde_json `arbitrary_precision`,
+/// which the price parser rejected, so older rows dropped fractional prices
+/// (`glm-5` output `3.2`, every `gpt-5.6-luna` rate). Refetch to restore them.
+///
+/// v13: retain toggle-only reasoning provenance so Chat Completions does not
+/// serialize the binary UI's Max level as an unadvertised effort value.
+///
+/// v14: the new `opencode` (Zen) provider reads `sdk_package` and prices from
+/// its rows to pick adapters and hide free models. A current older snapshot
+/// has no `opencode` rows, so it must refetch.
+///
+/// v15: the shared model-id tree also holds canonical `models.json` rows for
+/// `lab/model` ids no serving provider publishes under that slug. Older
+/// snapshots lack them, so those hosts would keep missing for a day.
+pub(super) const MODEL_METADATA_CACHE_VERSION: i64 = 15;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheFreshness {
+    CurrentOnly,
+    AllowStale,
+}
+
+fn cached_upstream_row(
+    provider: &str,
+    model: &str,
+    freshness: CacheFreshness,
+) -> Option<CachedRow> {
+    let cache_provider = provider;
+    let cache_model = model;
+    let (contents, cache_version): (String, i64) = with_models_dev_cache(|connection| {
+        connection.query_row(
+            "select metadata_json, cache_version from model_metadata
+             where provider = ?1 and model = ?2",
+            params![cache_provider, cache_model],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+    })
+    .ok()?
+    .ok()?;
+    let cached: CachedRow = serde_json::from_str(&contents).ok()?;
+    if !should_rehydrate_cached_metadata(cache_version, &cached.metadata) {
+        return Some(cached);
+    }
+
+    // Reads are side-effect free. Explicit fetch paths own catalog rehydration
+    // and only advance the cache after parsing a complete snapshot.
+    (freshness == CacheFreshness::AllowStale).then_some(cached)
+}
+
+fn should_rehydrate_cached_metadata(cache_version: i64, cached: &ModelMetadata) -> bool {
+    cache_version < MODEL_METADATA_CACHE_VERSION || !cached.reasoning_metadata_complete
+}
+
+/// Writes a batch of model metadata rows in a single SQLite transaction with a prepared statement.
+fn write_cached_upstream_model_metadata_batch<'a, I>(entries: I) -> usize
+where
+    I: IntoIterator<Item = (&'a str, &'a str, &'a CachedRow)>,
+{
+    with_models_dev_cache(|connection| {
+        let Ok(tx) = connection.transaction() else {
+            return 0;
+        };
+        let mut written = 0;
+        {
+            let Ok(mut stmt) = tx.prepare_cached(
+                "insert into model_metadata (provider, model, metadata_json, updated_at, cache_version)
+                 values (?1, ?2, ?3, strftime('%s', 'now'), ?4)
+                 on conflict(provider, model) do update set
+                   metadata_json = excluded.metadata_json,
+                   updated_at = excluded.updated_at,
+                   cache_version = excluded.cache_version",
+            ) else {
+                return 0;
+            };
+            for (provider, model, row) in entries {
+                let Ok(contents) = serde_json::to_string(row) else {
+                    continue;
+                };
+                if stmt
+                    .execute(params![
+                        provider,
+                        model,
+                        contents,
+                        MODEL_METADATA_CACHE_VERSION
+                    ])
+                    .is_ok()
+                {
+                    written += 1;
+                }
+            }
+        }
+        if tx.commit().is_err() {
+            return 0;
+        }
+        written
+    })
+    .unwrap_or_default()
+}
+
+pub(super) fn with_models_dev_cache<T>(
+    operation: impl FnOnce(&mut Connection) -> T,
+) -> rusqlite::Result<T> {
+    super::catalog_cache::with_connection(
+        models_dev_sqlite_path(),
+        super::catalog_cache::Schema::ModelsDev,
+        |connection, state| {
+            if matches!(state, super::catalog_cache::ConnectionState::Opened) {
+                // An externally removed/replaced catalog must not inherit the
+                // previous file's process-local hydrate readiness.
+                hydrate::set_catalog_ready(false);
+            }
+            operation(connection)
+        },
+    )
+}
+
+fn models_dev_sqlite_path() -> PathBuf {
+    cache_dir().join("models.dev/models-dev-metadata.sqlite3")
+}
+
+fn cache_dir() -> PathBuf {
+    if let Some(path) = test_cache_dir() {
+        return path;
+    }
+    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(path).join("rho");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(path) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(path).join("rho").join("cache");
+        }
+    }
+
+    if let Some(path) = crate::paths::home_dir() {
+        return path.join(".cache").join("rho");
+    }
+    std::env::temp_dir().join("rho-cache")
+}
+
+thread_local! {
+    static TEST_CACHE_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+pub(super) fn test_cache_dir_override_is_set() -> bool {
+    TEST_CACHE_DIR.with(|cache_dir| cache_dir.borrow().is_some())
+}
+
+pub(super) fn test_cache_dir() -> Option<PathBuf> {
+    TEST_CACHE_DIR.with(|cache_dir| cache_dir.borrow().clone())
+}
+
+#[doc(hidden)]
+pub fn with_models_dev_cache_dir_for_tests<T>(path: PathBuf, f: impl FnOnce() -> T) -> T {
+    let _guard = ModelsDevCacheDirGuard::new(path);
+    f()
+}
+
+/// Holds the models.dev cache dir for the current thread across awaits.
+///
+/// Prefer [`with_models_dev_cache_dir_for_tests`] for sync work. Use this when a
+/// test must keep the path set while awaiting on a `current_thread` runtime.
+#[doc(hidden)]
+pub struct ModelsDevCacheDirGuard {
+    previous: Option<PathBuf>,
+}
+
+impl ModelsDevCacheDirGuard {
+    #[doc(hidden)]
+    pub fn new(path: PathBuf) -> Self {
+        reset_catalog_hydrate_state_for_tests();
+        let previous = TEST_CACHE_DIR.with(|cache_dir| cache_dir.replace(Some(path)));
+        Self { previous }
+    }
+}
+
+impl Drop for ModelsDevCacheDirGuard {
+    fn drop(&mut self) {
+        super::catalog_cache::forget_connection(&models_dev_sqlite_path());
+        let previous = self.previous.take();
+        TEST_CACHE_DIR.with(|cache_dir| {
+            cache_dir.replace(previous);
+        });
+        reset_catalog_hydrate_state_for_tests();
+    }
+}
+
+/// Writes a cache row with `ImageInput::Unknown` and forgets the provider's
+/// cached display names.
+#[doc(hidden)]
+pub fn write_cached_model_metadata_for_tests(
+    provider: &str,
+    model: &str,
+    metadata: &ModelMetadata,
+) {
+    let row = CachedRow {
+        metadata: metadata.clone(),
+        ..CachedRow::default()
+    };
+    write_cached_upstream_model_metadata_batch([(provider, model, &row)]);
+    super::display_name::forget_provider_display_names(provider);
+}
+
+/// Writes a cache row carrying only `image_input` for tests of request shaping.
+#[doc(hidden)]
+pub fn write_cached_image_input_for_tests(provider: &str, model: &str, image_input: ImageInput) {
+    let row = CachedRow {
+        image_input,
+        ..CachedRow::default()
+    };
+    write_cached_upstream_model_metadata_batch([(provider, model, &row)]);
+}
+
+/// Marks the on-disk catalog snapshot current for tests that pre-seed rows.
+#[doc(hidden)]
+pub fn mark_catalog_snapshot_current_for_tests() {
+    let _ = hydrate::mark_catalog_snapshot_current();
+    hydrate::apply_in_memory_catalog_ready();
+}
+
+/// Ages the on-disk catalog snapshot past the freshness window for tests.
+///
+/// Leaves `cache_version` at the current binary value so only timestamp
+/// staleness forces another hydrate.
+#[doc(hidden)]
+pub fn age_catalog_snapshot_for_tests() {
+    hydrate::invalidate_catalog_snapshot();
+}
+
+/// Clears process-local hydrate readiness so a test can force another download path.
+#[doc(hidden)]
+pub fn reset_catalog_hydrate_state_for_tests() {
+    hydrate::set_catalog_ready(false);
+}
+
+#[cfg(test)]
+fn with_models_dev_cache_dir<T>(path: PathBuf, f: impl FnOnce() -> T) -> T {
+    with_models_dev_cache_dir_for_tests(path, f)
+}
+
+#[cfg(test)]
+fn model_metadata_from_api(api: &Value, provider: &str, model: &str) -> Option<ModelMetadata> {
+    let policy = crate::provider::provider_descriptor(provider)
+        .map(|descriptor| descriptor.catalog_reasoning)
+        .unwrap_or(CatalogReasoningPolicy::ExactAdvertised);
+    document::cached_row_from_catalog(
+        &document::ModelsDevCatalog::from_json_value(api),
+        provider,
+        model,
+        policy,
+    )
+    .map(|row| row.metadata)
+}
+
+#[cfg(test)]
+pub(crate) fn cache_catalog_for_tests(api: &Value) {
+    hydrate::hydrate_catalog_from_api(
+        &document::ModelsDevCatalog::from_json_value(api),
+        &document::ModelsDevCanonicalCatalog::default(),
+    );
+}

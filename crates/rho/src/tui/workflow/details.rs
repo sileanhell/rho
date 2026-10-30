@@ -1,0 +1,321 @@
+//! Selected-node details pane: durable output body, document scroll, and
+//! drag-to-copy text selection.
+
+use std::{path::PathBuf, time::Instant};
+
+use crossterm::event::{MouseButton, MouseEventKind};
+use ratatui::{
+    layout::Rect,
+    text::{Line, Span},
+};
+
+use crate::workflow::TaskInstanceId;
+
+use super::super::{
+    drag_selection::{DragSelection, SelectionBody},
+    render::{display_width, truncate_keep_end, truncate_one_line},
+    scrollbar::{HistoryScrollChrome, HistoryScrollbar, ScrollbarMouseInput},
+    theme::Theme,
+    HISTORY_MOUSE_SCROLL_LINES, HISTORY_SCROLLBAR_REVEAL_DURATION,
+};
+use super::{
+    event_adapter::{ArtifactReference, WorkflowNodeSnapshot},
+    output::{self, NodeOutputBody},
+};
+
+/// Right-pane output viewer for a finished workflow node.
+#[derive(Debug, Default)]
+pub(super) struct DetailPane {
+    run_directory: Option<PathBuf>,
+    body: Option<NodeOutputBody>,
+    /// Node and artifacts from the last load attempt, including a cache miss.
+    loaded_key: Option<(TaskInstanceId, Vec<ArtifactReference>)>,
+    scroll: HistoryScrollChrome,
+    area: Rect,
+    content_len: usize,
+    viewport: usize,
+    cached_width: Option<usize>,
+    cached_lines: Vec<Line<'static>>,
+    /// Body selection in content-line space, so it survives scrolling.
+    selection: DragSelection,
+    /// Text a finished drag selected; the app loop copies it.
+    pending_copy: Option<String>,
+}
+
+impl DetailPane {
+    pub(super) fn set_run_directory(&mut self, run_directory: Option<PathBuf>) {
+        self.run_directory = run_directory;
+        self.clear_body(/*reset_scroll*/ true);
+    }
+
+    #[cfg(test)]
+    pub(super) fn body(&self) -> Option<&NodeOutputBody> {
+        self.body.as_ref()
+    }
+
+    pub(super) fn has_body(&self) -> bool {
+        self.body.is_some()
+    }
+
+    pub(super) fn is_scrollable(&self) -> bool {
+        self.content_len > self.viewport && self.viewport > 0
+    }
+
+    pub(super) fn should_render_scrollbar(&self, now: Instant) -> bool {
+        self.scroll.should_render(now)
+    }
+
+    pub(super) fn dragging_scrollbar(&self) -> bool {
+        self.scroll.drag().is_some()
+    }
+
+    /// Body selection to highlight, in content-line space.
+    pub(super) fn selection(&self) -> DragSelection {
+        self.selection
+    }
+
+    /// Text a finished drag selected, for the caller to copy once.
+    pub(super) fn take_pending_copy(&mut self) -> Option<String> {
+        self.pending_copy.take()
+    }
+
+    /// Load durable output for the selected node when the cache is stale.
+    pub(super) fn refresh(&mut self, node: Option<&WorkflowNodeSnapshot>, reset_scroll: bool) {
+        let Some(node) = node else {
+            self.clear_body(reset_scroll);
+            return;
+        };
+        let Some(run_directory) = self.run_directory.as_ref() else {
+            self.clear_body(reset_scroll);
+            return;
+        };
+        let key = (node.id.clone(), node.artifacts.clone());
+        if self.loaded_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.loaded_key = Some(key);
+        self.body = output::load_finished_output(run_directory, node);
+        self.invalidate_line_cache();
+        self.clear_selection();
+        if reset_scroll {
+            self.scroll = HistoryScrollChrome::default();
+            // Stay top-anchored even before geometry is known.
+            self.scroll.pin_top_line(0, 0, 0);
+        }
+    }
+
+    /// Ensure body lines are rendered for `width` and return the full line count.
+    pub(super) fn prepare_body_lines(&mut self, width: usize) -> usize {
+        let width = width.max(1);
+        if self.cached_width != Some(width) {
+            self.cached_width = Some(width);
+            // Rewrapped lines no longer match the selected columns.
+            self.clear_selection();
+            self.cached_lines = match self.body.as_ref() {
+                Some(body) => {
+                    let mut lines = vec![section_rule(body, width), Line::from("")];
+                    lines.extend(output::render_body_lines(body, width));
+                    lines
+                }
+                None => Vec::new(),
+            };
+        }
+        self.cached_lines.len()
+    }
+
+    /// Clone only the currently visible window for rendering.
+    pub(super) fn visible_body_lines(&self) -> Vec<Line<'static>> {
+        if self.cached_lines.is_empty() || self.viewport == 0 {
+            return Vec::new();
+        }
+        let start = self.visible_start().min(self.cached_lines.len());
+        let end = start
+            .saturating_add(self.viewport)
+            .min(self.cached_lines.len());
+        self.cached_lines[start..end].to_vec()
+    }
+
+    pub(super) fn sync_geometry(&mut self, area: Rect, content_len: usize, viewport_len: usize) {
+        self.area = area;
+        self.content_len = content_len;
+        self.viewport = viewport_len;
+        let top = self.scroll.visible_start(content_len, viewport_len);
+        self.scroll.pin_top_line(content_len, viewport_len, top);
+    }
+
+    pub(super) fn visible_start(&self) -> usize {
+        self.scroll.visible_start(self.content_len, self.viewport)
+    }
+
+    pub(super) fn scroll_by(&mut self, delta: isize) {
+        if self.viewport == 0 {
+            return;
+        }
+        let max_start = self.content_len.saturating_sub(self.viewport);
+        let next = self
+            .visible_start()
+            .saturating_add_signed(delta)
+            .min(max_start);
+        self.scroll
+            .pin_top_line(self.content_len, self.viewport, next);
+        self.scroll.set_drag(None);
+    }
+
+    pub(super) fn scroll_page(&mut self, direction: isize) {
+        let page = self.viewport.max(1) as isize;
+        self.scroll_by(direction.saturating_mul(page));
+    }
+
+    pub(super) fn scroll_home(&mut self) {
+        self.scroll.pin_top_line(self.content_len, self.viewport, 0);
+        self.scroll.set_drag(None);
+    }
+
+    pub(super) fn scroll_end(&mut self) {
+        self.scroll.scroll_to_bottom();
+    }
+
+    pub(super) fn reveal_scrollbar(&mut self, now: Instant) {
+        if self.is_scrollable() {
+            self.scroll.reveal(now, HISTORY_SCROLLBAR_REVEAL_DURATION);
+        }
+    }
+
+    pub(super) fn handle_mouse(&mut self, kind: MouseEventKind, column: u16, row: u16) -> bool {
+        if self.area.width == 0 || self.area.height == 0 {
+            return false;
+        }
+        let now = Instant::now();
+        let scrollbar = self.scrollbar();
+        let over_details = self.area.contains((column, row).into())
+            || scrollbar.is_some_and(|bar| bar.contains(column, row));
+        let dragging = matches!(
+            kind,
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+        );
+        if !over_details && !dragging {
+            // A press elsewhere on the screen drops the body selection.
+            if matches!(kind, MouseEventKind::Down(MouseButton::Left)) && self.selection.is_active()
+            {
+                self.clear_selection();
+                return true;
+            }
+            return false;
+        }
+
+        let before = (
+            self.visible_start(),
+            self.scroll.drag().is_some(),
+            self.scroll.hovered(),
+            self.scroll.should_render(now),
+            self.selection,
+        );
+        self.scroll.handle_scrollbar_mouse(
+            kind,
+            column,
+            row,
+            ScrollbarMouseInput {
+                now,
+                reveal_duration: HISTORY_SCROLLBAR_REVEAL_DURATION,
+                scrollbar,
+                content_len: self.content_len,
+                viewport_len: self.viewport,
+                wheel_lines: HISTORY_MOUSE_SCROLL_LINES,
+            },
+        );
+        // Mouse helpers may collapse top into Bottom stickiness; re-pin document top.
+        let top = self.visible_start();
+        self.scroll
+            .pin_top_line(self.content_len, self.viewport, top);
+        self.handle_selection_mouse(kind, column, row);
+        let after = (
+            self.visible_start(),
+            self.scroll.drag().is_some(),
+            self.scroll.hovered(),
+            self.scroll.should_render(now),
+            self.selection,
+        );
+        before != after
+    }
+
+    /// Drag-to-select over the body text. A press that started a scrollbar
+    /// drag never selects; a release that selected text keeps the highlight
+    /// and queues the text for copy.
+    fn handle_selection_mouse(&mut self, kind: MouseEventKind, column: u16, row: u16) {
+        let body = SelectionBody {
+            area: self.text_area(),
+            top_line: self.visible_start(),
+            lines: &self.cached_lines,
+        };
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) if self.scroll.drag().is_some() => {
+                self.selection.clear();
+            }
+            MouseEventKind::Down(MouseButton::Left) => self.selection.press(body, column, row),
+            MouseEventKind::Drag(MouseButton::Left) => self.selection.drag(body, column, row),
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(text) = self.selection.release(body, column, row) {
+                    self.pending_copy = Some(text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Body text columns: the pane minus the scrollbar column the body lines
+    /// are wrapped around.
+    pub(super) fn text_area(&self) -> Rect {
+        Rect {
+            width: self.area.width.saturating_sub(1),
+            ..self.area
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection.clear();
+    }
+
+    pub(super) fn scrollbar(&self) -> Option<HistoryScrollbar> {
+        HistoryScrollbar::new(self.area, self.content_len, self.visible_start())
+    }
+
+    fn clear_body(&mut self, reset_scroll: bool) {
+        self.body = None;
+        self.loaded_key = None;
+        self.invalidate_line_cache();
+        self.clear_selection();
+        if reset_scroll {
+            self.scroll = HistoryScrollChrome::default();
+        }
+    }
+
+    fn invalidate_line_cache(&mut self) {
+        self.cached_width = None;
+        self.cached_lines.clear();
+    }
+}
+
+/// One rule row that names the artifact: `── answer · nodes/…/answer.txt ───`.
+/// The path keeps its file name when the pane is too narrow for all of it.
+fn section_rule(body: &NodeOutputBody, width: usize) -> Line<'static> {
+    let label = body.kind.label();
+    if 3 + display_width(label) + 1 > width {
+        // Too narrow for the decorated rule; keep one row that fits.
+        let text = truncate_one_line(&format!("── {label}"), width);
+        return Line::styled(text, Theme::dim());
+    }
+    // "── " + label + " · " + path + " " + at least one rule glyph.
+    let fixed = 3 + display_width(label) + 3 + 2;
+    let path = truncate_keep_end(&body.relative_path, width.saturating_sub(fixed));
+    let tail = if path.is_empty() {
+        " ".to_owned()
+    } else {
+        format!(" · {path} ")
+    };
+    let fill = width.saturating_sub(3 + display_width(label) + display_width(&tail));
+    Line::from(vec![
+        Span::styled("── ", Theme::dim()),
+        Span::styled(label, Theme::accent()),
+        Span::styled(format!("{tail}{}", "─".repeat(fill)), Theme::dim()),
+    ])
+}

@@ -1,0 +1,728 @@
+//! Provider-neutral model messages, requests, responses, and usage.
+//!
+//! These values are owned by the SDK rather than a specific transport. Message
+//! serialization intentionally preserves Rho's historical externally-tagged
+//! enum representation so existing session history remains readable.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+const PORTABLE_FALLBACK_CONTEXT_KIND: &str = "rho.sdk.portable_fallback.v1";
+/// Kind string providers emit on [`ModelEvent::ProviderContext`] when a tool
+/// call was accepted as async.
+///
+/// # Next major
+///
+/// NEXT_MAJOR(rho-sdk): replace the async-call marker block with a
+/// `ModelEvent::ToolCallAccepted { id, execution: ToolExecutionMode }` variant
+/// and an `execution` field on `ToolCall`.
+pub const ASYNC_TOOL_CALL_CONTEXT_KIND: &str = "rho.sdk.async_tool_call.v1";
+/// Kind prefix for provider notes: bookkeeping a provider records on an
+/// assistant turn for its own later requests. Build kinds with
+/// [`ProviderContextBlock::provider_note_kind`].
+///
+/// # Next major
+///
+/// NEXT_MAJOR(rho-sdk): replace the reserved provider-note kind prefix with the
+/// explicit replay scope on ProviderContextBlock.
+pub const PROVIDER_NOTE_CONTEXT_KIND_PREFIX: &str = "rho.sdk.provider_note.v1:";
+
+use crate::CancellationToken;
+
+mod compaction_summary;
+pub mod context;
+pub mod handoff;
+mod model_context;
+mod semantic;
+mod stop_reason;
+mod tool_image_supplement;
+
+pub use compaction_summary::CompactionSummary;
+pub use semantic::SemanticMessage;
+pub use stop_reason::ModelStopReason;
+pub(crate) use stop_reason::STOP_REASON_CONTEXT_KIND;
+pub use tool_image_supplement::ToolImageSupplement;
+
+/// Provider-neutral specification for a tool available during a model turn.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+/// Complete tool call requested by a model or supplied by the host.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+impl ToolCall {
+    pub(crate) fn has_valid_protocol_fields(&self) -> bool {
+        !self.id.is_empty() && !self.name.is_empty() && self.arguments.is_object()
+    }
+}
+
+/// Result returned to a model after a tool call.
+///
+/// # Next major
+///
+/// NEXT_MAJOR(rho-sdk): put tool images directly on ToolResult and remove supplemental user-role image messages.
+///
+/// Adding fields would break downstream struct literals. Until the next major,
+/// use [`Message::tool_image_supplement`] and [`Message::semantic`]
+/// to construct and classify the separate image entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub id: String,
+    pub ok: bool,
+    pub content: String,
+}
+
+/// Tool call fragment retained when a model turn is interrupted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialToolCall {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments: String,
+}
+
+/// Partial assistant output retained after an incomplete model turn.
+///
+/// Used when a run ends cooperatively before the assistant finishes, including
+/// explicit cancellation and terminal provider/run failure with streamed
+/// progress. Provider adapters may append a model-visible abort marker when
+/// replaying this entry on a later turn.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AbortedAssistant {
+    pub content: Vec<ContentBlock>,
+    pub reasoning: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ModelIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_context: Vec<ProviderContextBlock>,
+    pub tool_calls: Vec<PartialToolCall>,
+    pub usage: ModelUsage,
+}
+
+/// Exact provider, API, and model identity for replay-sensitive context.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ModelIdentity {
+    pub provider: String,
+    pub api: String,
+    pub model: String,
+}
+
+impl ModelIdentity {
+    pub fn new(
+        provider: impl Into<String>,
+        api: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            api: api.into(),
+            model: model.into(),
+        }
+    }
+}
+
+/// Opaque provider-native data tagged with its producing model identity.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderContextBlock {
+    pub identity: ModelIdentity,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<usize>,
+    pub data: Value,
+}
+
+impl ProviderContextBlock {
+    /// Whether the target can replay this native format without rewriting it.
+    ///
+    /// Unknown formats require exact identity. Codex Responses compaction items
+    /// and reasoning items with nonempty encrypted content can replay across
+    /// model names within the same provider and API. This exception does not
+    /// apply to API-key OpenAI or other Responses-compatible providers.
+    ///
+    /// # Next major
+    ///
+    /// NEXT_MAJOR(rho-sdk): replace the Codex format exception with explicit
+    /// replay scope on ProviderContextBlock, set by the producing adapter.
+    /// Adding that field now would break downstream struct literals. Until then,
+    /// use this method for both omission reporting and request filtering.
+    pub fn is_replayable_to(&self, target: &ModelIdentity) -> bool {
+        if self.is_sdk_metadata()
+            || self.identity.provider != target.provider
+            || self.identity.api != target.api
+        {
+            return false;
+        }
+        self.identity.model == target.model
+            || match (
+                self.identity.provider.as_str(),
+                self.identity.api.as_str(),
+                self.kind.as_str(),
+                self.data.get("type").and_then(Value::as_str),
+            ) {
+                (
+                    "openai-codex",
+                    "openai-responses",
+                    "openai_response_output_item",
+                    Some("compaction"),
+                ) => true,
+                (
+                    "openai-codex",
+                    "openai-responses",
+                    "openai_response_output_item",
+                    Some("reasoning"),
+                ) => self
+                    .data
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| !content.is_empty()),
+                _ => false,
+            }
+    }
+
+    /// Marks a tool call the provider accepted as async.
+    ///
+    /// # Next major
+    ///
+    /// NEXT_MAJOR(rho-sdk): replace the async-call marker block with a
+    /// `ModelEvent::ToolCallAccepted { id, execution: ToolExecutionMode }` variant
+    /// and an `execution` field on `ToolCall`.
+    ///
+    /// Providers emit this via [`crate::model::ModelEvent::ProviderContext`] because
+    /// `ModelEvent` and [`ToolCall`] cannot grow in a minor. SDK metadata: never
+    /// replayed as provider-native context, never counted as a handoff omission.
+    pub fn async_tool_call(identity: ModelIdentity, call_id: impl Into<String>) -> Self {
+        Self {
+            identity,
+            kind: ASYNC_TOOL_CALL_CONTEXT_KIND.into(),
+            position: None,
+            data: Value::String(call_id.into()),
+        }
+    }
+
+    /// Kind for the provider note `name`.
+    ///
+    /// Notes are SDK metadata: never replayed as provider-native context and
+    /// never counted as a handoff omission. The producing provider reads its
+    /// own notes back with [`Self::provider_note_name`] and an identity check.
+    pub fn provider_note_kind(name: &str) -> String {
+        format!("{PROVIDER_NOTE_CONTEXT_KIND_PREFIX}{name}")
+    }
+
+    /// The note name when this block is a provider note.
+    pub fn provider_note_name(&self) -> Option<&str> {
+        self.kind
+            .strip_prefix(PROVIDER_NOTE_CONTEXT_KIND_PREFIX)
+            .filter(|name| !name.is_empty())
+    }
+
+    /// Returns the call id when this block is a well-formed async-call marker.
+    pub fn async_tool_call_id(&self) -> Option<&str> {
+        (self.kind == ASYNC_TOOL_CALL_CONTEXT_KIND
+            && self.position.is_none()
+            && self.data.is_string())
+        .then(|| self.data.as_str())
+        .flatten()
+    }
+
+    pub(crate) fn is_portable_fallback(&self) -> bool {
+        self.kind == PORTABLE_FALLBACK_CONTEXT_KIND
+            && self.position.is_none()
+            && self.data.is_string()
+    }
+
+    /// Portable fallback, async-call marker, or provider note: never replayed
+    /// as provider-native context, never counted as a handoff omission.
+    pub(crate) fn is_sdk_metadata(&self) -> bool {
+        self.is_portable_fallback()
+            || self.async_tool_call_id().is_some()
+            || self.provider_note_name().is_some()
+    }
+}
+
+/// Completed assistant output with portable and provider-native context.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct AssistantMessage {
+    pub content: Vec<ContentBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ModelIdentity>,
+    /// Provider-produced reasoning summary. Raw reasoning must never be stored here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_summary: Option<String>,
+    /// Opaque provider data filtered by [`ProviderContextBlock::is_replayable_to`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_context: Vec<ProviderContextBlock>,
+}
+
+impl AssistantMessage {
+    pub fn from_content(content: Vec<ContentBlock>) -> Self {
+        Self {
+            content,
+            ..Self::default()
+        }
+    }
+
+    /// Adds portable text to use only when opaque provider context cannot replay.
+    ///
+    /// The fallback is stored as SDK metadata in [`Self::provider_context`] to
+    /// preserve compatibility with existing `AssistantMessage` struct literals.
+    /// It is never replayed as provider-native context.
+    pub fn with_portable_fallback(mut self, fallback: impl Into<String>) -> Self {
+        self.provider_context
+            .retain(|block| !block.is_portable_fallback());
+        let identity = self
+            .provenance
+            .clone()
+            .unwrap_or_else(|| ModelIdentity::new("", "", ""));
+        self.provider_context.push(ProviderContextBlock {
+            identity,
+            kind: PORTABLE_FALLBACK_CONTEXT_KIND.into(),
+            position: None,
+            data: Value::String(fallback.into()),
+        });
+        self
+    }
+
+    /// Returns portable fallback text attached by [`Self::with_portable_fallback`].
+    pub fn portable_fallback(&self) -> Option<&str> {
+        self.provider_context
+            .iter()
+            .find(|block| block.is_portable_fallback())
+            .and_then(|block| block.data.as_str())
+    }
+
+    /// Removes provider-native context while retaining portable SDK metadata.
+    pub fn retain_portable_context(&mut self) {
+        self.provider_context
+            .retain(ProviderContextBlock::is_portable_fallback);
+    }
+}
+
+#[derive(Deserialize)]
+struct AssistantMessageRepr {
+    #[serde(default)]
+    content: Vec<ContentBlock>,
+    #[serde(default)]
+    provenance: Option<ModelIdentity>,
+    #[serde(default)]
+    reasoning_summary: Option<String>,
+    #[serde(default)]
+    portable_fallback: Option<String>,
+    #[serde(default)]
+    provider_context: Vec<ProviderContextBlock>,
+}
+
+impl<'de> Deserialize<'de> for AssistantMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let repr = AssistantMessageRepr::deserialize(deserializer)?;
+        let message = Self {
+            content: repr.content,
+            provenance: repr.provenance,
+            reasoning_summary: repr.reasoning_summary,
+            provider_context: repr.provider_context,
+        };
+        Ok(match repr.portable_fallback {
+            Some(fallback) => message.with_portable_fallback(fallback),
+            None => message,
+        })
+    }
+}
+
+/// One provider-neutral history entry.
+///
+/// # Next major
+///
+/// NEXT_MAJOR(rho-sdk): put tool images directly on ToolResult and remove supplemental user-role image messages.
+///
+/// For minor compatibility tool-owned images use `User` entries. Prefer
+/// [`Self::semantic`] for exhaustive classification that distinguishes tool data
+/// from human submissions without changing the serialized variants.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Message {
+    System(String),
+    User(Vec<ContentBlock>),
+    /// Legacy provider-neutral assistant format retained for session compatibility.
+    Assistant(Vec<ContentBlock>),
+    /// Assistant output with model provenance and portable/provider-owned context.
+    EnrichedAssistant(Box<AssistantMessage>),
+    /// Partial assistant output retained when a model turn ends incompletely.
+    AbortedAssistant(Box<AbortedAssistant>),
+    ToolResult(ToolResult),
+}
+
+impl Message {
+    pub fn user_text(content: impl Into<String>) -> Self {
+        Self::User(vec![ContentBlock::Text(content.into())])
+    }
+
+    pub fn assistant_text(content: impl Into<String>) -> Self {
+        Self::Assistant(vec![ContentBlock::Text(content.into())])
+    }
+
+    pub fn assistant(message: AssistantMessage) -> Self {
+        Self::EnrichedAssistant(Box::new(message))
+    }
+
+    pub fn completed_assistant_content(&self) -> Option<&[ContentBlock]> {
+        match self {
+            Self::Assistant(content) => Some(content),
+            Self::EnrichedAssistant(message) => Some(&message.content),
+            Self::System(_) | Self::User(_) | Self::AbortedAssistant(_) | Self::ToolResult(_) => {
+                None
+            }
+        }
+    }
+}
+
+/// One provider-neutral content item.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ContentBlock {
+    Text(String),
+    Image(ImageContent),
+    ToolCall(ToolCall),
+}
+
+/// Base64-encoded image input and its media type.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageContent {
+    pub data: String,
+    pub mime_type: String,
+}
+
+impl ImageContent {
+    /// Detects PNG, JPEG, GIF, or WebP from leading magic bytes.
+    pub fn mime_type_from_bytes(header: &[u8]) -> Option<&'static str> {
+        if header.starts_with(b"\x89PNG\r\n\x1a\n") {
+            Some("image/png")
+        } else if header.starts_with(&[0xff, 0xd8, 0xff]) {
+            Some("image/jpeg")
+        } else if header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a") {
+            Some("image/gif")
+        } else if header.starts_with(b"RIFF") && header.get(8..12) == Some(b"WEBP") {
+            Some("image/webp")
+        } else {
+            None
+        }
+    }
+}
+
+/// Provider service class requested for one model turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum ServiceTier {
+    /// Prefer the provider's low-latency priority service.
+    Priority,
+}
+
+/// Borrowed input for one provider turn.
+#[derive(Clone, Debug)]
+pub struct ModelRequest<'a> {
+    pub messages: &'a [Message],
+    pub tools: &'a [ToolSpec],
+    pub cancellation: CancellationToken,
+    pub reasoning_level: crate::ReasoningLevel,
+    /// Provider-specific prompt cache key metadata.
+    ///
+    /// Providers must opt in explicitly when their API supports this field.
+    pub prompt_cache_key: Option<&'a str>,
+}
+
+/// Normalized result of one provider turn.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelResponse {
+    Assistant(Vec<ContentBlock>),
+}
+
+impl ModelResponse {
+    /// Explains why this response violates the tool-call protocol, if it does.
+    ///
+    /// Orchestration rejects responses with an issue and surfaces the returned
+    /// message. The per-call checks mirror [`ToolCall::has_valid_protocol_fields`]
+    /// and the walk adds duplicate-id detection across the whole response.
+    pub(crate) fn protocol_issue(&self) -> Option<String> {
+        let ModelResponse::Assistant(content) = self;
+        if content.is_empty() {
+            return Some("provider returned an empty assistant response".into());
+        }
+        let mut issues = Vec::new();
+        let mut call_ids = std::collections::BTreeSet::new();
+        for (index, block) in content.iter().enumerate() {
+            let ContentBlock::ToolCall(call) = block else {
+                continue;
+            };
+            if call.id.is_empty() {
+                issues.push(format!("tool call {index} has an empty id"));
+            } else if !call_ids.insert(call.id.as_str()) {
+                issues.push(format!("duplicate tool call id '{}'", call.id));
+            }
+            if call.name.is_empty() {
+                issues.push(format!("tool call {index} has an empty name"));
+            }
+            if !call.arguments.is_object() {
+                issues.push(format!("tool call {index} arguments are not a JSON object"));
+            }
+        }
+        if issues.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "provider returned a malformed assistant response: {}",
+                issues.join("; ")
+            ))
+        }
+    }
+}
+
+/// Host-reported usage where the prompt total still includes cache hits.
+///
+/// Pass this to [`ModelUsage::from_inclusive_prompt`]. Anthropic-style hosts
+/// that already report an uncached remainder should construct [`ModelUsage`]
+/// directly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InclusivePromptUsage {
+    pub prompt_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub reported_total: Option<u64>,
+    pub context_window: Option<u64>,
+    pub cost_usd_micros: Option<u64>,
+}
+
+/// Normalized token, context, and cost accounting for model work.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelUsage {
+    /// Uncached input tokens charged at the normal input-token rate.
+    ///
+    /// Absent when the host has not reported a cache split. Do not treat a
+    /// missing value as zero uncached tokens, and do not store a mixed prompt
+    /// total here. Use [`Self::from_inclusive_prompt`] for inclusive-prompt
+    /// hosts and [`Self::inclusive_prompt_tokens`] for prompt size.
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+    pub cost_usd_micros: Option<u64>,
+}
+
+impl ModelUsage {
+    /// Build usage from a host that reports an inclusive prompt total.
+    ///
+    /// Uncached input is derived only when a cache field is present, including
+    /// an explicit zero. A missing cache count is not treated as zero cache.
+    /// `total_tokens` keeps the host total, or prompt plus output when the host
+    /// omitted it, so [`Self::inclusive_prompt_tokens`] can recover prompt size.
+    pub fn from_inclusive_prompt(usage: InclusivePromptUsage) -> Self {
+        let input_tokens = match (
+            usage.prompt_tokens,
+            usage.cache_read_tokens,
+            usage.cache_write_tokens,
+        ) {
+            (Some(prompt), cache_read, cache_write)
+                if cache_read.is_some() || cache_write.is_some() =>
+            {
+                Some(
+                    prompt
+                        .saturating_sub(cache_read.unwrap_or_default())
+                        .saturating_sub(cache_write.unwrap_or_default()),
+                )
+            }
+            _ => None,
+        };
+        let total_tokens =
+            usage
+                .reported_total
+                .or_else(|| match (usage.prompt_tokens, usage.output_tokens) {
+                    (Some(prompt), Some(output)) => Some(prompt.saturating_add(output)),
+                    (Some(prompt), None) => Some(prompt),
+                    _ => None,
+                });
+        Self {
+            input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+            total_tokens,
+            context_window: usage.context_window,
+            cost_usd_micros: usage.cost_usd_micros,
+        }
+    }
+
+    /// Sum of the disjoint input buckets: uncached, cache read, and cache write.
+    ///
+    /// Missing when every bucket is absent. This is not prompt size for a mixed
+    /// total; use [`Self::inclusive_prompt_tokens`] for that.
+    pub fn total_input_tokens(&self) -> Option<u64> {
+        let has_input = self.input_tokens.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.cache_write_tokens.is_some();
+        has_input.then_some(
+            self.input_tokens
+                .unwrap_or_default()
+                .saturating_add(self.cache_read_tokens.unwrap_or_default())
+                .saturating_add(self.cache_write_tokens.unwrap_or_default()),
+        )
+    }
+
+    /// Prompt tokens present in the request, including cache hits and writes.
+    ///
+    /// Prefers the disjoint buckets. When those undercount an accumulated
+    /// session, or when they are absent, uses `total_tokens` minus output so
+    /// context fill and catalog cost can still see a prompt. Returns none when
+    /// output is unknown: a bare total may still be growing with generation.
+    pub fn inclusive_prompt_tokens(&self) -> Option<u64> {
+        let buckets = self.total_input_tokens();
+        let recovered = match (self.total_tokens, self.output_tokens) {
+            (Some(total), Some(output)) => Some(total.saturating_sub(output)),
+            _ => None,
+        };
+        match (buckets, recovered) {
+            (Some(known), Some(from_total)) => Some(known.max(from_total)),
+            (Some(known), None) | (None, Some(known)) => Some(known),
+            (None, None) => None,
+        }
+    }
+
+    /// Saturating sum used to accumulate usage across model steps.
+    pub fn saturating_add(&self, other: &Self) -> Self {
+        Self {
+            input_tokens: add_optional(self.input_tokens, other.input_tokens),
+            output_tokens: add_optional(self.output_tokens, other.output_tokens),
+            cache_read_tokens: add_optional(self.cache_read_tokens, other.cache_read_tokens),
+            cache_write_tokens: add_optional(self.cache_write_tokens, other.cache_write_tokens),
+            total_tokens: add_optional(self.total_tokens, other.total_tokens),
+            context_window: other.context_window.or(self.context_window),
+            cost_usd_micros: add_optional(self.cost_usd_micros, other.cost_usd_micros),
+        }
+    }
+}
+
+fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (None, None) => None,
+        (left, right) => Some(
+            left.unwrap_or_default()
+                .saturating_add(right.unwrap_or_default()),
+        ),
+    }
+}
+
+/// Semantic event produced while a provider response is streaming.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelEvent {
+    OutputDelta(String),
+    ReasoningDelta(String),
+    /// A provider-produced reasoning summary safe to persist and hand off.
+    ReasoningSummaryDelta(String),
+    /// Provider-native web search activity observed during a model turn.
+    WebSearch(String),
+    ToolCallDelta {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        arguments: String,
+    },
+    ProviderContext {
+        kind: String,
+        position: Option<usize>,
+        data: Value,
+    },
+    Usage(ModelUsage),
+    /// Generation-window output tokens for this attempt.
+    ///
+    /// The runtime consumes this into [`crate::ModelCallMetrics`] and never
+    /// lowers it to a [`crate::RunEvent`] or persists it as provider context.
+    GenerationOutputTokens(GenerationOutputTokens),
+    /// Provider-native hosted tool activity (for example xAI `x_search`).
+    ///
+    /// The runtime maps this to [`crate::RunEvent::HostedToolActivity`] and
+    /// does not retain it as provider-context replay state.
+    HostedToolActivity {
+        name: String,
+        detail: String,
+    },
+    /// The provider completed a request on a different service tier.
+    ///
+    /// The runtime maps this to [`crate::RunEvent::ProviderServiceTierFallback`]
+    /// and does not retain it as provider-context replay state.
+    ServiceTierFallback {
+        requested: ServiceTier,
+        used: String,
+    },
+}
+
+/// Generation-window output tokens reported by a provider for one attempt.
+///
+/// Distinct from aggregate [`ModelUsage::output_tokens`], which keeps the
+/// provider's full billed output total (including reasoning).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationOutputTokens {
+    /// Non-reasoning output count that matches the generation timing window.
+    Reported(u64),
+    /// The provider produced output that cannot be attributed to the generation
+    /// window (hidden reasoning without a token split, or a burst-replayed
+    /// proxy flush whose generation window measures replay speed).
+    Unavailable,
+}
+
+/// Source used to calculate the current context consumption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextUsageSource {
+    Estimated,
+    ProviderReported,
+    UnknownAfterCompaction,
+}
+
+/// Current model-context consumption and its provenance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextUsage {
+    pub tokens: Option<u64>,
+    pub context_window: Option<u64>,
+    pub source: ContextUsageSource,
+}
+
+impl ContextUsage {
+    pub fn estimated(tokens: u64, context_window: Option<u64>) -> Self {
+        Self {
+            tokens: Some(tokens),
+            context_window,
+            source: ContextUsageSource::Estimated,
+        }
+    }
+
+    pub fn provider_reported(tokens: u64, context_window: Option<u64>) -> Self {
+        Self {
+            tokens: Some(tokens),
+            context_window,
+            source: ContextUsageSource::ProviderReported,
+        }
+    }
+
+    pub fn unknown_after_compaction(context_window: Option<u64>) -> Self {
+        Self {
+            tokens: None,
+            context_window,
+            source: ContextUsageSource::UnknownAfterCompaction,
+        }
+    }
+
+    pub fn from_model_usage(usage: &ModelUsage) -> Option<Self> {
+        usage
+            .inclusive_prompt_tokens()
+            .map(|tokens| Self::provider_reported(tokens, usage.context_window))
+    }
+}

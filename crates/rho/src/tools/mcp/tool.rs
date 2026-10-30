@@ -1,0 +1,457 @@
+//! The native tool that fronts one remote MCP tool.
+//!
+//! A `tools/call` is an RPC on a session the host already owns, so the tool
+//! itself holds no process or network capability. What it does own is the live
+//! link between one invocation and the server: the progress token the server
+//! reports against, and the request handle that carries a real
+//! `notifications/cancelled` when the turn is cancelled.
+
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, RwLock,
+};
+
+use rho_sdk::{
+    model::ToolSpec,
+    tool::{
+        PreparedToolInvocation, Tool, ToolContext, ToolError, ToolErrorKind, ToolInvocation,
+        ToolOutput, ToolPreparationContext, ToolPrepareFuture, ToolProgressSender, ToolSecurity,
+    },
+    CancellationToken,
+};
+use rmcp::{
+    model::{CallToolRequest, CallToolRequestParams, ClientRequest, ServerResult},
+    service::{PeerRequestOptions, RequestHandle, ServiceError, ServiceRole},
+    Peer, RoleClient,
+};
+
+use super::{
+    config::McpTransport, definition::McpToolDefinition, inflight::McpInFlightCalls,
+    progress::McpProgressRouter, result,
+};
+
+// Bound in-flight tool calls so an unresponsive server cannot hang a turn.
+pub(super) const MCP_TOOL_CALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The remaining time one `tools/call` has, which a caller can push forward.
+///
+/// The budget exists to stop an unresponsive server from hanging a turn. A turn
+/// waiting on a person is not hung, so the time the user spends answering a
+/// server's question is given back rather than spent against the server.
+#[derive(Clone, Debug)]
+pub(super) struct CallBudget {
+    deadline: Arc<Mutex<tokio::time::Instant>>,
+}
+
+impl CallBudget {
+    pub(super) fn new(budget: std::time::Duration) -> Self {
+        Self {
+            deadline: Arc::new(Mutex::new(tokio::time::Instant::now() + budget)),
+        }
+    }
+
+    /// Completes once the deadline passes, re-reading it after every extension.
+    async fn expired(&self) {
+        loop {
+            let deadline = self.deadline();
+            tokio::time::sleep_until(deadline).await;
+            if tokio::time::Instant::now() >= self.deadline() {
+                return;
+            }
+        }
+    }
+
+    fn extend(&self, by: std::time::Duration) {
+        let mut deadline = self.lock();
+        *deadline += by;
+    }
+
+    fn deadline(&self) -> tokio::time::Instant {
+        *self.lock()
+    }
+
+    /// A poisoned lock still holds a valid deadline, so recover rather than
+    /// fail the call it is meant to bound.
+    fn lock(&self) -> std::sync::MutexGuard<'_, tokio::time::Instant> {
+        self.deadline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+const CANCEL_REASON: &str = "Rho cancelled the turn";
+
+/// The part of an exported MCP tool that can change while a session runs.
+///
+/// `tools/list_changed` lets a server revise a tool's description, schema,
+/// output contract, and annotations, and withdraw it entirely. Rho reads the
+/// definition when it builds each run, so a revision reaches the model on the
+/// next turn without a restart. A withdrawn tool stays registered under its
+/// exported name and fails with a clear reason, because the registry itself is
+/// fixed for the session.
+#[derive(Debug)]
+pub(super) struct McpToolSlot {
+    definition: RwLock<McpToolDefinition>,
+    available: AtomicBool,
+}
+
+impl McpToolSlot {
+    pub(super) fn new(definition: McpToolDefinition) -> Self {
+        Self {
+            definition: RwLock::new(definition),
+            available: AtomicBool::new(true),
+        }
+    }
+
+    /// Returns `true` when the incoming definition differs from the live one.
+    pub(super) fn refresh(&self, definition: McpToolDefinition) -> bool {
+        self.available.store(true, Ordering::Relaxed);
+        let mut current = self.write();
+        if *current == definition {
+            return false;
+        }
+        *current = definition;
+        true
+    }
+
+    pub(super) fn withdraw(&self) {
+        self.available.store(false, Ordering::Relaxed);
+    }
+
+    fn is_available(&self) -> bool {
+        self.available.load(Ordering::Relaxed)
+    }
+
+    /// A poisoned lock still holds a complete definition, so recover rather
+    /// than turn an unrelated panic into a failed tool call.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, McpToolDefinition> {
+        self.definition
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, McpToolDefinition> {
+        self.definition
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+pub(crate) struct McpTool {
+    pub(super) slot: Arc<McpToolSlot>,
+    pub(super) identity: String,
+    pub(super) remote_name: String,
+    pub(super) peer: Peer<RoleClient>,
+    pub(super) progress: McpProgressRouter,
+    /// Where this invocation publishes itself so the server's elicitation and
+    /// sampling requests can be routed back to it.
+    pub(super) calls: McpInFlightCalls,
+    pub(super) transport: McpTransport,
+    pub(super) max_output_bytes: usize,
+    pub(super) image_delivery: super::McpImageDelivery,
+}
+
+impl Tool for McpTool {
+    fn spec(&self) -> ToolSpec {
+        self.slot.read().spec.clone()
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        self.slot
+            .read()
+            .expectation
+            .output_schema
+            .as_deref()
+            .cloned()
+    }
+
+    fn security(&self) -> ToolSecurity {
+        // Config is the trust boundary: enabling a server starts it at session
+        // load. Tool calls are RPCs on that already-running host-owned session
+        // and must not pretend to spawn a process or open a fresh network grant.
+        ToolSecurity::built_in([])
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        invocation: ToolInvocation,
+        _context: ToolPreparationContext,
+    ) -> ToolPrepareFuture<'a> {
+        self.prepare_with_completion(invocation, None)
+    }
+}
+
+/// Whether the remote returned a tools/call result. Transport errors and
+/// cancellation do not establish completion, regardless of ToolErrorKind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum McpCallCompletion {
+    #[default]
+    Unconfirmed,
+    Answered,
+}
+
+impl McpTool {
+    /// Keep provenance per invocation, separate from SDK errors and metadata.
+    /// Preparation, execution, rendering and assets use the normal MCP path.
+    pub(crate) async fn call_with_completion(
+        &self,
+        invocation: ToolInvocation,
+        context: ToolContext,
+    ) -> (McpCallCompletion, Result<ToolOutput, ToolError>) {
+        let call = ObservedCall {
+            tool: self,
+            completion: Mutex::new(McpCallCompletion::Unconfirmed),
+        };
+        let result = call.call(invocation, context).await;
+        (
+            call.completion
+                .into_inner()
+                .unwrap_or_else(|error| error.into_inner()),
+            result,
+        )
+    }
+
+    fn prepare_with_completion<'a>(
+        &'a self,
+        invocation: ToolInvocation,
+        completion: Option<&'a Mutex<McpCallCompletion>>,
+    ) -> ToolPrepareFuture<'a> {
+        let arguments = invocation.into_arguments();
+        Box::pin(async move {
+            if !self.slot.is_available() {
+                return Err(ToolError::new(
+                    ToolErrorKind::Execution,
+                    format!(
+                        "MCP server `{}` withdrew tool `{}`; restart the session to refresh its tools",
+                        self.identity, self.remote_name
+                    ),
+                ));
+            }
+            let Some(arguments) = arguments.as_object().cloned() else {
+                return Err(ToolError::new(
+                    ToolErrorKind::InvalidArguments,
+                    "MCP tool arguments must be a JSON object",
+                ));
+            };
+            let (metadata, expectation) = {
+                let definition = self.slot.read();
+                (
+                    definition.presentation.metadata(&self.transport),
+                    definition.expectation.clone(),
+                )
+            };
+            Ok(PreparedToolInvocation::resource_aware(
+                [],
+                [],
+                metadata.clone(),
+                move |context| {
+                    Box::pin(async move {
+                        // Published before the request goes out and withdrawn
+                        // when this future ends, so a server request that
+                        // arrives mid-call has a caller and one that arrives
+                        // after it does not.
+                        // Call-scoped registration: its token cancels when this future
+                        // ends (success, error, turn cancel, or budget), so
+                        // nested sampling cannot outlive the tools/call.
+                        let (_registration, questions) = self.calls.register();
+                        let budget = CallBudget::new(MCP_TOOL_CALL_BUDGET);
+                        let call = call_remote_tool(
+                            McpCall {
+                                peer: &self.peer,
+                                progress: &self.progress,
+                                budget: &budget,
+                                remote_name: self.remote_name.clone(),
+                                arguments,
+                                expectation,
+                                image_delivery: self.image_delivery,
+                            },
+                            context.cancellation(),
+                            Some(context.progress().clone()),
+                            self.max_output_bytes,
+                            completion,
+                        );
+                        // The question service never finishes on its own, so
+                        // the call is always what ends the select. Both are
+                        // polled together, which is what lets a server ask the
+                        // user something while its own call is still open.
+                        let service = serve_caller_questions(questions, &context, &budget);
+                        tokio::pin!(call, service);
+                        let rendered = tokio::select! {
+                            result = &mut call => result?,
+                            never = &mut service => match never {},
+                        };
+                        Ok(rendered.into_json_output(metadata))
+                    })
+                },
+            ))
+        })
+    }
+}
+
+/// A single invocation uses the SDK preparation/authorization path while
+/// retaining transport provenance outside its public result contract.
+struct ObservedCall<'a> {
+    tool: &'a McpTool,
+    completion: Mutex<McpCallCompletion>,
+}
+
+impl Tool for ObservedCall<'_> {
+    fn spec(&self) -> ToolSpec {
+        self.tool.spec()
+    }
+
+    fn security(&self) -> ToolSecurity {
+        self.tool.security()
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        self.tool.output_schema()
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        invocation: ToolInvocation,
+        _context: ToolPreparationContext,
+    ) -> ToolPrepareFuture<'a> {
+        self.tool
+            .prepare_with_completion(invocation, Some(&self.completion))
+    }
+}
+
+/// Put one server-raised question to the user, for as long as the call runs.
+///
+/// Returns [`std::convert::Infallible`] because the only way out is the call
+/// finishing, which the caller observes on the other select branch.
+async fn serve_caller_questions(
+    mut questions: tokio::sync::mpsc::Receiver<super::inflight::McpUserQuestion>,
+    context: &rho_sdk::tool::AuthorizedToolContext,
+    budget: &CallBudget,
+) -> std::convert::Infallible {
+    loop {
+        let Some(question) = questions.recv().await else {
+            // Only the registration holds the sender, and it outlives this
+            // future, so this is unreachable in practice. Waiting forever keeps
+            // the invariant true rather than ending the select early.
+            std::future::pending::<()>().await;
+            continue;
+        };
+        let started = tokio::time::Instant::now();
+        let answer = context.request_host_input(question.request).await;
+        budget.extend(started.elapsed());
+        let _ = question.reply.send(answer);
+    }
+}
+
+/// Everything one `tools/call` needs from the owning session.
+pub(super) struct McpCall<'a> {
+    pub(super) peer: &'a Peer<RoleClient>,
+    pub(super) progress: &'a McpProgressRouter,
+    /// Remaining time for this call, extended while the user is being asked
+    /// something on the server's behalf.
+    pub(super) budget: &'a CallBudget,
+    pub(super) remote_name: String,
+    pub(super) arguments: serde_json::Map<String, serde_json::Value>,
+    /// What the tool's declaration says the result must contain.
+    pub(super) expectation: super::result::ResultExpectation,
+    pub(super) image_delivery: super::McpImageDelivery,
+}
+
+/// Issue one `tools/call` and return its model and script views.
+///
+/// The request goes out as a cancellable handle rather than a plain await so
+/// two things hold: the server's progress token is known before the response
+/// arrives, and a cancelled turn tells the server to stop instead of silently
+/// abandoning work it keeps doing.
+pub(super) async fn call_remote_tool(
+    call: McpCall<'_>,
+    cancellation: &CancellationToken,
+    progress_sender: Option<ToolProgressSender>,
+    max_output_bytes: usize,
+    completion: Option<&Mutex<McpCallCompletion>>,
+) -> Result<rho_tools::Rendered<serde_json::Value>, ToolError> {
+    let McpCall {
+        peer,
+        progress,
+        budget,
+        remote_name,
+        arguments,
+        expectation,
+        image_delivery,
+    } = call;
+    let params = CallToolRequestParams::new(remote_name).with_arguments(arguments);
+    let mut handle = peer
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+            PeerRequestOptions::no_options(),
+        )
+        .await
+        .map_err(execution_error)?;
+
+    // Subscribe before awaiting: the server may report progress immediately.
+    let _subscription =
+        progress_sender.map(|sender| progress.subscribe(handle.progress_token.clone(), sender));
+
+    // The response channel is awaited by reference so the handle survives the
+    // select and can still carry a cancellation to the server.
+    let outcome = tokio::select! {
+        response = &mut handle.rx => CallOutcome::Answered(response),
+        () = cancellation.cancelled() => CallOutcome::Cancelled,
+        () = budget.expired() => CallOutcome::TimedOut,
+    };
+    let response = match outcome {
+        CallOutcome::Answered(response) => response,
+        CallOutcome::Cancelled => {
+            cancel_handle(handle).await;
+            return Err(ToolError::cancelled());
+        }
+        CallOutcome::TimedOut => {
+            cancel_handle(handle).await;
+            return Err(ToolError::new(
+                ToolErrorKind::Execution,
+                format!(
+                    "MCP tool call exceeded its {}s budget",
+                    MCP_TOOL_CALL_BUDGET.as_secs()
+                ),
+            ));
+        }
+    };
+    match response {
+        Ok(Ok(ServerResult::CallToolResult(result))) => {
+            if let Some(completion) = completion {
+                *completion.lock().unwrap_or_else(|error| error.into_inner()) =
+                    McpCallCompletion::Answered;
+            }
+            result::render(result, &expectation, max_output_bytes, image_delivery)
+        }
+        Ok(Ok(_)) => Err(ToolError::new(
+            ToolErrorKind::Execution,
+            "MCP server answered tools/call with an unexpected result",
+        )),
+        Ok(Err(error)) => Err(execution_error(error)),
+        // The oneshot closed without a value: the session's transport is gone.
+        Err(_) => Err(ToolError::new(
+            ToolErrorKind::Execution,
+            "MCP session closed before the tool call returned",
+        )),
+    }
+}
+
+enum CallOutcome<T> {
+    Answered(T),
+    Cancelled,
+    TimedOut,
+}
+
+fn execution_error(error: ServiceError) -> ToolError {
+    ToolError::new(ToolErrorKind::Execution, error.to_string())
+}
+
+/// Cancel an in-flight handle so the server learns the turn ended.
+///
+/// Kept separate from the select arm above because `RequestHandle::cancel`
+/// consumes the handle, and the select borrows it.
+async fn cancel_handle<R: ServiceRole>(handle: RequestHandle<R>) {
+    if let Err(error) = handle.cancel(Some(CANCEL_REASON.into())).await {
+        tracing::debug!(error = %error, "could not notify MCP server of cancellation");
+    }
+}

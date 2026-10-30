@@ -1,0 +1,932 @@
+//! Multi-span Call + Children rendering for structured tool cards.
+
+use std::time::Duration;
+
+use ratatui::{
+    style::Style,
+    text::{Line, Span},
+};
+use rho_tools::tool_card::{
+    DiffRow, DiffRowKind, ToolBody, ToolCard, ToolFact, ToolHeader, ToolStatus,
+};
+use unicode_width::UnicodeWidthStr;
+
+use crate::app::interactive_presenter::{PresentedToolCard, ToolBodySyntax, ToolBodyWindow};
+
+#[path = "tool_card_code.rs"]
+mod code;
+
+#[path = "tool_card_header.rs"]
+mod header;
+use header::push_header_line;
+
+use super::{
+    feed_image::reserve_optional_image_rows,
+    render::{
+        display_width, pad_display_line, pad_spaces, padded_content_width, push_wrapped_text,
+        slice_spans_by_bytes, soft_wrap_visible_ranges, spans_display_width, styled_blank_line,
+        wrap_line_at_whitespace, wrap_line_at_whitespace_ranges, wrap_line_hard, LineFill,
+    },
+    theme::Theme,
+    tool_code::CodeSyntax,
+    tool_diff::{self, DiffSyntax},
+    tool_search::SearchSyntax,
+    ToolEntry,
+};
+
+/// First-line mid branch: `  ├ `.
+const TREE_CHILD_MID: &str = "  ├ ";
+/// First-line end branch: `  └ `.
+const TREE_CHILD_END: &str = "  └ ";
+/// Vertical stem on wrapped header/child rows; same box-drawing family as ├ / └.
+/// Display width matches `  ├ ` / `  └ ` so wrapped content stays in one column.
+const TREE_WRAP_STEM: &str = "  │ ";
+/// Content column after `  ├ ` / `  └ `.
+const CHILD_CONTENT_INDENT: &str = "    ";
+/// Space hang under `└ ` when a last child wraps (trunk ends at └).
+const TREE_CHILD_HANG: &str = CHILD_CONTENT_INDENT;
+
+/// One fact or body/diff block rendered to terminal rows.
+///
+/// Tree facts always render mid trunk (`├` / `│`); last-child `└` / hang is
+/// applied after budget clipping. Plain body rows start with a content indent;
+/// when a later tree branch remains after clipping, that indent is rewritten
+/// to a continuing trunk stem (`│`) so multi-file File headers stay connected.
+enum ChildGroup {
+    /// Fact / File-section rows: `[0]` is the branch, `[1..]` are wrap stems.
+    TreeFact(Vec<Line<'static>>),
+    /// Body/diff rows with fixed content indent (stem applied after clip when
+    /// a later tree branch still follows).
+    Plain(Vec<Line<'static>>),
+}
+
+impl ChildGroup {
+    fn len(&self) -> usize {
+        match self {
+            Self::TreeFact(lines) | Self::Plain(lines) => lines.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn truncate(&mut self, len: usize) {
+        match self {
+            Self::TreeFact(lines) | Self::Plain(lines) => lines.truncate(len),
+        }
+    }
+
+    fn into_lines(self) -> Vec<Line<'static>> {
+        match self {
+            Self::TreeFact(lines) | Self::Plain(lines) => lines,
+        }
+    }
+}
+
+pub(super) fn tool_entry_lines(
+    tool: &ToolEntry,
+    width: usize,
+    max_tool_output_lines: usize,
+    max_image_height: u16,
+) -> Vec<Line<'static>> {
+    let inner_width = padded_content_width(width);
+    let mut lines = Vec::new();
+    push_tool_entry(&mut lines, tool, inner_width, max_tool_output_lines);
+    reserve_optional_image_rows(
+        &mut lines,
+        tool.image.as_ref(),
+        inner_width,
+        max_image_height,
+    );
+    // One trailing spacer only. Prior entries own the blank above this card.
+    let padding_style = Theme::tool_card_padding();
+    let mut padded = Vec::with_capacity(lines.len() + 1);
+    padded.extend(lines.into_iter().map(pad_display_line));
+    padded.push(styled_blank_line(width, padding_style));
+    padded
+}
+
+/// Live elapsed for shell timeout facts while the call is still running.
+///
+/// Render paths fold this into the painted fact instead of cloning the card
+/// with a rewritten clock, so a running shell costs no per-frame body copy.
+pub(super) fn live_shell_elapsed(tool: &ToolEntry) -> Option<Duration> {
+    let crate::presentation::Presentation::Card(card) = &tool.presentation else {
+        return None;
+    };
+    if !matches!(card.header, ToolHeader::Shell { .. }) {
+        return None;
+    }
+    match card.status {
+        ToolStatus::Running => tool.started_at.map(|started_at| started_at.elapsed()),
+        ToolStatus::Interrupted | ToolStatus::Ok | ToolStatus::Error => None,
+    }
+}
+
+/// Live elapsed suffix painted after a timeout fact (` · 1.2s`).
+pub(super) fn live_elapsed_label(elapsed: Duration) -> String {
+    format!(" · {:.1}s", elapsed.as_secs_f64())
+}
+
+/// Timeout budget text shared by the typed fact and its live elapsed suffix.
+fn timeout_text(seconds: Option<u64>) -> String {
+    match seconds {
+        Some(seconds) => format!("timeout {seconds}s"),
+        None => "timeout none".into(),
+    }
+}
+
+/// Paint the selected presentation, shared by live cache, history, and attach.
+pub(super) fn paint_entry_sections(
+    tool: &ToolEntry,
+    width: usize,
+    max_tool_output_lines: usize,
+) -> CardRender {
+    match &tool.presentation {
+        crate::presentation::Presentation::Notification(message) => CardRender {
+            sections: super::notification_card_render::notification_card_sections(
+                message,
+                width,
+                max_tool_output_lines,
+                tool.expanded,
+            ),
+            toggleable: true,
+        },
+        crate::presentation::Presentation::Card(card) => paint_card_sections(
+            card,
+            width,
+            max_tool_output_lines.max(1),
+            tool.expanded,
+            live_shell_elapsed(tool),
+        ),
+        crate::presentation::Presentation::SummaryCard(card) => {
+            let mut rendered = paint_card_sections(
+                card,
+                width,
+                summary_card_budget(card, width),
+                tool.expanded,
+                None,
+            );
+            rendered.toggleable = !card.body.is_empty();
+            rendered
+        }
+    }
+}
+
+pub(super) fn push_tool_entry(
+    lines: &mut Vec<Line<'static>>,
+    tool: &ToolEntry,
+    width: usize,
+    max_tool_output_lines: usize,
+) {
+    let sections = paint_entry_sections(tool, width, max_tool_output_lines).sections;
+    lines.extend(sections.header);
+    lines.extend(sections.facts);
+    lines.extend(sections.body);
+}
+
+#[cfg(test)]
+pub(super) fn push_tool_card(
+    lines: &mut Vec<Line<'static>>,
+    card: &ToolCard,
+    width: usize,
+    max_tool_output_lines: usize,
+    expanded: bool,
+    live_elapsed: Option<Duration>,
+) {
+    let sections = paint_card_sections(
+        &card.clone().into(),
+        width,
+        max_tool_output_lines.max(1),
+        expanded,
+        live_elapsed,
+    )
+    .sections;
+    lines.extend(sections.header);
+    lines.extend(sections.facts);
+    lines.extend(sections.body);
+}
+
+/// Highlighted header, timeout facts, and syntax-highlighted body.
+///
+/// Live cards cache `header` and `body` across animation frames and only
+/// rebuild `facts` when the timeout clock ticks.
+pub(super) struct CardSections {
+    pub(super) header: Vec<Line<'static>>,
+    pub(super) facts: Vec<Line<'static>>,
+    pub(super) body: Vec<Line<'static>>,
+    pub(super) last_fact_is_end: bool,
+}
+
+/// Toggle metadata comes from the same row count used to clip the painted card.
+pub(super) struct CardRender {
+    pub(super) sections: CardSections,
+    pub(super) toggleable: bool,
+}
+
+pub(super) fn paint_card_sections(
+    card: &PresentedToolCard,
+    width: usize,
+    collapsed_rows: usize,
+    expanded: bool,
+    live_elapsed: Option<Duration>,
+) -> CardRender {
+    let mut header = Vec::new();
+    push_header_line(&mut header, card, card.status, width);
+    let mut facts = Vec::new();
+
+    let budget = collapsed_rows;
+    // Collapsed: paint only the visible budget (syntax is the costly part).
+    // Expanded: paint the full body. Retain the row count for toggle checks.
+    let paint_budget = if expanded { None } else { Some(budget) };
+    let rendered = render_child_groups(card, width, paint_budget, live_elapsed);
+    let total_rows = rendered.total_terminal_rows;
+    let mut remaining = if expanded { usize::MAX } else { budget };
+    let mut hidden_rows = 0usize;
+    let mut emitted = Vec::new();
+    let fact_count = rendered.fact_groups.len();
+
+    for group in rendered.fact_groups.into_iter().chain(rendered.body_groups) {
+        if remaining == 0 {
+            hidden_rows = hidden_rows.saturating_add(group.len());
+            continue;
+        }
+        if group.len() <= remaining {
+            remaining = remaining.saturating_sub(group.len());
+            emitted.push(group);
+            continue;
+        }
+        // Clip a wrapping child to the remaining terminal-row budget.
+        hidden_rows = hidden_rows.saturating_add(group.len() - remaining);
+        let mut clipped = group;
+        clipped.truncate(remaining);
+        remaining = 0;
+        if !clipped.is_empty() {
+            emitted.push(clipped);
+        }
+    }
+    // When paint stopped early, estimated tail is already in total_rows.
+    if !expanded {
+        let shown: usize = emitted.iter().map(ChildGroup::len).sum();
+        hidden_rows = total_rows.saturating_sub(shown);
+    }
+
+    // Keybinds live in the help window; the card only says what is hidden.
+    let has_prompt = !expanded && hidden_rows > 0;
+    // For each group, whether a later TreeFact still needs the trunk. Mid
+    // branches stay ├ and plain rows between them keep │ so multi-file File
+    // headers connect through their body content.
+    let later_has_tree = {
+        let mut later = false;
+        let mut flags = vec![false; emitted.len()];
+        for (index, group) in emitted.iter().enumerate().rev() {
+            flags[index] = later;
+            if matches!(group, ChildGroup::TreeFact(_)) {
+                later = true;
+            }
+        }
+        flags
+    };
+    let prefix_groups = fact_count.min(emitted.len());
+    let mut body = Vec::new();
+    for (index, mut group) in emitted.into_iter().enumerate() {
+        match &mut group {
+            ChildGroup::TreeFact(fact_lines) => {
+                // Last tree branch uses └ even when plain body hangs under it.
+                // A following "more lines" prompt keeps mid ├, matching facts.
+                let is_last_tree = !later_has_tree[index] && !has_prompt;
+                rewrite_tree_fact(fact_lines, is_last_tree);
+            }
+            ChildGroup::Plain(plain_lines) if later_has_tree[index] => {
+                apply_trunk_stem(plain_lines);
+            }
+            ChildGroup::Plain(_) => {}
+        }
+        let dest = if index < prefix_groups {
+            &mut facts
+        } else {
+            &mut body
+        };
+        dest.extend(group.into_lines());
+    }
+
+    let last_fact_is_end = prefix_groups > 0 && !later_has_tree[prefix_groups - 1] && !has_prompt;
+
+    if has_prompt {
+        // Tail windows show the newest rows, so the notice goes above them and
+        // the card ends on generated source. Head windows append it below.
+        let (hidden, above) = match &card.body_syntax {
+            ToolBodySyntax::Code {
+                window: ToolBodyWindow::Tail,
+                ..
+            } => (format!("... {hidden_rows} earlier lines"), true),
+            ToolBodySyntax::Plain
+            | ToolBodySyntax::Code {
+                window: ToolBodyWindow::Head,
+                ..
+            } => (format!("... {hidden_rows} more lines"), false),
+        };
+        let mut notice = Vec::new();
+        push_wrapped_text(
+            &mut notice,
+            &hidden,
+            width,
+            Theme::dim(),
+            LineFill::PadToWidth,
+        );
+        if above {
+            notice.append(&mut body);
+            body = notice;
+        } else {
+            body.append(&mut notice);
+        }
+    }
+    CardRender {
+        sections: CardSections {
+            header,
+            facts,
+            body,
+            last_fact_is_end,
+        },
+        toggleable: total_rows > budget,
+    }
+}
+
+/// A receipt keeps all facts, including wrapped notices, but hides its body.
+fn summary_card_budget(card: &ToolCard, width: usize) -> usize {
+    card.facts
+        .iter()
+        .map(|fact| push_wrapped_tree_fact(fact_spans(fact, None), width).len())
+        .sum()
+}
+
+/// Cached header plus rebuilt timeout facts. Used to refresh the live elapsed
+/// clock without re-highlighting the command or the cached body.
+pub(super) fn paint_live_prefix(
+    card: &ToolCard,
+    width: usize,
+    live_elapsed: Option<Duration>,
+    last_fact_is_end: bool,
+    header: &[Line<'static>],
+) -> Vec<Line<'static>> {
+    let mut prefix = header.to_vec();
+    let last = card.facts.len().saturating_sub(1);
+    for (index, fact) in card.facts.iter().enumerate() {
+        let mut fact_lines = push_wrapped_tree_fact(fact_spans(fact, live_elapsed), width);
+        rewrite_tree_fact(&mut fact_lines, last_fact_is_end && index == last);
+        prefix.extend(fact_lines);
+    }
+    prefix
+}
+
+/// Whether ctrl+o / click should toggle this tool at the given terminal width.
+pub(super) fn card_is_toggleable(
+    card: &PresentedToolCard,
+    width: usize,
+    max_tool_output_lines: usize,
+) -> bool {
+    let budget = max_tool_output_lines.max(1);
+    // Wrap math only, no syntect. Highlight does not change display width.
+    estimate_child_terminal_rows(card, width) > budget
+}
+
+struct ChildRender {
+    fact_groups: Vec<ChildGroup>,
+    body_groups: Vec<ChildGroup>,
+    /// Full terminal-row height of all children (painted + estimated tail).
+    total_terminal_rows: usize,
+}
+
+/// Render fact/body groups. When `paint_budget` is `Some(n)`, only the first
+/// `n` terminal rows are language-painted; the remainder is wrap-estimated so
+/// collapse stays cheap and expand still shows an accurate "... N more" count.
+fn render_child_groups(
+    card: &PresentedToolCard,
+    width: usize,
+    paint_budget: Option<usize>,
+    live_elapsed: Option<Duration>,
+) -> ChildRender {
+    let mut fact_groups = Vec::new();
+    let mut body_groups = Vec::new();
+    let mut total_rows = 0usize;
+    let mut paint_remaining = paint_budget.unwrap_or(usize::MAX);
+
+    for fact in &card.facts {
+        // Always mid trunk here; last-child └ / hang is rewritten after clip.
+        let fact_lines = push_wrapped_tree_fact(fact_spans(fact, live_elapsed), width);
+        take_group(
+            &mut fact_groups,
+            &mut total_rows,
+            &mut paint_remaining,
+            ChildGroup::TreeFact(fact_lines),
+        );
+    }
+
+    match (&card.body, &card.body_syntax) {
+        (ToolBody::None, _) => {}
+        (ToolBody::Lines(body), ToolBodySyntax::Plain) => {
+            let logical = tool_diff::logical_lines(body);
+            let search_mode = card.match_pattern.is_some();
+            let mut search = card.match_pattern.as_ref().map(|pattern| {
+                SearchSyntax::new(crate::tui::syntax::MatchQuery::new(
+                    pattern.clone(),
+                    card.match_literal,
+                    card.match_case_sensitive,
+                ))
+            });
+            for line in &logical {
+                if paint_remaining == 0 {
+                    // Still count wrap height for "... N more" without paint.
+                    total_rows = total_rows.saturating_add(if search_mode {
+                        SearchSyntax::estimate_rows(line, width)
+                    } else {
+                        estimate_plain_body_rows(line, width)
+                    });
+                    continue;
+                }
+                let mut lines = Vec::new();
+                if let Some(syntax) = search.as_mut() {
+                    let _ = syntax.paint_line(line, width, &mut lines);
+                } else {
+                    push_body_line(&mut lines, line, width, Theme::text());
+                }
+                take_group(
+                    &mut body_groups,
+                    &mut total_rows,
+                    &mut paint_remaining,
+                    ChildGroup::Plain(lines),
+                );
+            }
+        }
+        (ToolBody::Lines(lines), ToolBodySyntax::Code { language, window }) => {
+            let rendered =
+                code::render_code_body(lines, language, *window, width, &mut paint_remaining);
+            total_rows = total_rows.saturating_add(rendered.total_rows);
+            body_groups.extend(rendered.groups);
+        }
+        (ToolBody::Diff(rows), _) => {
+            let gutter = tool_diff::gutter_width(rows);
+            let fallback = rows
+                .iter()
+                .all(|row| row.kind != DiffRowKind::File)
+                .then(|| tool_diff::single_file_path_from_header(card.family, &card.header))
+                .flatten();
+            let mut syntax = DiffSyntax::new(fallback);
+            for row in rows {
+                // Multi-file File headers are tree branches (path + structured
+                // stats). Still feed DiffSyntax so language paint tracks path.
+                if row.kind == DiffRowKind::File {
+                    let _ = syntax.paint_row(row);
+                    if paint_remaining == 0 {
+                        total_rows =
+                            total_rows.saturating_add(estimate_diff_row_rows(row, gutter, width));
+                        continue;
+                    }
+                    let spans = file_section_spans(row);
+                    take_group(
+                        &mut body_groups,
+                        &mut total_rows,
+                        &mut paint_remaining,
+                        ChildGroup::TreeFact(push_wrapped_tree_fact(spans, width)),
+                    );
+                    continue;
+                }
+                if paint_remaining == 0 {
+                    total_rows =
+                        total_rows.saturating_add(estimate_diff_row_rows(row, gutter, width));
+                    continue;
+                }
+                let mut lines = Vec::new();
+                push_diff_row(&mut lines, row, gutter, width, &mut syntax);
+                take_group(
+                    &mut body_groups,
+                    &mut total_rows,
+                    &mut paint_remaining,
+                    ChildGroup::Plain(lines),
+                );
+            }
+        }
+    }
+
+    ChildRender {
+        fact_groups,
+        body_groups,
+        total_terminal_rows: total_rows,
+    }
+}
+
+/// Push one child group, clipping to `paint_remaining` when set. Always adds
+/// the full (pre-clip) height to `total_rows`.
+fn take_group(
+    groups: &mut Vec<ChildGroup>,
+    total_rows: &mut usize,
+    paint_remaining: &mut usize,
+    group: ChildGroup,
+) {
+    let full = group.len().max(1);
+    *total_rows = total_rows.saturating_add(full);
+    if *paint_remaining == 0 {
+        return;
+    }
+    if full <= *paint_remaining {
+        *paint_remaining -= full;
+        groups.push(group);
+        return;
+    }
+    let mut clipped = group;
+    clipped.truncate(*paint_remaining);
+    *paint_remaining = 0;
+    if !clipped.is_empty() {
+        groups.push(clipped);
+    }
+}
+
+/// Full child terminal-row estimate without language highlighting.
+fn estimate_child_terminal_rows(card: &PresentedToolCard, width: usize) -> usize {
+    let mut total = 0usize;
+    for fact in &card.facts {
+        total = total.saturating_add(estimate_fact_rows(fact, width));
+    }
+    match (&card.body, &card.body_syntax) {
+        (ToolBody::None, _) => {}
+        (ToolBody::Lines(body), ToolBodySyntax::Plain) => {
+            let logical = tool_diff::logical_lines(body);
+            let search_mode = card.match_pattern.is_some();
+            total = total.saturating_add(estimate_lines_rows(&logical, width, search_mode));
+        }
+        (ToolBody::Lines(lines), ToolBodySyntax::Code { language, .. }) => {
+            total = tool_diff::logical_lines(lines)
+                .iter()
+                .map(|line| CodeSyntax::estimate_rows(language, line, width))
+                .fold(total, usize::saturating_add);
+        }
+        (ToolBody::Diff(rows), _) => {
+            let gutter = tool_diff::gutter_width(rows);
+            total = total.saturating_add(estimate_diff_rows(rows, gutter, width));
+        }
+    }
+    total
+}
+
+fn estimate_fact_rows(fact: &ToolFact, width: usize) -> usize {
+    push_wrapped_tree_fact(fact_spans(fact, /*live_elapsed*/ None), width)
+        .len()
+        .max(1)
+}
+
+/// Rows for one word-wrapped body line; code bodies wrap the same way.
+pub(super) fn estimate_plain_body_rows(line: &str, width: usize) -> usize {
+    let prefix_width = display_width(CHILD_CONTENT_INDENT);
+    let content_width = width.saturating_sub(prefix_width).max(1);
+    wrap_line_at_whitespace(line, content_width).len().max(1)
+}
+
+fn estimate_lines_rows(lines: &[&str], width: usize, search_mode: bool) -> usize {
+    if search_mode {
+        lines
+            .iter()
+            .map(|line| SearchSyntax::estimate_rows(line, width))
+            .sum()
+    } else {
+        lines
+            .iter()
+            .map(|line| estimate_plain_body_rows(line, width))
+            .sum()
+    }
+}
+
+fn estimate_diff_rows(rows: &[DiffRow], gutter: usize, width: usize) -> usize {
+    rows.iter()
+        .map(|row| estimate_diff_row_rows(row, gutter, width))
+        .sum()
+}
+
+fn estimate_diff_row_rows(row: &DiffRow, gutter: usize, width: usize) -> usize {
+    if row.kind == DiffRowKind::File || row.kind == DiffRowKind::Meta {
+        let prefix_width = display_width(CHILD_CONTENT_INDENT);
+        let content_width = width.saturating_sub(prefix_width).max(1);
+        return wrap_line_hard(&row.text, content_width).len().max(1);
+    }
+    let number = match (gutter, row.line) {
+        (0, _) => 0,
+        (_, Some(line)) => format!("{line} ").len().max(gutter + 1),
+        (_, None) => gutter + 1,
+    };
+    let sign = 2usize; // "+ " / "- " / "  "
+    let prefix_width = display_width(CHILD_CONTENT_INDENT) + number + sign;
+    let content_width = width.saturating_sub(prefix_width).max(1);
+    wrap_line_hard(&row.text, content_width).len().max(1)
+}
+
+/// Final visible tree fact becomes └ with a space hang on wrap so the trunk
+/// does not continue past the end. `[0]` is the branch; `[1..]` are wrap stems.
+fn rewrite_tree_fact(lines: &mut [Line<'static>], is_last: bool) {
+    let Some((first, rest)) = lines.split_first_mut() else {
+        return;
+    };
+    set_tree_prefix(
+        first,
+        if is_last {
+            TREE_CHILD_END
+        } else {
+            TREE_CHILD_MID
+        },
+    );
+    let continuation = if is_last {
+        TREE_CHILD_HANG
+    } else {
+        TREE_WRAP_STEM
+    };
+    for line in rest {
+        set_tree_prefix(line, continuation);
+    }
+}
+
+/// Fact rows keep the tree glyph in the first span; replace that span only.
+fn set_tree_prefix(line: &mut Line<'static>, prefix: &str) {
+    let Some(first) = line.spans.first_mut() else {
+        return;
+    };
+    first.content = prefix.to_string().into();
+}
+
+/// Swap the leading content-indent columns for a continuing trunk stem (`  │ `).
+///
+/// Body/diff rows start with [`CHILD_CONTENT_INDENT`] (or a pure-space hang of
+/// at least that width). When a later tree branch still follows, rewrite only
+/// those leading columns so File headers read as one connected tree. Gutter
+/// digits and other content after the indent keep their original style.
+fn apply_trunk_stem(lines: &mut [Line<'static>]) {
+    let indent_len = CHILD_CONTENT_INDENT.len();
+    for line in lines {
+        let Some(first) = line.spans.first() else {
+            continue;
+        };
+        let text = first.content.as_ref();
+        let rewrite_indent = text.starts_with(CHILD_CONTENT_INDENT)
+            || (text.len() >= indent_len && text.bytes().all(|b| b == b' '));
+        if !rewrite_indent {
+            continue;
+        }
+        let rest = text[indent_len..].to_string();
+        let rest_style = first.style;
+        let mut spans = vec![Span::styled(TREE_WRAP_STEM.to_string(), Theme::tool_tree())];
+        if !rest.is_empty() {
+            spans.push(Span::styled(rest, rest_style));
+        }
+        spans.extend(line.spans.iter().skip(1).cloned());
+        line.spans = spans;
+    }
+}
+
+/// Wrap styled text under a fixed first-line prefix.
+///
+/// Continuations are supplied by `continuation_prefix(hang)`. Headers pad a
+/// `│` stem out to the primary hang; tree facts use a plain `│` trunk
+/// (last-child hang is applied later by [`rewrite_tree_fact`]).
+///
+/// Intentional newlines in the wrappable text (multi-line bash, heredocs) are
+/// hard breaks. Soft width-wrap still applies within each logical line. Without
+/// this, `\n` has zero display width and ratatui drops the control char, so
+/// `check\ngit` renders as `checkgit`.
+fn push_wrapped_prefixed(
+    lines: &mut Vec<Line<'static>>,
+    prefix: Vec<Span<'static>>,
+    wrappable: Vec<Span<'static>>,
+    width: usize,
+    continuation_prefix: impl Fn(usize) -> Vec<Span<'static>>,
+) {
+    let hang = spans_display_width(&prefix);
+    if hang >= width {
+        // Pathological narrow width: fall back to a single padded row.
+        let mut spans = prefix;
+        spans.extend(wrappable);
+        lines.push(pad_spans_line(spans, width));
+        return;
+    }
+    let content_width = (width - hang).max(1);
+    let text: String = wrappable.iter().map(|span| span.content.as_ref()).collect();
+    if text.is_empty() {
+        lines.push(pad_spans_line(prefix, width));
+        return;
+    }
+
+    // Same hard-then-soft pattern as push_wrapped_text_with: str::lines() first.
+    let mut row_index = 0usize;
+    for logical_line in text.lines() {
+        let line_start = subslice_start(&text, logical_line);
+        for range in soft_wrap_visible_ranges(
+            logical_line,
+            wrap_line_at_whitespace_ranges(logical_line, content_width),
+        ) {
+            let chunk_spans =
+                slice_spans_by_bytes(&wrappable, line_start + range.start, line_start + range.end);
+            let mut row = if row_index == 0 {
+                prefix.clone()
+            } else {
+                continuation_prefix(hang)
+            };
+            row.extend(chunk_spans);
+            lines.push(pad_spans_line(row, width));
+            row_index += 1;
+        }
+    }
+}
+
+/// Byte offset of `child` inside `parent`. `child` must be a subslice of `parent`
+/// (as yielded by `str::lines()`).
+fn subslice_start(parent: &str, child: &str) -> usize {
+    let start = child.as_ptr() as usize - parent.as_ptr() as usize;
+    debug_assert!(parent.get(start..start + child.len()) == Some(child));
+    start
+}
+
+/// `  │ ` in the tree column, then spaces out to the primary hang.
+fn header_wrap_continuation_prefix(hang: usize) -> Vec<Span<'static>> {
+    let stem_width = display_width(TREE_WRAP_STEM);
+    let mut spans = vec![Span::styled(TREE_WRAP_STEM.to_string(), Theme::tool_tree())];
+    if hang > stem_width {
+        spans.push(Span::styled(" ".repeat(hang - stem_width), Theme::text()));
+    }
+    spans
+}
+
+/// Wrap a fact under provisional `├` / `│`. Last-child rewrite owns `└` / hang.
+fn push_wrapped_tree_fact(wrappable: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let prefix = vec![Span::styled(TREE_CHILD_MID.to_string(), Theme::tool_tree())];
+    push_wrapped_prefixed(&mut lines, prefix, wrappable, width, |_| {
+        vec![Span::styled(TREE_WRAP_STEM.to_string(), Theme::tool_tree())]
+    });
+    lines
+}
+
+fn fact_spans(fact: &ToolFact, live_elapsed: Option<Duration>) -> Vec<Span<'static>> {
+    match fact {
+        ToolFact::DiffStat {
+            added,
+            removed,
+            path,
+        } => diff_stat_spans(*added, *removed, path.as_deref()),
+        ToolFact::Exit { code, duration_ms } => {
+            let status = if *code == 0 {
+                ToolStatus::Ok
+            } else {
+                ToolStatus::Error
+            };
+            let mut spans = vec![Span::styled(
+                format!("exit {code}"),
+                Theme::tool_exit(status),
+            )];
+            if let Some(ms) = duration_ms {
+                let secs = *ms as f64 / 1000.0;
+                spans.push(Span::styled(format!(" · {secs:.1}s"), Theme::tool_meta()));
+            }
+            spans
+        }
+        ToolFact::Timeout { seconds } => {
+            let mut spans = vec![Span::styled(timeout_text(*seconds), Theme::tool_meta())];
+            if let Some(elapsed) = live_elapsed {
+                spans.push(Span::styled(
+                    live_elapsed_label(elapsed),
+                    Theme::tool_meta(),
+                ));
+            }
+            spans
+        }
+        ToolFact::Count {
+            label,
+            value,
+            detail,
+        } => {
+            let mut text = format!("{value} {label}");
+            if let Some(detail) = detail.as_ref().filter(|detail| !detail.is_empty()) {
+                text.push(' ');
+                text.push_str(detail);
+            }
+            vec![Span::styled(text, Theme::text())]
+        }
+        ToolFact::Meta { text } => vec![Span::styled(text.clone(), Theme::tool_meta())],
+        ToolFact::Error { text } => vec![Span::styled(text.clone(), Theme::tool_error_text())],
+        ToolFact::Progress { completed, total } => {
+            let text = match total {
+                Some(total) => format!("{completed}/{total}"),
+                None => format!("{completed}"),
+            };
+            vec![Span::styled(text, Theme::tool_meta())]
+        }
+        ToolFact::Text { text } => vec![Span::styled(text.clone(), Theme::text())],
+    }
+}
+
+/// Tool-card diff row: File/Meta rows as indented body text, content rows
+/// through the shared painter under the tree content column.
+fn push_diff_row(
+    lines: &mut Vec<Line<'static>>,
+    row: &DiffRow,
+    gutter: usize,
+    width: usize,
+    syntax: &mut DiffSyntax,
+) {
+    // File rows are TreeFact groups in render_child_groups. Fallback keeps path
+    // plain if a caller still routes a File row through this helper.
+    match row.kind {
+        DiffRowKind::File => {
+            let _ = syntax.paint_row(row);
+            push_body_line(lines, &row.plain_text(), width, Theme::tool_path());
+        }
+        // Op locators and other annotations are not content lines; drop the
+        // sign column so they read as headers rather than gap markers.
+        DiffRowKind::Meta => {
+            let _ = syntax.paint_row(row);
+            push_body_line(lines, &row.text, width, Theme::text());
+        }
+        DiffRowKind::Context | DiffRowKind::Added | DiffRowKind::Removed | DiffRowKind::Skip => {
+            tool_diff::push_diff_content_row(
+                lines,
+                row,
+                tool_diff::DiffRowFrame {
+                    indent: CHILD_CONTENT_INDENT,
+                    gutter,
+                    width,
+                },
+                syntax,
+            );
+        }
+    }
+}
+
+fn push_body_line(lines: &mut Vec<Line<'static>>, line: &str, width: usize, style: Style) {
+    // Indent body under the tree content column.
+    let prefix = CHILD_CONTENT_INDENT;
+    let prefix_width = display_width(prefix);
+    let content_width = width.saturating_sub(prefix_width).max(1);
+    // Word wrap so prose and JSON break between tokens; unbroken runs (paths,
+    // hashes) still split at the width.
+    let chunks = wrap_line_at_whitespace(line, content_width);
+    if chunks.is_empty() {
+        lines.push(pad_spans_line(
+            vec![
+                Span::styled(prefix.to_string(), Theme::tool_tree()),
+                Span::styled(String::new(), style),
+            ],
+            width,
+        ));
+        return;
+    }
+    for chunk in chunks {
+        lines.push(pad_spans_line(
+            vec![
+                Span::styled(prefix.to_string(), Theme::tool_tree()),
+                Span::styled(chunk.to_string(), style),
+            ],
+            width,
+        ));
+    }
+}
+
+/// File section header spans from structured path + optional stats.
+fn file_section_spans(row: &DiffRow) -> Vec<Span<'static>> {
+    match row.stats {
+        Some((added, removed)) => diff_stat_spans(added, removed, Some(row.text.as_str())),
+        None => vec![Span::styled(row.text.clone(), Theme::tool_path())],
+    }
+}
+
+/// Shared colored spans for DiffStat facts and multi-file File section headers.
+fn diff_stat_spans(added: u64, removed: u64, path: Option<&str>) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        Span::styled(format!("+{added}"), Theme::tool_stat_add()),
+        Span::raw(" "),
+        Span::styled(format!("-{removed}"), Theme::tool_stat_del()),
+        Span::styled(" lines", Theme::tool_meta()),
+    ];
+    if let Some(path) = path.filter(|path| !path.is_empty()) {
+        spans.push(Span::styled(" | ", Theme::tool_meta()));
+        spans.push(Span::styled(path.to_string(), Theme::tool_path()));
+    }
+    spans
+}
+
+fn pad_spans_line(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    pad_spans_line_with(spans, width, Theme::text())
+}
+
+fn pad_spans_line_with(
+    mut spans: Vec<Span<'static>>,
+    width: usize,
+    pad_style: Style,
+) -> Line<'static> {
+    let used = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>();
+    if used < width {
+        spans.push(Span::styled(pad_spaces(width - used), pad_style));
+    }
+    Line::from(spans)
+}
+
+#[path = "live_card_cache.rs"]
+mod live_card_cache;

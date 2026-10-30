@@ -1,0 +1,536 @@
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use tokio::{net::TcpListener, time::timeout};
+use url::Url;
+
+use crate::{credentials::XaiTokens, model::TransportError};
+
+use super::device_code::{
+    poll_device_token, standard_device_poll_step, DeviceCodeResponse, DevicePollHttp,
+    DevicePollOutcome, DevicePollRequest, DevicePollStep, FirstPoll,
+};
+use super::loopback::{
+    bind_loopback, pkce_challenge, random_token, wait_for_oauth_callback, CallbackDecision,
+    CallbackWaitError, LoopbackBindError, ResponseBodies,
+};
+
+pub(crate) const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+pub(crate) const TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
+const AUTHORIZE_URL: &str = "https://auth.x.ai/oauth2/authorize";
+const DEVICE_AUTHORIZATION_URL: &str = "https://auth.x.ai/oauth2/device/code";
+const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
+const CALLBACK_PORT: u16 = 56121;
+const CALLBACK_PATH: &str = "/callback";
+const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_DEVICE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+pub struct XaiOAuthRequest {
+    pub authorize_url: String,
+    redirect_uri: String,
+    state: String,
+    verifier: String,
+    challenge: String,
+}
+
+#[derive(Clone)]
+pub struct XaiDeviceLogin {
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: Option<String>,
+    expires_in: Duration,
+    interval: Duration,
+    device_code: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum CallbackOutcome {
+    Code(String),
+    Error(String),
+}
+
+impl std::fmt::Debug for XaiOAuthRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("XaiOAuthRequest")
+            .field("authorize_url", &"[REDACTED]")
+            .field("redirect_uri", &self.redirect_uri)
+            .field("state", &"[REDACTED]")
+            .field("verifier", &"[REDACTED]")
+            .field("challenge", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for XaiDeviceLogin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("XaiDeviceLogin")
+            .field("user_code", &"[REDACTED]")
+            .field("verification_uri", &self.verification_uri)
+            .field("verification_uri_complete", &"[REDACTED]")
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .field("device_code", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for CallbackOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Code(_) => formatter.write_str("Code([REDACTED])"),
+            Self::Error(_) => formatter.write_str("Error([REDACTED])"),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum XaiOAuthError {
+    #[error("could not bind local SpaceXAI OAuth callback listener: {0}")]
+    Bind(std::io::Error),
+    /// # Next major
+    ///
+    /// NEXT_MAJOR(rho-providers): remove XaiOAuthError::Browser; browser launch lives in the login dispatch layer
+    #[error("could not open browser for SpaceXAI OAuth: {0}")]
+    Browser(String),
+    #[error("timed out waiting for SpaceXAI OAuth browser callback")]
+    Timeout,
+    #[error("could not read SpaceXAI OAuth callback: {0}")]
+    CallbackIo(std::io::Error),
+    #[error("SpaceXAI OAuth callback was invalid: {0}")]
+    InvalidCallback(String),
+    #[error("SpaceXAI OAuth was denied or failed: {0}")]
+    OAuthDenied(String),
+    #[error("SpaceXAI device login setup failed: {0}")]
+    DeviceSetup(String),
+    #[error("timed out waiting for SpaceXAI device login")]
+    DeviceTimeout,
+    #[error("SpaceXAI OAuth request failed: {0}")]
+    Request(#[source] TransportError),
+    #[error("SpaceXAI OAuth token response was missing {0}")]
+    MissingToken(&'static str),
+}
+
+impl From<reqwest::Error> for XaiOAuthError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Request(TransportError::from_reqwest(error))
+    }
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    id_token: Option<String>,
+    expires_in: Option<u64>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DeviceCodeRequest<'a> {
+    client_id: &'a str,
+    scope: &'a str,
+}
+
+/// Bound loopback login. The authorize URL is ready before the callback wait.
+pub struct XaiBrowserLogin {
+    pub authorize_url: String,
+    listener: TcpListener,
+    request: XaiOAuthRequest,
+}
+
+/// One-shot browser login used by 2.0 callers.
+///
+/// # Next major
+///
+/// NEXT_MAJOR(rho-providers): remove run_xai_oauth_flow; use start_xai_browser_login and complete_xai_browser_login
+#[deprecated(
+    since = "2.1.0",
+    note = "use start_xai_browser_login and complete_xai_browser_login so the authorize URL can be shown before the browser opens"
+)]
+pub async fn run_xai_oauth_flow() -> Result<XaiTokens, XaiOAuthError> {
+    let login = start_xai_browser_login().await?;
+    webbrowser::open(&login.authorize_url)
+        .map_err(|err| XaiOAuthError::Browser(err.to_string()))?;
+    complete_xai_browser_login(login).await
+}
+
+pub async fn start_xai_browser_login() -> Result<XaiBrowserLogin, XaiOAuthError> {
+    let bound = bind_loopback(CALLBACK_PORT, CALLBACK_PATH)
+        .await
+        .map_err(|error| match error {
+            LoopbackBindError::Bind(error) => XaiOAuthError::Bind(error),
+            LoopbackBindError::LocalAddress(error) => XaiOAuthError::CallbackIo(error),
+        })?;
+    let request = build_oauth_request_with_redirect(
+        random_token(32),
+        random_token(64),
+        random_token(32),
+        bound.callback_url,
+    );
+    Ok(XaiBrowserLogin {
+        authorize_url: request.authorize_url.clone(),
+        listener: bound.listener,
+        request,
+    })
+}
+
+pub async fn complete_xai_browser_login(
+    login: XaiBrowserLogin,
+) -> Result<XaiTokens, XaiOAuthError> {
+    let client = http_client()?;
+    let code = match timeout(
+        CALLBACK_TIMEOUT,
+        wait_for_callback(&login.listener, &login.request.state),
+    )
+    .await
+    {
+        Ok(Ok(CallbackOutcome::Code(code))) => code,
+        Ok(Ok(CallbackOutcome::Error(error))) => return Err(XaiOAuthError::OAuthDenied(error)),
+        Ok(Err(err)) => return Err(err),
+        Err(_) => return Err(XaiOAuthError::Timeout),
+    };
+
+    exchange_code(&client, &code, &login.request).await
+}
+
+pub async fn start_xai_device_login() -> Result<XaiDeviceLogin, XaiOAuthError> {
+    start_xai_device_login_with_endpoint(&http_client()?, DEVICE_AUTHORIZATION_URL).await
+}
+
+pub async fn complete_xai_device_login(login: XaiDeviceLogin) -> Result<XaiTokens, XaiOAuthError> {
+    complete_xai_device_login_with_endpoint(&http_client()?, login, TOKEN_URL).await
+}
+
+pub fn build_oauth_request() -> XaiOAuthRequest {
+    build_oauth_request_with_values(random_token(32), random_token(64), random_token(32))
+}
+
+fn build_oauth_request_with_values(
+    state: String,
+    verifier: String,
+    nonce: String,
+) -> XaiOAuthRequest {
+    build_oauth_request_with_redirect(
+        state,
+        verifier,
+        nonce,
+        format!("http://127.0.0.1:{CALLBACK_PORT}{CALLBACK_PATH}"),
+    )
+}
+
+fn build_oauth_request_with_redirect(
+    state: String,
+    verifier: String,
+    nonce: String,
+    redirect_uri: String,
+) -> XaiOAuthRequest {
+    let challenge = pkce_challenge(&verifier);
+    let mut url = Url::parse(AUTHORIZE_URL).expect("xAI authorize URL must be valid");
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", CLIENT_ID)
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("scope", SCOPE)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", &state)
+        .append_pair("nonce", &nonce)
+        .append_pair("plan", "generic")
+        .append_pair("referrer", "rho");
+    XaiOAuthRequest {
+        authorize_url: url.to_string(),
+        redirect_uri,
+        state,
+        verifier,
+        challenge,
+    }
+}
+
+fn http_client() -> Result<reqwest::Client, XaiOAuthError> {
+    crate::reqwest_client_builder()
+        .timeout(REQUEST_TIMEOUT)
+        .user_agent(crate::rho_user_agent())
+        .build()
+        .map_err(XaiOAuthError::from)
+}
+
+async fn wait_for_callback(
+    listener: &TcpListener,
+    expected_state: &str,
+) -> Result<CallbackOutcome, XaiOAuthError> {
+    const BODIES: ResponseBodies<'static> = ResponseBodies {
+        success: "SpaceXAI login complete. You can return to Rho.",
+        failure: "SpaceXAI login failed. You can return to Rho for details.",
+        ignored: "Not found",
+    };
+    wait_for_oauth_callback(
+        listener,
+        |request| match parse_callback_http_request(request, expected_state) {
+            CallbackParse::Outcome(CallbackOutcome::Code(code)) => {
+                CallbackDecision::Success(CallbackOutcome::Code(code))
+            }
+            CallbackParse::Outcome(CallbackOutcome::Error(error)) => {
+                CallbackDecision::Failure(CallbackOutcome::Error(error))
+            }
+            CallbackParse::Ignored => CallbackDecision::Ignored,
+            CallbackParse::Invalid(error) => CallbackDecision::Invalid(error),
+        },
+        BODIES,
+        CALLBACK_READ_TIMEOUT,
+    )
+    .await
+    .map_err(|error| match error {
+        CallbackWaitError::Accept(error) => XaiOAuthError::CallbackIo(error),
+        CallbackWaitError::Invalid(error) => error,
+    })
+}
+
+#[derive(Debug)]
+enum CallbackParse {
+    Outcome(CallbackOutcome),
+    Ignored,
+    Invalid(XaiOAuthError),
+}
+
+/// Parse a full HTTP request (request line + headers + optional body).
+///
+/// Non-callback probes return [`CallbackParse::Ignored`] so the listener can
+/// keep waiting. Real `/callback` requests with mismatched state or missing
+/// code are fatal.
+fn parse_callback_http_request(request: &str, expected_state: &str) -> CallbackParse {
+    let (header_section, body) = match request.split_once("\r\n\r\n") {
+        Some(parts) => parts,
+        None => match request.split_once("\n\n") {
+            Some(parts) => parts,
+            None => (request, ""),
+        },
+    };
+    let request_line = header_section.lines().next().unwrap_or_default().trim();
+    if request_line.is_empty() {
+        return CallbackParse::Ignored;
+    }
+
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    if target.is_empty() {
+        return CallbackParse::Ignored;
+    }
+
+    let url = match Url::parse(&format!("http://127.0.0.1{target}")) {
+        Ok(url) => url,
+        Err(_) => return CallbackParse::Ignored,
+    };
+    if url.path() != CALLBACK_PATH {
+        return CallbackParse::Ignored;
+    }
+
+    let method = method.to_ascii_uppercase();
+    let mut params = url
+        .query_pairs()
+        .into_owned()
+        .collect::<std::collections::HashMap<_, _>>();
+    match method.as_str() {
+        "GET" | "HEAD" => {}
+        "POST" => {
+            for (key, value) in url::form_urlencoded::parse(body.as_bytes()) {
+                params.insert(key.into_owned(), value.into_owned());
+            }
+        }
+        _ => {
+            return CallbackParse::Invalid(XaiOAuthError::InvalidCallback(format!(
+                "expected GET or POST callback request, got {method}"
+            )));
+        }
+    }
+
+    match outcome_from_callback_params(&params, expected_state) {
+        Ok(outcome) => CallbackParse::Outcome(outcome),
+        Err(err) => CallbackParse::Invalid(err),
+    }
+}
+
+fn outcome_from_callback_params(
+    params: &std::collections::HashMap<String, String>,
+    expected_state: &str,
+) -> Result<CallbackOutcome, XaiOAuthError> {
+    let state = params
+        .get("state")
+        .ok_or_else(|| XaiOAuthError::InvalidCallback("callback was missing state".into()))?;
+    if state != expected_state {
+        return Err(XaiOAuthError::InvalidCallback(
+            "callback state did not match".into(),
+        ));
+    }
+    if let Some(error) = params.get("error") {
+        return Ok(CallbackOutcome::Error(
+            params
+                .get("error_description")
+                .cloned()
+                .unwrap_or_else(|| error.clone()),
+        ));
+    }
+    params
+        .get("code")
+        .filter(|code| !code.is_empty())
+        .cloned()
+        .map(CallbackOutcome::Code)
+        .ok_or_else(|| XaiOAuthError::InvalidCallback("callback was missing code".into()))
+}
+
+async fn exchange_code(
+    client: &reqwest::Client,
+    code: &str,
+    request: &XaiOAuthRequest,
+) -> Result<XaiTokens, XaiOAuthError> {
+    exchange_code_with_endpoint(client, code, request, TOKEN_URL).await
+}
+
+async fn exchange_code_with_endpoint(
+    client: &reqwest::Client,
+    code: &str,
+    request: &XaiOAuthRequest,
+    endpoint: &str,
+) -> Result<XaiTokens, XaiOAuthError> {
+    let response = client
+        .post(endpoint)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", request.redirect_uri.as_str()),
+            ("client_id", CLIENT_ID),
+            ("code_verifier", request.verifier.as_str()),
+            // xAI currently requires the original challenge to be echoed at token exchange.
+            ("code_challenge", request.challenge.as_str()),
+            ("code_challenge_method", "S256"),
+        ])
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<TokenResponse>()
+        .await?;
+    tokens_from_response(response)
+}
+
+async fn start_xai_device_login_with_endpoint(
+    client: &reqwest::Client,
+    endpoint: &str,
+) -> Result<XaiDeviceLogin, XaiOAuthError> {
+    let response = client
+        .post(endpoint)
+        .form(&DeviceCodeRequest {
+            client_id: CLIENT_ID,
+            scope: SCOPE,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<DeviceCodeResponse>()
+        .await?;
+    if let Some(error) = response.error {
+        return Err(XaiOAuthError::DeviceSetup(
+            response.error_description.unwrap_or(error),
+        ));
+    }
+    Ok(XaiDeviceLogin {
+        user_code: response
+            .user_code
+            .ok_or(XaiOAuthError::MissingToken("user_code"))?,
+        verification_uri: response
+            .verification_uri
+            .ok_or(XaiOAuthError::MissingToken("verification_uri"))?,
+        verification_uri_complete: response.verification_uri_complete,
+        expires_in: Duration::from_secs(
+            response
+                .expires_in
+                .unwrap_or(DEFAULT_DEVICE_TIMEOUT.as_secs()),
+        ),
+        interval: Duration::from_secs(
+            response
+                .interval
+                .unwrap_or(DEFAULT_DEVICE_POLL_INTERVAL.as_secs())
+                .max(1),
+        ),
+        device_code: response
+            .device_code
+            .ok_or(XaiOAuthError::MissingToken("device_code"))?,
+    })
+}
+
+async fn complete_xai_device_login_with_endpoint(
+    client: &reqwest::Client,
+    login: XaiDeviceLogin,
+    endpoint: &str,
+) -> Result<XaiTokens, XaiOAuthError> {
+    let form = [
+        ("grant_type", DEVICE_CODE_GRANT_TYPE),
+        ("client_id", CLIENT_ID),
+        ("device_code", login.device_code.as_str()),
+    ];
+    match poll_device_token(
+        DevicePollRequest {
+            client,
+            endpoint,
+            form: &form,
+            extra_headers: &[],
+            expires_in: login.expires_in,
+            interval: login.interval,
+            first_poll: FirstPoll::Immediate,
+            http: DevicePollHttp::Json,
+        },
+        |status, body: TokenResponse| {
+            if status.is_success() {
+                return DevicePollStep::Tokens(body);
+            }
+            if let Some(step) = standard_device_poll_step(body.error.as_deref()) {
+                return step;
+            }
+            match body.error.as_deref() {
+                Some("access_denied" | "authorization_denied") => DevicePollStep::Denied {
+                    description: body
+                        .error_description
+                        .unwrap_or_else(|| "access denied".into()),
+                },
+                Some(error) => DevicePollStep::Fatal {
+                    error: body.error_description.unwrap_or_else(|| error.to_string()),
+                },
+                None => DevicePollStep::Fatal {
+                    error: format!("token endpoint returned HTTP {status} without an OAuth error"),
+                },
+            }
+        },
+    )
+    .await?
+    {
+        DevicePollOutcome::Tokens(body) => tokens_from_response(body),
+        DevicePollOutcome::Denied { description } => Err(XaiOAuthError::OAuthDenied(description)),
+        DevicePollOutcome::Timeout => Err(XaiOAuthError::DeviceTimeout),
+        DevicePollOutcome::Fatal { error } => Err(XaiOAuthError::DeviceSetup(error)),
+    }
+}
+
+fn tokens_from_response(response: TokenResponse) -> Result<XaiTokens, XaiOAuthError> {
+    let access_token = response
+        .access_token
+        .ok_or(XaiOAuthError::MissingToken("access_token"))?;
+    let expires_at_unix = response.expires_in.and_then(|expires_in| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|now| i64::try_from(now.as_secs().saturating_add(expires_in)).ok())
+    });
+    Ok(XaiTokens {
+        access_token,
+        refresh_token: response.refresh_token,
+        expires_at_unix,
+        id_token: response.id_token,
+    })
+}

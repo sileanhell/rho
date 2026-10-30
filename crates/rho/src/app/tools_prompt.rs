@@ -1,0 +1,393 @@
+use std::path::{Path, PathBuf};
+
+use rho_sdk::SystemPrompt;
+use tracing::Instrument;
+
+use {
+    crate::agent::{PromptPolicy, ToolCapability},
+    crate::config::Config,
+    crate::diagnostics::RuntimeDiagnostics,
+    crate::prompt,
+    crate::tools::{
+        advisor::AdvisorSessionStore,
+        sdk_registry::{AppToolSet, DelegationConfig, ToolSetOptions},
+    },
+};
+
+use super::agent_binding::BoundAgent;
+
+pub(crate) struct ToolsAndPromptOptions<'a> {
+    pub(crate) config: &'a Config,
+    /// Bootstrap's discovered agent catalog. `None` when assembly may run from
+    /// a different cwd (subagents, automation); the delegation tool set then
+    /// rediscovers on its own.
+    pub(crate) catalog: Option<&'a crate::agent::DiscoveredAgentCatalog>,
+    pub(crate) config_path: PathBuf,
+    pub(crate) cwd: &'a Path,
+    pub(crate) no_system_prompt: bool,
+    pub(crate) no_tools: bool,
+    pub(crate) no_subagents: bool,
+    pub(crate) questionnaire_enabled: bool,
+    /// Whether this run can put an MCP server's question in front of a person.
+    /// Only a host that answers questionnaires may declare `elicitation`.
+    pub(crate) mcp_elicitation: crate::tools::mcp::McpElicitationSupport,
+    /// Whether this run will bind a model that opted-in MCP servers may sample.
+    pub(crate) mcp_sampling: McpSamplingSupport,
+    /// Whether this run starts MCP servers from user config and Agent Plugins
+    /// and loads OpenAPI sources.
+    pub(crate) tool_source_attach: ToolSourceAttach,
+    /// Whether a configured MCP server may start a browser login. The host
+    /// decides: probing stdin here would race the ACP transport's read of it.
+    pub(crate) mcp_authorization: crate::tools::mcp::McpAuthorizationMode,
+    /// Startup system-prompt model labels should wait on a models.dev
+    /// catalog hydrate. Interactive sessions stay cache-only on the first
+    /// frame and rewrite once if the hydrate lands before the first request.
+    /// Automation stays cache-only so cold/offline launches do not block.
+    pub(crate) await_catalog_names: bool,
+    /// Interactive sessions spawn MCP connect and OpenAPI loading and paint a
+    /// pending inventory so a slow server cannot stall the first frame.
+    /// Automation still awaits.
+    pub(crate) defer_tool_sources: bool,
+    pub(crate) diagnostics: &'a RuntimeDiagnostics,
+    pub(crate) agent: &'a BoundAgent,
+    /// Added workspace directories: their AGENTS.md files join instruction
+    /// discovery, and delegated agents inherit them.
+    pub(crate) added_dirs: &'a crate::added_dirs::AddedDirs,
+    /// Whether `process start` advertises `keep_warm`. Only the interactive
+    /// host runs the cache warmer that honors it.
+    pub(crate) process_keep_warm: crate::tools::process::KeepWarmOffer,
+    /// What the host does in place of local disk, such as serving files.
+    pub(crate) host_io: crate::tools::host_io::HostIo,
+}
+
+/// Whether this run offers MCP sampling at all.
+///
+/// A run that never binds a model must not declare the `sampling` capability,
+/// so the decision is made by the host rather than inferred later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum McpSamplingSupport {
+    Available,
+    Unavailable,
+}
+
+/// Whether this session loads external tool sources: MCP servers from user
+/// config and Agent Plugins, and OpenAPI sources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolSourceAttach {
+    /// Merge plugin MCP into config, connect enabled servers, and load
+    /// OpenAPI sources.
+    Connect,
+    /// Ignore user and plugin MCP and every OpenAPI source. No transports start.
+    None,
+}
+
+/// External tools loaded at session start, together so one deferred job
+/// settles them and the prompt and tool list are rebuilt once.
+pub(crate) struct ToolSourcesOutcome {
+    pub(crate) mcp: crate::tools::mcp::McpConnectOutcome,
+    pub(crate) openapi: crate::tools::openapi::bundle::OpenApiLoadOutcome,
+}
+
+impl ToolSourcesOutcome {
+    /// Connect MCP servers and load OpenAPI sources concurrently.
+    async fn load(
+        mcp_plan: crate::tools::mcp::McpSessionPlan,
+        mcp_config: &crate::tools::mcp::config::McpConfig,
+        mcp_options: crate::tools::mcp::McpSessionOptions,
+        openapi: crate::tools::openapi::config::SourcePlans,
+        openapi_options: crate::tools::openapi::bundle::LoadOptions,
+    ) -> Self {
+        let (mcp, openapi) = tokio::join!(
+            crate::tools::mcp::McpConnectOutcome::run(mcp_plan, mcp_config, mcp_options),
+            crate::tools::openapi::bundle::load(openapi, openapi_options),
+        );
+        Self { mcp, openapi }
+    }
+}
+pub(crate) struct StartupInventory {
+    pub(crate) mcp: crate::tools::mcp::McpSessionReport,
+    pub(crate) plugins: crate::plugins::PluginLoadReport,
+}
+
+pub(crate) struct ToolsAndPrompt {
+    pub(crate) tools: AppToolSet,
+    /// Stable across tool-list changes, rebuilt when the conversation model changes.
+    pub(super) prompt: super::active_prompt::ActivePrompt,
+    pub(crate) prompt_template: Option<prompt::ModelPromptTemplate>,
+    pub(crate) inventory: StartupInventory,
+    /// In-flight MCP connect and OpenAPI loading when the interactive host
+    /// deferred them off the first frame. `None` when they were awaited or
+    /// skipped.
+    pub(crate) pending_tool_sources: Option<tokio::task::JoinHandle<ToolSourcesOutcome>>,
+    /// Late-bound model handle for MCP sampling. Bound once the runtime exists,
+    /// and rebound whenever the user changes models. Left unbound, every
+    /// sampling request fails closed.
+    pub(crate) mcp_sampling: crate::tools::mcp::McpSamplingBridge,
+}
+
+/// Capability resolution plus system prompt assembly for root interactive and
+/// automation startup. Claude-cli agents bind no Rho host tools; root runs still
+/// use the Rho loop and parent config, with Claude execution via AgentExecutor
+/// for delegated runs.
+pub(crate) async fn assemble_tools_and_prompt(
+    options: ToolsAndPromptOptions<'_>,
+) -> anyhow::Result<ToolsAndPrompt> {
+    let native_runtime = options.agent.rho_capabilities().is_some();
+    let mut capabilities = options
+        .agent
+        .rho_capabilities()
+        .cloned()
+        .unwrap_or_default();
+    if options.no_subagents {
+        capabilities.remove(&ToolCapability::Agent);
+        capabilities.remove(&ToolCapability::Agents);
+    }
+    if !options.questionnaire_enabled {
+        capabilities.remove(&ToolCapability::Questionnaire);
+    }
+    // The capability says the run may offer the advisor; config says whether it
+    // does right now. Advisor mode on with no advisor model configured is a real
+    // state, and the TUI surfaces it.
+    let advisor_capable = capabilities.contains(&ToolCapability::Advisor);
+    let launch_delegation_enabled = capabilities.contains(&ToolCapability::Agent);
+    let delegation_enabled =
+        launch_delegation_enabled || capabilities.contains(&ToolCapability::Agents);
+    // Agent Plugins contribute skills through ordinary skill discovery, MCP
+    // servers through the generic native MCP configuration, and agents
+    // through the agent catalog's own discovery.
+    let plugin_discovery =
+        crate::plugins::discover(options.cwd, crate::paths::home_dir().as_deref());
+    crate::plugins::log(&plugin_discovery.report);
+    let crate::plugins::PluginDiscovery {
+        skills: plugin_skills,
+        mcp: plugin_mcp,
+        agents: _,
+        report: plugins_report,
+    } = plugin_discovery;
+    let mcp_config = mcp_config_for_attach(options.config, plugin_mcp, options.tool_source_attach);
+    // One decision for every external tool source, so MCP and OpenAPI attach
+    // together or not at all.
+    let attach_tool_sources = native_runtime
+        && !options.no_tools
+        && options.tool_source_attach == ToolSourceAttach::Connect;
+    let mcp_plan = if attach_tool_sources {
+        crate::tools::mcp::McpSessionPlan::Connect
+    } else if !native_runtime {
+        crate::tools::mcp::McpSessionPlan::Inventory(
+            crate::tools::mcp::McpLoadMode::UnsupportedAgent,
+        )
+    } else {
+        crate::tools::mcp::McpSessionPlan::Inventory(crate::tools::mcp::McpLoadMode::ToolsDisabled)
+    };
+    let mcp_sampling_bridge = crate::tools::mcp::McpSamplingBridge::new();
+    let mut mcp_options = crate::tools::mcp::McpSessionOptions::new(
+        options.config.max_output_bytes,
+        crate::tools::mcp::McpRoots::for_workspace(options.cwd),
+        options.mcp_authorization,
+    )
+    .with_elicitation(options.mcp_elicitation);
+    match options.mcp_sampling {
+        McpSamplingSupport::Available => {
+            mcp_options = mcp_options.with_sampling(mcp_sampling_bridge.clone());
+        }
+        McpSamplingSupport::Unavailable => {}
+    }
+    let openapi_plans = if attach_tool_sources {
+        crate::tools::openapi::config::OpenApiSources::discover(
+            &options.config.openapi,
+            &options.config_path,
+            options.cwd,
+            crate::workspace::ProjectTrust::from_openapi_env(),
+        )
+        .plan(&|name| std::env::var(name).ok())
+    } else {
+        crate::tools::openapi::config::SourcePlans::default()
+    };
+    let openapi_options =
+        crate::tools::openapi::bundle::LoadOptions::new(options.config.max_output_bytes);
+    // A source that failed planning still defers, so its error reaches the
+    // transcript through the same path as a failed download.
+    let defer = options.defer_tool_sources
+        && attach_tool_sources
+        && (mcp_config.has_enabled_servers() || !openapi_plans.is_empty());
+    let (sources, pending_tool_sources) = if defer {
+        let pending_report =
+            crate::tools::mcp::McpSessionReport::from_config_connecting(&mcp_config);
+        let connect_config = mcp_config.clone();
+        let connect_options = mcp_options.clone();
+        let handle = tokio::spawn(
+            async move {
+                ToolSourcesOutcome::load(
+                    crate::tools::mcp::McpSessionPlan::Connect,
+                    &connect_config,
+                    connect_options,
+                    openapi_plans,
+                    openapi_options,
+                )
+                .await
+            }
+            .instrument(tracing::info_span!("startup.tool_sources")),
+        );
+        let pending = ToolSourcesOutcome {
+            mcp: crate::tools::mcp::McpConnectOutcome {
+                report: pending_report,
+                bundle: None,
+                catalog: crate::tools::mcp::McpCatalog::default(),
+            },
+            openapi: crate::tools::openapi::bundle::OpenApiLoadOutcome::default(),
+        };
+        (pending, Some(handle))
+    } else {
+        let loaded = ToolSourcesOutcome::load(
+            mcp_plan,
+            &mcp_config,
+            mcp_options,
+            openapi_plans,
+            openapi_options,
+        )
+        .await;
+        // Hosts that load inline have no transcript yet, so problems go to
+        // the log, as MCP connect failures do. Deferred loads show them.
+        for problem in loaded
+            .openapi
+            .report
+            .errors
+            .iter()
+            .chain(&loaded.openapi.report.warnings)
+        {
+            tracing::warn!("{problem}");
+        }
+        (loaded, None)
+    };
+    let ToolSourcesOutcome { mcp, openapi } = sources;
+    let mut tools = if options.no_tools {
+        AppToolSet::disabled().with_mcp(mcp)
+    } else {
+        let mut tool_options = ToolSetOptions::new(capabilities)
+            .process_keep_warm(options.process_keep_warm)
+            .host_io(options.host_io.clone());
+        let workflow_tracker = crate::tools::workflow_tracker::WorkflowRunTracker::new();
+        tool_options = tool_options.workflow_tracker(workflow_tracker.clone());
+        if advisor_capable {
+            tool_options = tool_options.advisor(AdvisorSessionStore::new());
+        }
+        if delegation_enabled {
+            tool_options = tool_options.delegation(DelegationConfig::new(
+                options.cwd.to_path_buf(),
+                options.config_path.clone(),
+                options
+                    .catalog
+                    .and_then(|discovered| discovered.for_cwd(options.cwd)),
+            ));
+        }
+        if options
+            .agent
+            .rho_capabilities()
+            .is_some_and(|capabilities| capabilities.contains(&ToolCapability::Workflow))
+        {
+            tool_options = tool_options.workflow(super::workflow_cli::workflow_tool_service(
+                options.cwd.to_path_buf(),
+                Some(options.config_path.clone()),
+                workflow_tracker,
+            ));
+        }
+        AppToolSet::new(options.config, options.diagnostics.clone(), tool_options).with_mcp(mcp)
+    };
+    tools.attach_openapi(openapi);
+    if let Some(manager) = tools.subagents() {
+        manager.update_added_dirs(options.added_dirs.clone());
+    }
+    let mcp_report = tools.mcp_report().clone();
+    let openapi_report = tools.openapi_report().clone();
+    let specs = tools.specs();
+    let mut prompt_template = None;
+    let mut model_prompt = None;
+    let mut sources = Vec::new();
+    let system_prompt = if options.no_system_prompt {
+        SystemPrompt::None
+    } else {
+        let mut text = match options.agent.prompt() {
+            PromptPolicy::Replace(text) => text.clone(),
+            PromptPolicy::Extend(extra) => {
+                // The bound model, not the host one: a delegated agent that
+                // pins its own model must be told the model it is running on.
+                let running = options.agent.prompt_model();
+                let advisor = advisor_capable
+                    .then(|| crate::tools::advisor::advisor_model(options.config))
+                    .flatten()
+                    .map(crate::model_identity::PromptModel::from_internal_agent);
+                // Interactive sessions stay cache-only on the first frame. A
+                // later one-shot rewrite can land display names if hydrate
+                // finishes before the first request. Automation stays cache-only.
+                if options.await_catalog_names {
+                    rho_providers::model::ensure_model_catalog_names().await;
+                }
+                let mut template = prompt::system_prompt_template_with_plugin_skills(
+                    &specs,
+                    options.cwd,
+                    advisor.as_ref(),
+                    plugin_skills,
+                );
+                template.replace_tool_sources(&mcp_report, &openapi_report);
+                template.set_added_dirs(options.added_dirs);
+                let mut retained = String::new();
+                if !launch_delegation_enabled {
+                    prompt::append_subagents_disabled_instruction(&mut retained);
+                }
+                if !extra.is_empty() {
+                    retained.push_str(&format!("\n\n# Agent instructions\n\n{extra}"));
+                }
+                template.append_retained(&retained);
+                let built = match template.build(&running) {
+                    Ok(built) => built,
+                    Err(error) => {
+                        if let Some(pending) = pending_tool_sources {
+                            pending.abort();
+                        }
+                        tools.shutdown().await;
+                        return Err(error);
+                    }
+                };
+                sources = built.sources;
+                prompt_template = Some(template);
+                model_prompt = built.model_prompt;
+                built.text
+            }
+        };
+        if text.is_empty() {
+            text = "You are a coding agent.".into();
+        }
+        // Advisor steering lives on the tool description / enable notice, not
+        // here, so mid-session /advisor toggles never require a prompt rewrite.
+        SystemPrompt::Custom(text)
+    };
+    let prompt = super::active_prompt::ActivePrompt::new(system_prompt, model_prompt, sources);
+    prompt.install(options.diagnostics, tools.advisor());
+    options.diagnostics.update_tools(&specs);
+    Ok(ToolsAndPrompt {
+        tools,
+        prompt,
+        prompt_template,
+        inventory: StartupInventory {
+            mcp: mcp_report,
+            plugins: plugins_report,
+        },
+        pending_tool_sources,
+        mcp_sampling: mcp_sampling_bridge,
+    })
+}
+
+pub(super) fn mcp_config_for_attach(
+    config: &Config,
+    plugin_mcp: crate::tools::mcp::config::McpConfig,
+    attach: ToolSourceAttach,
+) -> crate::tools::mcp::config::McpConfig {
+    match attach {
+        ToolSourceAttach::None => crate::tools::mcp::config::McpConfig::default(),
+        ToolSourceAttach::Connect => {
+            let mut mcp_config = config.mcp.clone();
+            mcp_config.merge(plugin_mcp);
+            mcp_config
+        }
+    }
+}

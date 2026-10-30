@@ -1,0 +1,624 @@
+use std::{borrow::Cow, collections::BTreeSet, fmt, str::FromStr};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+use rho_providers::reasoning::ReasoningLevel;
+
+use super::{AntigravityTool, CursorTool};
+
+macro_rules! define_tool_capabilities {
+    ($($variant:ident => $name:literal : $detail:literal),+ $(,)?) => {
+        /// A parsed tool capability in an agent definition.
+        ///
+        /// Built-ins have stable variants so policy code does not parse names again.
+        /// Extension names are reserved for capabilities supplied by the host.
+        #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum ToolCapability {
+            $($variant,)+
+            Extension(String),
+        }
+
+        /// Every built-in tool capability understood by the Rho host.
+        pub const BUILTIN_TOOL_CAPABILITIES: &[ToolCapability] = &[
+            $(ToolCapability::$variant,)+
+        ];
+
+        impl ToolCapability {
+            pub fn parse(name: String) -> Self {
+                match name.as_str() {
+                    $($name => Self::$variant,)+
+                    // Alternate edit tool names share one capability; the global
+                    // edit preference chooses the model-facing implementation.
+                    "apply_patch" | "hashline" | "str_replace" => Self::Edit,
+                    _ => Self::Extension(name),
+                }
+            }
+
+            pub fn as_str(&self) -> &str {
+                match self {
+                    $(Self::$variant => $name,)+
+                    Self::Extension(name) => name,
+                }
+            }
+
+            /// One-line description for pickers and help text.
+            pub fn detail(&self) -> &str {
+                match self {
+                    $(Self::$variant => $detail,)+
+                    Self::Extension(_) => "Host-supplied extension capability.",
+                }
+            }
+        }
+    };
+}
+
+define_tool_capabilities! {
+    Advisor => "advisor" : "Consult the advisor model for a second opinion.",
+    Agent => "agent" : "Delegate work to a subagent.",
+    Agents => "agents" : "Inspect and message running subagents.",
+    Bash => "bash" : "Run bash commands.",
+    Edit => "edit" : "Edit existing files (str_replace, hashline, or apply_patch).",
+    FetchContent => "fetch_content" : "Fetch URLs, repos, PDFs, and local files.",
+    GetSearchContent => "get_search_content" : "Read stored web search or fetch results.",
+    Glob => "glob" : "Find files by glob pattern.",
+    Grep => "grep" : "Search file contents by regex.",
+    ListDir => "list_dir" : "List a directory.",
+    Powershell => "powershell" : "Run PowerShell commands.",
+    Process => "process" : "Start, poll, and stop background processes.",
+    Questionnaire => "questionnaire" : "Ask the user structured questions.",
+    ReadFile => "read_file" : "Read files, documents, and images.",
+    Rho => "rho" : "Inspect the running Rho harness.",
+    Sessions => "sessions" : "Search and read prior session evidence.",
+    Shell => "shell" : "Run shell commands.",
+    Skill => "skill" : "Load skill files.",
+    Todo => "todo" : "Track a short task checklist shown to the user.",
+    WebSearch => "web_search" : "Search the web.",
+    Workflow => "workflow" : "Validate, plan, and run workflows.",
+    WriteFile => "write" : "Create or overwrite files.",
+}
+
+impl fmt::Display for ToolCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+pub type ToolCapabilitySet = BTreeSet<ToolCapability>;
+
+/// Tool capabilities resolved against the current host and invocation role.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentCapabilities {
+    tools: ToolCapabilitySet,
+}
+
+impl AgentCapabilities {
+    pub fn new(tools: ToolCapabilitySet) -> Self {
+        Self { tools }
+    }
+
+    pub fn all_host_tools() -> Self {
+        Self::new(BUILTIN_TOOL_CAPABILITIES.iter().cloned().collect())
+    }
+
+    pub fn contains(&self, capability: &ToolCapability) -> bool {
+        self.tools.contains(capability)
+    }
+
+    /// Debug matrix fixture injects the TUI extension tool. Release builds
+    /// never mutate a resolved set after [`Self::new`].
+    #[cfg(debug_assertions)]
+    pub fn insert(&mut self, capability: ToolCapability) {
+        self.tools.insert(capability);
+    }
+
+    pub fn remove(&mut self, capability: &ToolCapability) {
+        self.tools.remove(capability);
+    }
+}
+
+impl From<ToolCapabilitySet> for AgentCapabilities {
+    fn from(tools: ToolCapabilitySet) -> Self {
+        Self::new(tools)
+    }
+}
+
+/// Stable identifier used to select an agent across invocations.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AgentId(String);
+
+impl AgentId {
+    pub fn new(value: impl Into<String>) -> Result<Self, AgentIdError> {
+        let value = value.into();
+        validate_agent_id(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AgentId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for AgentId {
+    type Err = AgentIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("invalid agent ID '{value}': {reason}")]
+pub struct AgentIdError {
+    value: String,
+    reason: &'static str,
+}
+
+fn validate_agent_id(value: &str) -> Result<(), AgentIdError> {
+    let invalid = |reason| AgentIdError {
+        value: value.to_string(),
+        reason,
+    };
+    if value.is_empty() || value.len() > 64 {
+        return Err(invalid("must contain 1-64 characters"));
+    }
+    if value.starts_with('-') || value.ends_with('-') || value.contains("--") {
+        return Err(invalid("must use single hyphens only between segments"));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(invalid(
+            "must contain only lowercase ASCII letters, digits, and hyphens",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptPolicy {
+    Extend(String),
+    Replace(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelSelection {
+    pub provider: Option<String>,
+    pub model: String,
+    /// Optional auth profile id (for example `xai-oauth`).
+    ///
+    /// When unset, bind keeps the host auth if it is valid for the selected
+    /// provider; otherwise it falls back to that provider's default auth.
+    pub auth: Option<String>,
+    /// Fast serving for this pinned model (`fast: true`). Rho only.
+    ///
+    /// Independent of the parent's `/fast`: delegated runs use exactly this
+    /// value. Bind fails when the resolved model and auth cannot serve it.
+    pub fast: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelPolicy {
+    Inherit,
+    Prefer(ModelSelection),
+    Require(ModelSelection),
+    Select(ModelSelection),
+}
+
+impl ModelPolicy {
+    /// Embedded selection for prefer/require/select policies.
+    pub fn selection_mut(&mut self) -> Option<&mut ModelSelection> {
+        match self {
+            Self::Prefer(selection) | Self::Require(selection) | Self::Select(selection) => {
+                Some(selection)
+            }
+            Self::Inherit => None,
+        }
+    }
+
+    pub fn selection(&self) -> Option<&ModelSelection> {
+        match self {
+            Self::Prefer(selection) | Self::Require(selection) | Self::Select(selection) => {
+                Some(selection)
+            }
+            Self::Inherit => None,
+        }
+    }
+
+    /// Maps the embedded selection. Returns `None` for [`Self::Inherit`].
+    pub fn map_selection(self, f: impl FnOnce(ModelSelection) -> ModelSelection) -> Option<Self> {
+        match self {
+            Self::Prefer(selection) => Some(Self::Prefer(f(selection))),
+            Self::Require(selection) => Some(Self::Require(f(selection))),
+            Self::Select(selection) => Some(Self::Select(f(selection))),
+            Self::Inherit => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolPolicy {
+    All,
+    Allow(ToolCapabilitySet),
+}
+
+/// Which harness executes an agent definition.
+///
+/// Runtime is independent of model selection. `Rho` uses Rho's own loop and
+/// tool vocabulary. `Cursor` delegates the loop to `cursor-agent`
+/// and uses the closed Cursor tool vocabulary. `Antigravity` delegates the
+/// loop to `agy_acp_server` and uses the closed Antigravity tool vocabulary.
+#[derive(
+    Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentRuntime {
+    #[default]
+    Rho,
+    Cursor,
+    Antigravity,
+}
+
+impl AgentRuntime {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rho => "rho",
+            Self::Cursor => "cursor",
+            Self::Antigravity => "antigravity",
+        }
+    }
+
+    /// Whether this runtime delegates the agent loop to an external binary.
+    ///
+    /// True for every runtime but [`Self::Rho`]. Those runtimes pass `model`
+    /// through to the harness and do not use Rho provider or auth.
+    pub fn is_external_cli(self) -> bool {
+        self != Self::Rho
+    }
+}
+
+impl fmt::Display for AgentRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AgentRuntime {
+    type Err = AgentRuntimeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "rho" => Ok(Self::Rho),
+            "cursor" => Ok(Self::Cursor),
+            "antigravity" => Ok(Self::Antigravity),
+            _ => Err(AgentRuntimeError {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("unknown runtime '{value}'; expected rho, cursor, or antigravity")]
+pub struct AgentRuntimeError {
+    value: String,
+}
+
+/// Settings that only the Cursor Agent runtime understands.
+///
+/// Built at parse time with a nonempty closed tool allow list. Each run derives
+/// Cursor's managed-config fence and permission answers from `tools`. Cursor has no reasoning flag; effort
+/// lives in the model id or a bracket override.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CursorAgentConfig {
+    /// Nonempty closed allow list. Enforced at parse and edit validation.
+    pub tools: Vec<CursorTool>,
+    /// Pass-through `--model` value. `None` omits the flag.
+    pub model: Option<String>,
+}
+
+/// Settings that only the Antigravity runtime understands.
+///
+/// Built at parse time with a nonempty closed tool allow list. Each run sends
+/// `tools` as the session's built-in allowlist and answers permissions from
+/// it. Antigravity has no reasoning setting outside the model id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AntigravityAgentConfig {
+    /// Nonempty closed allow list. Enforced at parse and edit validation.
+    pub tools: Vec<AntigravityTool>,
+    /// Session `model` config option value. `None` keeps the server default.
+    pub model: Option<String>,
+}
+
+/// The runtime together with the settings only that runtime understands.
+///
+/// One value carries the whole runtime axis, so a definition cannot pair one
+/// harness with another harness's tool vocabulary or settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentRuntimeSpec {
+    Rho {
+        tools: ToolPolicy,
+        model: ModelPolicy,
+        reasoning: Option<ReasoningLevel>,
+    },
+    Cursor(CursorAgentConfig),
+    Antigravity(AntigravityAgentConfig),
+}
+
+impl Default for AgentRuntimeSpec {
+    fn default() -> Self {
+        Self::Rho {
+            tools: ToolPolicy::All,
+            model: ModelPolicy::Inherit,
+            reasoning: None,
+        }
+    }
+}
+
+impl AgentRuntimeSpec {
+    pub fn runtime(&self) -> AgentRuntime {
+        match self {
+            Self::Rho { .. } => AgentRuntime::Rho,
+            Self::Cursor(_) => AgentRuntime::Cursor,
+            Self::Antigravity(_) => AgentRuntime::Antigravity,
+        }
+    }
+
+    /// Pass-through model for external runtimes: `--model` for Cursor, the
+    /// session `model` option for Antigravity.
+    ///
+    /// `Some` for every external runtime (inner `None` keeps its default).
+    /// `None` for Rho, which uses [`ModelPolicy`] instead.
+    pub fn pass_through_model(&self) -> Option<&Option<String>> {
+        match self {
+            Self::Cursor(config) => Some(&config.model),
+            Self::Antigravity(config) => Some(&config.model),
+            Self::Rho { .. } => None,
+        }
+    }
+
+    /// Mutable pass-through model for external runtimes.
+    pub fn pass_through_model_mut(&mut self) -> Option<&mut Option<String>> {
+        match self {
+            Self::Cursor(config) => Some(&mut config.model),
+            Self::Antigravity(config) => Some(&mut config.model),
+            Self::Rho { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentDefinition {
+    pub id: AgentId,
+    pub description: String,
+    pub prompt: PromptPolicy,
+    pub runtime: AgentRuntimeSpec,
+}
+
+impl AgentDefinition {
+    /// Model policy for display and fingerprinting.
+    ///
+    /// Taken from the Rho arm, or reconstructed from an external CLI
+    /// pass-through model string (`None` → inherit, `Some` → select).
+    pub fn model_policy(&self) -> Cow<'_, ModelPolicy> {
+        match self.runtime.pass_through_model() {
+            Some(model) => Cow::Owned(pass_through_model_policy(model.as_deref())),
+            None => match &self.runtime {
+                AgentRuntimeSpec::Rho { model, .. } => Cow::Borrowed(model),
+                AgentRuntimeSpec::Cursor(_) | AgentRuntimeSpec::Antigravity(_) => {
+                    unreachable!("external CLI runtimes expose a pass-through model")
+                }
+            },
+        }
+    }
+
+    /// Reasoning level for display and fingerprinting.
+    pub fn reasoning(&self) -> Option<ReasoningLevel> {
+        match &self.runtime {
+            AgentRuntimeSpec::Rho { reasoning, .. } => *reasoning,
+            AgentRuntimeSpec::Cursor(_) | AgentRuntimeSpec::Antigravity(_) => None,
+        }
+    }
+
+    /// Whether this definition asks for fast serving. Only pinned Rho
+    /// selections can.
+    pub fn fast(&self) -> bool {
+        self.model_policy()
+            .selection()
+            .is_some_and(|selection| selection.fast)
+    }
+
+    /// Current semantic fingerprint (v2). New sessions store this value.
+    pub fn fingerprint(&self) -> AgentFingerprint {
+        self.hash_semantic(FingerprintEncoding::V2)
+    }
+
+    /// Pre-runtime-axis v1 fingerprint for Rho definitions that still mean the
+    /// same thing under default runtime encoding.
+    ///
+    /// Present only when behavior maps to the historical shape: `runtime: rho`,
+    /// `inherit_claude_config: false`, and Rho tool policy. Used so sessions
+    /// created before the runtime axis can resume without treating unchanged
+    /// builtins as definition changes. Absent for Claude agents and any
+    /// definition that cannot be expressed in the old encoding.
+    pub fn legacy_v1_fingerprint(&self) -> Option<AgentFingerprint> {
+        match &self.runtime {
+            AgentRuntimeSpec::Rho { tools, .. } => {
+                Some(self.hash_semantic(FingerprintEncoding::LegacyV1 { tools }))
+            }
+            AgentRuntimeSpec::Cursor(_) | AgentRuntimeSpec::Antigravity(_) => None,
+        }
+    }
+
+    /// True when `stored` is the current fingerprint or an exact accepted
+    /// legacy v1 fingerprint for this definition.
+    pub fn accepts_stored_fingerprint(&self, stored: &str) -> bool {
+        if self.fingerprint().to_string() == stored {
+            return true;
+        }
+        self.legacy_v1_fingerprint()
+            .is_some_and(|fingerprint| fingerprint.to_string() == stored)
+    }
+
+    fn hash_semantic(&self, encoding: FingerprintEncoding<'_>) -> AgentFingerprint {
+        let mut hash = Sha256::new();
+        match encoding {
+            FingerprintEncoding::V2 => hash_field(&mut hash, b"rho-agent-definition-v2"),
+            FingerprintEncoding::LegacyV1 { .. } => {
+                hash_field(&mut hash, b"rho-agent-definition-v1")
+            }
+        }
+        hash_field(&mut hash, self.id.as_str().as_bytes());
+        hash_field(&mut hash, self.description.as_bytes());
+        match &self.prompt {
+            PromptPolicy::Extend(text) => {
+                hash_field(&mut hash, b"prompt:extend");
+                hash_field(&mut hash, text.as_bytes());
+            }
+            PromptPolicy::Replace(text) => {
+                hash_field(&mut hash, b"prompt:replace");
+                hash_field(&mut hash, text.as_bytes());
+            }
+        }
+        match self.model_policy().as_ref() {
+            ModelPolicy::Inherit => hash_field(&mut hash, b"model:inherit"),
+            ModelPolicy::Prefer(selection) => hash_selection(&mut hash, b"model:prefer", selection),
+            ModelPolicy::Require(selection) => {
+                hash_selection(&mut hash, b"model:require", selection)
+            }
+            ModelPolicy::Select(selection) => hash_selection(&mut hash, b"model:select", selection),
+        }
+        match encoding {
+            FingerprintEncoding::V2 => {
+                hash_field(&mut hash, b"runtime");
+                hash_field(&mut hash, self.runtime.runtime().as_str().as_bytes());
+                match &self.runtime {
+                    AgentRuntimeSpec::Rho {
+                        tools: ToolPolicy::All,
+                        ..
+                    } => hash_field(&mut hash, b"tools:rho:all"),
+                    AgentRuntimeSpec::Rho {
+                        tools: ToolPolicy::Allow(tools),
+                        ..
+                    } => {
+                        hash_field(&mut hash, b"tools:rho:allow");
+                        for tool in tools {
+                            hash_field(&mut hash, tool.as_str().as_bytes());
+                        }
+                    }
+                    AgentRuntimeSpec::Cursor(config) => {
+                        hash_field(&mut hash, b"tools:cursor");
+                        for tool in &config.tools {
+                            hash_field(&mut hash, tool.as_flag().as_bytes());
+                        }
+                    }
+                    AgentRuntimeSpec::Antigravity(config) => {
+                        hash_field(&mut hash, b"tools:antigravity");
+                        for tool in &config.tools {
+                            hash_field(&mut hash, tool.as_name().as_bytes());
+                        }
+                    }
+                }
+            }
+            FingerprintEncoding::LegacyV1 { tools } => match tools {
+                ToolPolicy::All => hash_field(&mut hash, b"tools:all"),
+                ToolPolicy::Allow(tools) => {
+                    hash_field(&mut hash, b"tools:allow");
+                    for tool in tools {
+                        hash_field(&mut hash, tool.as_str().as_bytes());
+                    }
+                }
+            },
+        }
+        if let Some(reasoning) = self.reasoning() {
+            hash_field(&mut hash, b"reasoning:some");
+            hash_field(&mut hash, reasoning.to_string().as_bytes());
+        } else {
+            hash_field(&mut hash, b"reasoning:none");
+        }
+        AgentFingerprint(hash.finalize().into())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FingerprintEncoding<'a> {
+    V2,
+    /// Pre-runtime-axis encoding. Only Rho definitions can express it, so the
+    /// tool policy arrives as data and no Claude case can occur here.
+    LegacyV1 {
+        tools: &'a ToolPolicy,
+    },
+}
+
+fn pass_through_model_policy(model: Option<&str>) -> ModelPolicy {
+    match model {
+        None => ModelPolicy::Inherit,
+        Some(model) => ModelPolicy::Select(ModelSelection {
+            provider: None,
+            model: model.to_string(),
+            auth: None,
+            fast: false,
+        }),
+    }
+}
+
+fn hash_selection(hash: &mut Sha256, policy: &[u8], selection: &ModelSelection) {
+    hash_field(hash, policy);
+    hash_field(hash, selection.provider.as_deref().unwrap_or("").as_bytes());
+    hash_field(hash, selection.model.as_bytes());
+    // Only hash explicit auth pins so definitions without `auth` keep the same
+    // fingerprint as before this field existed.
+    if let Some(auth) = selection.auth.as_deref() {
+        hash_field(hash, b"auth");
+        hash_field(hash, auth.as_bytes());
+    }
+    // Likewise only an explicit opt-in changes the fingerprint.
+    if selection.fast {
+        hash_field(hash, b"fast:true");
+    }
+}
+
+fn hash_field(hash: &mut Sha256, value: &[u8]) {
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct AgentFingerprint([u8; 32]);
+
+impl fmt::Display for AgentFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for AgentFingerprint {
+    type Err = AgentFingerprintParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(AgentFingerprintParseError);
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+            let text = std::str::from_utf8(chunk).map_err(|_| AgentFingerprintParseError)?;
+            bytes[index] = u8::from_str_radix(text, 16).map_err(|_| AgentFingerprintParseError)?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("agent fingerprint must contain exactly 64 hexadecimal characters")]
+pub struct AgentFingerprintParseError;

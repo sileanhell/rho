@@ -1,0 +1,85 @@
+#![cfg_attr(test, allow(dead_code))]
+//! Workspace coding tools and SDK tool adapters shared by Rho hosts.
+//!
+//! The crate has two layers:
+//!
+//! - Application tools ([`tool::Tool`]) implement the user-facing built-ins
+//!   (`bash`, `read_file`, `write`, one selected edit surface, `list_dir`)
+//!   with output truncation, diffs, and display formatting.
+//! - Workspace searches implement `grep` and `glob` over the shared
+//!   [`workspace_walk`] walker.
+//! - SDK adapters ([`sdk_adapter`], [`sdk_shell`], [`sdk_search`]) wrap those
+//!   implementations in the public [`rho_sdk::tool::Tool`] contract so hosts
+//!   can register them on an SDK runtime with explicit workspace policies.
+
+pub mod cancellation;
+pub mod document;
+mod edit_format;
+mod file_view;
+mod host;
+mod host_files;
+mod host_terminals;
+pub mod image_format;
+mod image_preview;
+mod path_glob;
+mod paths;
+mod process_env;
+#[cfg(unix)]
+#[doc(hidden)]
+pub mod process_session;
+mod process_stream;
+#[cfg(windows)]
+#[doc(hidden)]
+pub mod process_supervision;
+mod search;
+mod shell_process;
+pub use shell_process::{
+    login_shell_script, parent_path_for, parse_shell_content, ShellContent, PARENT_PATH_VAR,
+};
+mod file_mutation;
+pub mod tool;
+pub mod tool_card;
+pub mod workspace_mutation;
+pub mod workspace_walk;
+
+pub mod apply_patch;
+pub mod bash;
+pub mod diff;
+mod glob;
+mod grep;
+mod grep_format;
+pub mod hashline;
+pub mod list_dir;
+pub mod powershell;
+pub mod read_file;
+mod rendered;
+pub mod rtk;
+pub use rendered::{json_len, output_schema, Rendered};
+pub mod sdk_adapter;
+mod sdk_search;
+pub mod sdk_security;
+pub mod sdk_shell;
+pub mod sdk_support;
+pub mod str_replace;
+mod text_view;
+pub mod write_file;
+
+pub use cancellation::RunCancellation;
+pub use edit_format::EditFormat;
+pub use file_view::{FileViewPolicy, FileViewStyle};
+pub use host::{HostError, HostFuture};
+pub use host_files::HostTextFiles;
+pub use host_terminals::{
+    HostCommand, HostExitStatus, HostTerminal, HostTerminalOutput, HostTerminals,
+};
+pub use image_format::{supported_image_mime_type, MAX_IMAGE_FILE_BYTES};
+pub use image_preview::decode_preview_image;
+pub use process_env::apply_process_environment;
+pub use sdk_adapter::{coding_tool, coding_tools, CodingToolKind, CodingToolOptions};
+pub use sdk_shell::{shell_tool, ShellKind, ShellToolOptions};
+pub use tool::{compact_display_path, resolve_path, truncate, Tool, ToolContext, ToolError};
+pub use workspace_mutation::{UntrackedWorkspaceEffect, WorkspaceMutationObserver};
+
+/// Default per-tool output budget, in bytes, when the host does not configure
+/// one explicitly.
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64_000;

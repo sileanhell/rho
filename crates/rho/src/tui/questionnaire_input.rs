@@ -1,0 +1,295 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{backend::Backend, Terminal};
+
+use super::{
+    composer_pointer::ChoiceClick,
+    questionnaire::{QuestionnaireComposer, QuestionnaireEnterAction, QuestionnaireTarget},
+    questionnaire_notice_text, App, ComposerMode, Entry, QuestionAnswerRequest, UserWait,
+};
+
+impl App {
+    pub(super) fn observe_questionnaire_input(&mut self, event: &crossterm::event::Event) {
+        if let Some(questionnaire) = self.questionnaire_mut() {
+            questionnaire.observe_input(event);
+        }
+    }
+
+    pub(super) fn questionnaire_timeout_running(&self) -> bool {
+        matches!(self.input_ui.composer(), ComposerMode::Questionnaire(questionnaire) if questionnaire.timeout_running())
+    }
+
+    pub(super) fn tick_questionnaire_timeout(&mut self) -> bool {
+        let Some(display) = self.questionnaire_mut().and_then(|questionnaire| {
+            questionnaire.submit_timeout_if_due(std::time::Instant::now())
+        }) else {
+            return false;
+        };
+        self.input_ui.take_composer();
+        self.clear_submitted_input();
+        self.insert_entry(&Entry::Notice(display));
+        self.set_status("fallback answers submitted");
+        true
+    }
+
+    /// Questionnaires own editing, but allow read-only transcript inspection
+    /// in both idle and running turns. Never route through the full composer
+    /// handler here: it can queue input, paste, or change model state.
+    pub(super) fn handle_questionnaire_transcript_key<B: Backend>(
+        &mut self,
+        key: KeyEvent,
+        terminal: &mut Terminal<B>,
+    ) -> anyhow::Result<bool> {
+        if !matches!(self.input_ui.composer(), ComposerMode::Questionnaire(_))
+            || !self
+                .info
+                .runtime
+                .keybindings
+                .toggle_tool_output
+                .matches(key)
+        {
+            return Ok(false);
+        }
+        self.toggle_latest_tool_output(terminal)?;
+        self.input_ui.clear_paste_burst();
+        self.ctrl_c_streak = 0;
+        Ok(true)
+    }
+
+    pub(super) fn handle_questionnaire_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        if !matches!(self.input_ui.composer(), ComposerMode::Questionnaire(_)) {
+            return Ok(false);
+        }
+
+        match (key.modifiers, key.code) {
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
+                if self.ctrl_c_streak == 0 {
+                    if let Some(questionnaire) = self.questionnaire_mut() {
+                        questionnaire.clear_active_answer();
+                    }
+                    self.set_status("answer cleared; press ctrl-c again to cancel");
+                    self.ctrl_c_streak = 1;
+                } else {
+                    self.cancel_questionnaire_answer();
+                }
+            }
+            (KeyModifiers::ALT, KeyCode::Up) | (_, KeyCode::BackTab) => {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.move_to_previous_field();
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (KeyModifiers::ALT, KeyCode::Down) | (_, KeyCode::Tab) => {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.move_to_next_field();
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (KeyModifiers::ALT, KeyCode::Backspace) => {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.delete_previous_word();
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                let action = match self.questionnaire_mut() {
+                    Some(questionnaire) => questionnaire.confirm_active_question(),
+                    None => unreachable!("questionnaire mode checked before key handling"),
+                };
+                match action {
+                    QuestionnaireEnterAction::Advance => {}
+                    QuestionnaireEnterAction::Submit => self.submit_questionnaire_answer(),
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (_, KeyCode::Esc) => {
+                self.cancel_questionnaire_answer();
+                self.ctrl_c_streak = 0;
+            }
+            (_, KeyCode::Up) => {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.move_up();
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (_, KeyCode::Down) => {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.move_down();
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (_, KeyCode::Backspace) => {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.backspace();
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (_, KeyCode::Delete) => {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.delete();
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (KeyModifiers::ALT, KeyCode::Left) => {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.move_text_cursor_previous_word();
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (KeyModifiers::ALT, KeyCode::Right) => {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.move_text_cursor_next_word();
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (_, KeyCode::Left) => {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.move_cursor_left();
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (_, KeyCode::Right) => {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.move_cursor_right();
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (_, KeyCode::Home) => {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.move_cursor_home();
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (_, KeyCode::End) => {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.move_cursor_end();
+                }
+                self.ctrl_c_streak = 0;
+            }
+            _ if self.info.runtime.keybindings.insert_newline.matches(key)
+                || self.info.runtime.keybindings.queue_prompt_matches(key) =>
+            {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.insert_char('\n');
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (modifiers, KeyCode::Enter) if modifiers.contains(KeyModifiers::SHIFT) => {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.insert_char('\n');
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (_, KeyCode::Char(' ')) => {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    if questionnaire.active_text_entry_active() {
+                        questionnaire.insert_char(' ');
+                    } else {
+                        questionnaire.toggle_active_choice();
+                    }
+                }
+                self.ctrl_c_streak = 0;
+            }
+            (modifiers, KeyCode::Char(ch))
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(questionnaire) = self.questionnaire_mut() {
+                    questionnaire.insert_char(ch);
+                }
+                self.ctrl_c_streak = 0;
+            }
+            _ => {
+                self.ctrl_c_streak = 0;
+            }
+        }
+        self.input_ui.clear_paste_burst();
+        Ok(true)
+    }
+
+    /// Applies a click on a tab chip or choice row. A double click confirms
+    /// like Enter: it advances, or submits on the last question.
+    pub(super) fn click_questionnaire(&mut self, target: QuestionnaireTarget, click: ChoiceClick) {
+        let Some(questionnaire) = self.questionnaire_mut() else {
+            return;
+        };
+        let action = match target {
+            QuestionnaireTarget::Question(index) => {
+                questionnaire.focus_question(index);
+                None
+            }
+            QuestionnaireTarget::Choice { index, .. } => {
+                questionnaire.click_choice(index);
+                match click {
+                    ChoiceClick::Single => None,
+                    ChoiceClick::Double => Some(questionnaire.confirm_active_question()),
+                }
+            }
+        };
+        match action {
+            None | Some(QuestionnaireEnterAction::Advance) => {}
+            Some(QuestionnaireEnterAction::Submit) => self.submit_questionnaire_answer(),
+        }
+    }
+
+    fn questionnaire_mut(&mut self) -> Option<&mut QuestionnaireComposer> {
+        match self.input_ui.composer_mut() {
+            ComposerMode::Questionnaire(questionnaire) => Some(questionnaire),
+            _ => None,
+        }
+    }
+
+    fn submit_questionnaire_answer(&mut self) {
+        let ComposerMode::Questionnaire(mut questionnaire) = self.input_ui.take_composer() else {
+            return;
+        };
+        match questionnaire.submit() {
+            Ok(submitted) => {
+                self.clear_submitted_input();
+                self.set_status("answers submitted");
+                self.insert_entry(&Entry::User(submitted.display));
+            }
+            Err(error) => {
+                self.input_ui
+                    .set_composer(ComposerMode::Questionnaire(questionnaire));
+                self.set_status(error);
+            }
+        }
+    }
+
+    fn cancel_questionnaire_answer(&mut self) {
+        let ComposerMode::Questionnaire(mut questionnaire) = self.input_ui.take_composer() else {
+            return;
+        };
+        questionnaire.cancel_by_user();
+        self.ctrl_c_streak = 0;
+        self.clear_submitted_input();
+        self.set_status("answer cancelled");
+    }
+
+    pub(super) async fn open_questionnaire(
+        &mut self,
+        request: QuestionAnswerRequest,
+    ) -> std::io::Result<()> {
+        self.finish_streams();
+        // Snapshot the user-owned policy at open, not when the model starts the tool.
+        // A config read failure must never enable automatic answers.
+        let timeout_seconds = self
+            .info
+            .services
+            .config_repository
+            .load()
+            .map(|config| config.questionnaire.timeout_seconds)
+            .unwrap_or_default();
+        self.clear_submitted_input();
+        let notice = request
+            .notice
+            .unwrap_or_else(|| questionnaire_notice_text(&request.request));
+        self.insert_entry(&Entry::Notice(notice));
+        let mut composer = QuestionnaireComposer::new(request.request, request.response);
+        composer.start_timeout(timeout_seconds, std::time::Instant::now());
+        self.input_ui
+            .set_composer(ComposerMode::Questionnaire(composer));
+        self.set_status(UserWait::Questionnaire.message());
+        self.wait_for_user(UserWait::Questionnaire).await;
+        Ok(())
+    }
+}

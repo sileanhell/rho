@@ -1,0 +1,689 @@
+use std::{
+    collections::VecDeque,
+    future::Future,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
+use questionnaire::QuestionnaireCancelReason;
+use synced_backend::{repaint_after_resize, DefaultTerminal};
+use tokio::sync::oneshot;
+mod activity;
+mod add_dir_command;
+mod advisor_command;
+mod advisor_reasoning;
+mod advisor_status;
+mod agent_creator_command;
+mod agent_delete;
+mod agent_editor;
+mod agent_picker;
+mod agent_tools_picker;
+mod app_construct;
+mod app_state;
+mod approval;
+mod attach_picker;
+pub(crate) mod attachment;
+mod background_polls;
+mod background_tasks;
+mod cache_stats;
+mod cache_warm;
+mod click_sequence;
+mod clipboard;
+mod codemode_command;
+mod command_actions;
+mod command_block;
+mod command_palette;
+mod compact_work;
+mod compaction_config;
+mod compaction_display;
+mod composer;
+mod composer_attachments;
+mod composer_buffer;
+mod composer_chrome;
+mod composer_history;
+mod composer_pointer;
+mod composer_undo;
+mod composer_vim;
+mod computer_command;
+mod computer_overlay;
+mod config_actions;
+mod config_editor;
+mod config_input;
+mod config_picker;
+mod config_row;
+mod context_handoff;
+mod context_overlay;
+mod copy_interaction;
+mod diff_pane;
+mod diff_viewer;
+mod divider;
+mod doctor_overlay;
+mod drag_selection;
+pub(crate) mod event_adapter;
+mod external_editor;
+mod external_login;
+mod fast_command;
+mod feed_image;
+mod file_palette;
+mod file_picker;
+mod first_run;
+mod frame_context;
+mod frame_scheduler;
+mod goal;
+mod line_editor;
+mod line_editor_view;
+mod panel_overlay;
+mod subagent_inbox;
+mod subagent_questionnaires;
+mod text_input;
+mod text_view_overlay;
+mod web_search_config;
+
+fn plural_suffix(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+pub(crate) use first_run::SetupEntry;
+pub(crate) use goal::GOAL_JUDGE_PROMPT;
+mod antigravity_login;
+
+mod chat_media;
+mod choice_actions;
+mod chrome_pointer;
+
+mod composer_layout;
+mod copy_actions;
+mod cursor_login;
+mod cursor_model_picker;
+mod custom_provider_login;
+mod during_turn;
+mod exclusive_screen;
+mod exit_receipt;
+mod goal_command;
+mod help_picker;
+mod herdr_resume;
+mod history_cache;
+mod history_soft_settings;
+mod hook_actions;
+mod hooks_overlay;
+mod info_command;
+mod info_overlay;
+mod init_command;
+mod inline_choice;
+mod inline_prompt_input;
+pub(crate) use inline_prompt_input::InlinePromptInput;
+mod inline_shell;
+mod inline_shell_config;
+mod keybindings;
+mod keyboard_modes;
+mod limits_command;
+mod local_commands;
+mod local_diff;
+mod login;
+mod login_flow;
+mod login_pending;
+mod login_presentation;
+mod login_secret_input;
+mod login_target;
+pub(crate) mod managed_shell;
+mod markdown;
+mod markdown_image;
+mod mcp_actions;
+mod mcp_argument_completion;
+mod mcp_picker;
+mod mcp_prompt;
+mod mcp_resource;
+mod media_attach;
+mod message_history;
+mod message_render;
+mod model_actions;
+mod model_cycle;
+mod model_performance;
+mod model_picker;
+pub(crate) mod model_prompt_picker;
+mod models_dev_actions;
+mod mouse;
+mod mouse_capture;
+mod notification_card_render;
+mod notifications;
+mod overlay_panel;
+mod palette;
+mod palette_pointer;
+mod panel_pointer;
+mod panel_text;
+mod paste_burst;
+mod paste_mode;
+mod pending_input;
+mod permission_mode;
+mod picker;
+mod picker_actions;
+mod plan_exit;
+mod pointer_actions;
+mod process_panel;
+mod process_peek;
+mod program_status;
+mod prompt_history;
+mod prompt_history_search;
+mod prompt_turn;
+mod provider_actions;
+mod provider_attempt;
+mod provider_picker;
+mod questionnaire;
+mod questionnaire_input;
+mod reasoning_metadata;
+mod remember_command;
+mod render;
+mod rendered_entry;
+mod run_lifecycle;
+mod screen_layout;
+mod screen_model;
+mod scrollbar;
+mod send_confirm;
+mod session_actions;
+mod session_picker;
+mod session_title;
+mod sessions_hub;
+mod sessions_hub_groups;
+mod sessions_hub_tasks;
+mod setup_screen;
+mod shell_palette;
+mod side_chat;
+mod spend_overlay;
+mod spend_view;
+mod stacked_rail;
+mod syntax;
+mod syntax_warmup;
+mod todo_overlay;
+pub(crate) use syntax_warmup::spawn_syntax_warmup;
+pub(in crate::tui) mod terminal_graph;
+mod transcript_events;
+mod transcript_search;
+pub(crate) use session_title::SESSION_TITLE_PROMPT;
+mod app_loop;
+mod idle_input;
+mod reasoning_phase;
+mod rewind_actions;
+mod skill_actions;
+mod skill_mention_completion;
+mod skill_picker;
+mod startup_prompt;
+// Always compiled: display_version() is used in release TUI chrome.
+// Matrix/herdr injection paths stay no-ops outside debug builds.
+mod github_pr;
+mod smoke_injection;
+mod status_overlay;
+mod statusline;
+pub(in crate::tui) use statusline::reasoning_is_configurable;
+mod stream;
+mod stream_pace;
+mod stream_preview;
+mod streaming_mode;
+mod subagent_attach;
+mod subagent_delivery;
+mod subagent_panel;
+mod synced_backend;
+mod terminal_events;
+mod terminal_probe;
+mod terminal_session;
+mod text_selection;
+mod theme;
+mod theme_actions;
+mod theme_picker;
+mod theme_scheme;
+mod theme_terminal;
+mod tool_call_batch;
+mod tool_card_hover;
+mod tool_card_render;
+mod tool_code;
+mod tool_diff;
+mod tool_output_ui;
+mod tool_search;
+mod tree_actions;
+mod turn_prompt;
+mod usage_cost;
+mod view;
+mod view_composer;
+mod view_scroll;
+mod workflow_hub;
+mod workflow_panel;
+// Separate full-screen mode for an active workflow run. The chat hub hands off
+// through terminal suspend when starting or resuming a run.
+pub(crate) mod workflow;
+mod workspace;
+mod zen_tool_run;
+
+mod types;
+use types::*;
+
+use activity::{ActivityPhase, ActivityStatus, BackgroundCounts, LoadingSpinner};
+use app_state::{HistoryUi, InputUi, PendingWorkUi, TurnUi};
+use approval::{approval_frame, ApprovalKeyOutcome};
+use chat_media::{
+    ChatMedia, ChatTextDocument, ComposerAttachment, MediaAttachId, PendingAttachmentSource,
+};
+use clipboard::Clipboard;
+use config_editor::{
+    config_number_input_frame, resolve_web_search_editor_value, ConfigNumberInput, ConfigNumberKey,
+    ConfigToggle,
+};
+use copy_interaction::CodeBlockCopyTarget;
+use event_adapter::{SdkEventAdapter, ViewEvent, ViewModelEvent};
+use feed_image::FeedImage;
+use frame_scheduler::FrameScheduler;
+use goal::GoalState;
+use inline_choice::{
+    InlineChoice, InlineChoiceKeyOutcome, InlineChoiceModal, InlineChoiceOption,
+    InlineChoicePending,
+};
+use paste_burst::PasteBurstEnter;
+use picker::{
+    sort_items_by_ascii_label, PickerBadge, PickerBadgePlacement, PickerBadgeTone, PickerCursor,
+    PickerItem, PickerKeyHints, PickerLayout, RowDeleteKeys, TabKey, UiPicker,
+};
+use process_panel::ProcessPanel;
+use prompt_turn::FailedTurn;
+use questionnaire::{
+    questionnaire_frame, questionnaire_notice_text, QuestionAnswerRequest, QuestionnaireReply,
+    QuestionnaireResponseChannel,
+};
+use render::{
+    display_width, input_frame, list_picker_frame, session_header_lines, styled_line,
+    tool_entry_lines, truncate_one_line, InputFrame, LineFill,
+};
+use scrollbar::HistoryScrollbar;
+use session_title::PendingSessionTitle;
+use statusline::{GoalStatus, StatusLine};
+use subagent_panel::SubagentPanel;
+use terminal_session::TerminalSession;
+use text_selection::{highlight_selection, render_copy_notice, TextSelection};
+use theme::Theme;
+use turn_prompt::TurnPrompt;
+use workflow_panel::WorkflowPanel;
+
+use {
+    crate::app::config_repository::ConfigRepository,
+    crate::app::interactive_runtime::InteractiveRuntime,
+    crate::commands::{self, CommandId, CommandInvocation},
+    crate::herdr::{HerdrReporter, HerdrState},
+    crate::keybindings::Keybindings,
+    crate::permission::PermissionMode,
+    crate::session::Session,
+    rho_providers::credentials::CredentialStore,
+    rho_providers::model::{
+        catalog::{self, LoginTarget, ModelSelection},
+        favorites,
+        provider_models::refresh_provider_models_with_store,
+        ContentBlock, Message, ModelMetadata, ReasoningRequestSource, UnavailableProvider,
+    },
+    rho_providers::provider,
+    rho_providers::reasoning::ReasoningLevel,
+};
+/// Viewport height used by line-level tests that render without a real terminal.
+#[cfg(test)]
+const DEFAULT_TUI_HEIGHT: u16 = 18;
+const MAX_COMMAND_SUGGESTIONS: usize = 5;
+const MIN_COMMAND_DESCRIPTION_WIDTH: usize = 7;
+/// Shared cadence for releasing held stream text and refreshing partial previews.
+const STREAM_UI_TICK: Duration = Duration::from_millis(24);
+const STREAM_PREVIEW_MIN_CHARS: usize = 2;
+const HISTORY_SCROLLBAR_REVEAL_DURATION: Duration = Duration::from_millis(1200);
+pub(in crate::tui) const HISTORY_MOUSE_SCROLL_LINES: usize = 3;
+pub struct TuiBootstrap {
+    pub runtime: RuntimeModelView,
+    pub session: SessionBootstrap,
+    pub services: ApplicationServices,
+}
+
+pub struct RuntimeModelView {
+    pub cwd: PathBuf,
+    pub provider: String,
+    pub model: String,
+    pub(crate) model_aliases: crate::model_aliases::ModelAliases,
+    pub reasoning: ReasoningLevel,
+    pub service_tier: Option<rho_sdk::model::ServiceTier>,
+    pub reasoning_source: ReasoningRequestSource,
+    pub permission_mode: PermissionMode,
+    /// Mirror of the live session's added workspace directories, synced after
+    /// `/add-dir`, `/new`, and `/resume`.
+    pub(crate) added_dirs: crate::added_dirs::AddedDirs,
+    pub show_reasoning_output: bool,
+    pub zen_mode: bool,
+    /// Offer the advisor tool, backed by the `advisor` internal agent's model.
+    pub advisor_mode: bool,
+    /// Show a transcript notice after a turn that re-billed a large uncached prompt.
+    pub cache_miss_notices: bool,
+    /// Live mirror of `behavior.keep_cache_warm`. Turning it off stops any
+    /// active warming at once; the `keep_warm` tool parameter follows on restart.
+    pub keep_cache_warm: bool,
+    /// Resolved cache lifetime for the active provider, shared by scheduling and notices.
+    pub prompt_cache_ttl: Duration,
+    /// Show the keyboard hint block in the session header.
+    pub show_header_hints: bool,
+    /// Notify through the terminal when a turn finishes or needs the user
+    /// while the terminal is unfocused. Ignored under Herdr.
+    pub notifications: bool,
+    pub auth: String,
+    pub internal_agents:
+        std::collections::BTreeMap<String, crate::config::InternalAgentModelConfig>,
+    pub favorite_models: Vec<String>,
+    pub max_tool_output_lines: usize,
+    pub keybindings: Keybindings,
+    /// Inline `[prompt_templates]` from config, overriding live-discovered files
+    /// with the same name; see `App::prompt_templates`.
+    pub config_prompt_templates: crate::prompt_templates::PromptTemplates,
+    /// Home root for template discovery, injected so tests never read user files.
+    pub prompt_template_home: Option<PathBuf>,
+}
+
+/// How reasoning appears in the transcript for the current display settings.
+///
+/// Zen and `show_reasoning_output` collapse into one exclusive policy so call
+/// sites never invert complementary booleans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReasoningChrome {
+    /// Stream and store reasoning text in the transcript.
+    FullText,
+    /// Suppress reasoning text; show live `Thinking...` while the stretch is open.
+    ThinkingPlaceholder,
+    /// Suppress reasoning text and `Thinking...` (zen mode).
+    Hidden,
+}
+
+impl RuntimeModelView {
+    fn model_call_profile(&self) -> rho_sdk::ModelCallProfile {
+        rho_sdk::ModelCallProfile {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            reasoning: self.reasoning,
+            service_tier: self.service_tier,
+        }
+    }
+
+    /// Exclusive reasoning display policy for the current session settings.
+    pub(crate) fn reasoning_chrome(&self) -> ReasoningChrome {
+        if self.zen_mode {
+            ReasoningChrome::Hidden
+        } else if self.show_reasoning_output {
+            ReasoningChrome::FullText
+        } else {
+            ReasoningChrome::ThinkingPlaceholder
+        }
+    }
+
+    /// Whether the TUI should render reasoning text for this session.
+    pub(crate) fn displays_reasoning_output(&self) -> bool {
+        matches!(self.reasoning_chrome(), ReasoningChrome::FullText)
+    }
+
+    /// Whether tool cards and reasoning blocks are visible in the transcript.
+    ///
+    /// Zen mode suppresses that work chrome while keeping the live activity rail
+    /// and live subagent or process rows so the session still shows progress. Reasoning text vs
+    /// `Thinking...` vs neither is [`Self::reasoning_chrome`].
+    pub(crate) fn shows_work_chrome(&self) -> bool {
+        !self.zen_mode
+    }
+
+    pub(crate) fn history_render_settings(
+        &self,
+        width: usize,
+        max_image_height: u16,
+    ) -> history_cache::HistoryRenderSettings {
+        history_cache::HistoryRenderSettings {
+            width,
+            max_tool_output_lines: self.max_tool_output_lines,
+            zen_mode: self.zen_mode,
+            show_reasoning_output: self.show_reasoning_output,
+            theme_generation: theme::Theme::generation(),
+            max_image_height,
+        }
+    }
+
+    fn fast_mode_active(&self) -> bool {
+        self.service_tier == Some(rho_sdk::model::ServiceTier::Priority)
+            && rho_providers::providers::fast_mode::supports_fast_mode(
+                &self.provider,
+                &self.model,
+                &self.auth,
+            )
+    }
+}
+
+pub struct SessionBootstrap {
+    /// Invocation-wide policy, retained when starting a new conversation.
+    pub no_save: bool,
+    pub session_id: Option<String>,
+    /// Take-once startup buffer. `insert_recovered_history` converts this into
+    /// transcript entries and drops the `Message` vec.
+    pub recovered_messages: Vec<Message>,
+    pub open_resume_picker: bool,
+    /// Launch options the Herdr resume command repeats.
+    pub resume_launch: ResumeLaunchOptions,
+    /// Take-once CLI prompt. After the first frame, the TUI submits it as the
+    /// first turn once the composer is free.
+    pub startup_prompt: Option<String>,
+}
+
+pub struct ApplicationServices {
+    pub(crate) config_repository: ConfigRepository,
+    /// Theme id from the already-loaded startup config, so the TUI does not
+    /// re-read and re-parse the config file for one field.
+    pub(crate) theme: String,
+    /// Set when this launch should open the first-run setup screen, and at
+    /// which step. `None` for a returning session.
+    pub(crate) first_run: Option<first_run::SetupEntry>,
+    pub auth_unavailable: Option<String>,
+
+    pub pending_custom_models: Option<tokio::task::JoinHandle<()>>,
+    /// Bat grammar dump loading off the UI thread. First paint stays plain if
+    /// this is still running; completion rebuilds history so roles appear.
+    pub pending_syntax_warmup: Option<tokio::task::JoinHandle<()>>,
+    pub pending_prompt_history: Option<crate::prompt_history::PromptHistoryLoadHandle>,
+    pub diagnostics: crate::diagnostics::RuntimeDiagnostics,
+    pub herdr: HerdrReporter,
+}
+pub(crate) use attachment::{
+    run as run_attachment, translate_run_event, AttachmentDisplaySettings,
+};
+pub(crate) use exit_receipt::{print_exit_receipt, ExitReceipt};
+pub use herdr_resume::ResumeLaunchOptions;
+
+pub(crate) async fn run(
+    agent: &mut InteractiveRuntime,
+    info: TuiBootstrap,
+) -> anyhow::Result<Option<ExitReceipt>> {
+    let mut terminal = synced_backend::init();
+    let probe = terminal_probe::probe_terminal();
+    Theme::initialize_palette(probe.palette);
+    Theme::apply_committed(&info.services.theme);
+    let herdr = info.services.herdr.clone();
+    let result = {
+        let injected = smoke_injection::after_terminal_init();
+
+        match injected {
+            Ok(()) => {
+                let mut app = App::new(
+                    info,
+                    agent.mcp_report().clone(),
+                    agent.mcp_catalog().clone(),
+                    agent.plugins_report().clone(),
+                    probe
+                        .program_status
+                        .with_override(std::env::var("RHO_PROGRAM_STATUS").ok().as_deref()),
+                );
+                app.spawn_initial_herdr_report();
+                app.terminal_session = Some(TerminalSession::acquire());
+                if let Some(manager) = agent.subagents() {
+                    app.subagent_inbox.bind(manager);
+                    let pool = manager.concurrency();
+                    app.info
+                        .services
+                        .diagnostics
+                        .update_agent_concurrency(pool.total_limit());
+                    app.agent_concurrency = Some(pool);
+                }
+                let (result, mut program_status) = app.run(&mut terminal, agent).await;
+                // Teardown must clear the terminal record even when the loop
+                // exits through an error rather than its clean-return path.
+                if let Some(bytes) = program_status.clear() {
+                    notifications::write_to_terminal(&bytes);
+                }
+                if let Some(manager) = agent.subagents() {
+                    manager.unbind_host_input();
+                    manager.unbind_notices();
+                }
+                result
+            }
+            Err(error) => Err(error),
+        }
+    };
+    let _ = herdr.release().await;
+    ratatui::restore();
+    result
+}
+
+struct App {
+    info: TuiBootstrap,
+    terminal_session: Option<TerminalSession>,
+    statusline: StatusLine,
+    subagent_panel: SubagentPanel,
+    process_panel: ProcessPanel,
+    workflow_panel: WorkflowPanel,
+    subagent_inbox: subagent_inbox::SubagentInbox,
+    /// Live delegated-agent cap, shared with the executor so `/config` can resize it.
+    agent_concurrency: Option<crate::app::agent_concurrency::AgentConcurrency>,
+    pending_subagent_questionnaire: Option<PendingSubagentQuestionnaire>,
+    input_ui: InputUi,
+    /// Palette match caches shared by keystroke and render paths.
+    palette_caches: palette::PaletteCaches,
+    /// Tiny disappearing feedback toast. Write only through [`App::set_status`]
+    /// / [`App::notify_status`].
+    status_overlay: Option<status_overlay::StatusOverlay>,
+    /// Last status text for callers that inspect mode feedback.
+    last_status: String,
+    /// Who owns `last_status`, so a poll can retire its own message.
+    status_source: StatusSource,
+    should_quit: bool,
+    ctrl_c_streak: u8,
+    /// Set when a provider turn finished while history was scrolled away from
+    /// the bottom, so the jump chip can flag the response until the user
+    /// returns to bottom or the next turn starts.
+    turn_finished_attention: bool,
+    streams: StreamUi,
+    turn: TurnUi,
+    image_picker: Option<ratatui_image::picker::Picker>,
+    pending: PendingWorkUi,
+    pending_inline_shells: Vec<inline_shell::PendingShellTask>,
+    deferred_inline_shell_context: Vec<inline_shell::DeferredShellContext>,
+    goal: Option<GoalState>,
+    history: HistoryUi,
+    credential_store: Arc<dyn CredentialStore>,
+    available_auths: Vec<String>,
+    using_unavailable_provider: bool,
+    /// Who owns the full terminal. Setup and attach replace session chrome.
+    exclusive: exclusive_screen::ExclusiveOccupant,
+    /// Background task handles; see `background_tasks`.
+    tasks: background_tasks::BackgroundTasks,
+    /// `/info` opened while a turn was still writing the tree. Start the read
+    /// once the session is idle again, if the overlay is still open.
+    info_tree_deferred: bool,
+    /// Last `/spend` reports; outlives the overlay.
+    spend: spend_overlay::SpendCache,
+    usage_limits_live: std::collections::BTreeMap<
+        crate::usage_limits::UsageProviderKind,
+        limits_command::LiveUsage,
+    >,
+    /// Open `/diff` popup state; dropped once its picker closes.
+    diff_viewer: Option<diff_viewer::DiffViewer>,
+    web_search_reload_pending: bool,
+    compaction_reload_pending: bool,
+    /// Set when classifier settings were saved without the agent at hand;
+    /// see [`App::apply_pending_classifier_config`].
+    classifier_config_sync_pending: bool,
+    /// Built on first `/limits` use; constructing a client loads TLS roots,
+    /// which startup should not pay for a feature that may never run.
+    usage_limits_client: std::sync::OnceLock<reqwest::Client>,
+    usage: UsageUi,
+    model_metadata: Option<ModelMetadata>,
+    prompt_history: prompt_history::PromptHistory,
+    /// Turns held until MCP connect settles.
+    held_turns: VecDeque<idle_input::HeldTurn>,
+    compact_follow_up: compact_work::CompactFollowUp,
+    /// Work made runnable by compact settlement. A confirmed send remains a
+    /// distinct owned submission rather than being cloned into the edit queue.
+    start_follow_ups: Option<compact_work::ReadyFollowUp>,
+    /// "Send for this session" consent; see [`send_confirm::SendOmissions::covers`].
+    acknowledged_send_omissions: Option<send_confirm::SendOmissions>,
+    /// Paste-code OAuth login awaiting its `code#state` paste; the composer
+    /// holds a `TextInputTarget::LoginCode` while this owns the exchange.
+    pending_login_code: Option<login_pending::PendingLoginCode>,
+    pending_model_selection: Option<InteractiveModelSelection>,
+    pending_permission_mode: Option<crate::permission::PermissionMode>,
+    /// Explicit all/pinned choice from the scope-toggle key. `None` means
+    /// prefer pinned, falling back to all when no pin has auth.
+    model_picker_scope_override: Option<model_picker::ModelPickerScope>,
+    internal_agent_model_target: Option<agent_picker::AgentModelTarget>,
+    /// Set when the user dismisses the startup Auto classifier picker. The next
+    /// idle reconcile demotes Auto → Supervised so cancel stays sync and never
+    /// needs an optional runtime handle on shared picker Esc paths.
+    pending_auto_classifier_demote: bool,
+    agent_editor_session: Option<agent_editor::AgentEditSession>,
+    sessions_hub_state: sessions_hub::SessionsHubState,
+    /// Session list or delete running off the event loop.
+    pending_sessions_task: Option<sessions_hub_tasks::PendingSessionsTask>,
+    pending_session_title: Option<PendingSessionTitle>,
+    /// Set by `/title` so auto-title generation cannot overwrite a manual name.
+    session_title_locked: bool,
+    /// Latest native checklist, mirrored for commands while a turn is running.
+    todo_list: Option<crate::tools::todo::TodoList>,
+    clipboard: Box<dyn Clipboard + Send>,
+    media_attach_tasks: Vec<media_attach::MediaAttachTask>,
+    /// Shared composer attachment layout for the current frame/width.
+    composer_attachment_layout_cache: Option<composer_attachments::ComposerAttachmentLayoutCache>,
+
+    /// `/attach` starts on running runs; Ctrl-R includes finished transcripts.
+    attach_run_filter: attach_picker::WorkspaceRunFilter,
+    /// Disk listing captured when `/attach` opens so panel ticks only rematch live rows.
+    attach_disk_candidates: Vec<attach_picker::AttachCandidate>,
+    /// Run ids seen on the live panel while the picker is open.
+    attach_seen_live: std::collections::HashSet<String>,
+    last_mouse_position: Option<(u16, u16)>,
+    /// Screen-space drag selection for text outside the history area.
+    screen_selection: Option<TextSelection>,
+    /// MCP inventory for `/mcp` and `/doctor` (session snapshot from tool assembly).
+    mcp_report: crate::tools::mcp::McpSessionReport,
+    /// Recovered history rendered before deferred MCP servers connected.
+    provisional_history: Option<message_history::ProvisionalHistory>,
+    computer_use: Option<crate::tools::computer_use::ComputerUseControl>,
+    /// Prompts and resources connected MCP servers offer, for palette matching.
+    mcp_catalog: crate::tools::mcp::McpCatalog,
+    /// Fetched argument suggestions for the MCP prompt being typed, so palette
+    /// matching reads a local cache instead of awaiting a server.
+    mcp_argument_completions: mcp_argument_completion::McpArgumentCompletions,
+    /// Agent Plugins load report captured at session start for `/doctor`.
+    plugins_report: crate::plugins::PluginLoadReport,
+    /// In-memory `/side` aside. Survives overlay close until `/new` or resume.
+    side_chat: Option<side_chat::SideChat>,
+    /// What Herdr last heard about the session, so idle changes are re-sent.
+    herdr_sync: herdr_resume::HerdrSync,
+    notifier: notifications::TerminalNotifier,
+    /// OSC 7501 reports; see `program_status`.
+    program_status: program_status::ProgramStatusReporter,
+    /// Last turn outcome, deferred until the event loop rests on input.
+    settled_program_status: program_status::ProgramStatus,
+}
+
+struct PendingSubagentQuestionnaire {
+    run_id: String,
+    agent_id: String,
+    reply_rx: oneshot::Receiver<QuestionnaireReply>,
+    response_tx: tokio::sync::oneshot::Sender<Result<rho_sdk::HostInputResponse, rho_sdk::Error>>,
+}

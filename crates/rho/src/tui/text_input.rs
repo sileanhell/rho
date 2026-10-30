@@ -1,0 +1,153 @@
+//! Overlay single-line text input for config keys and agent fields.
+
+use rho_providers::credentials::WebSearchCredential;
+
+use super::{
+    line_editor::LineEditor,
+    line_editor_view::EditorPresentation,
+    picker::UiPicker,
+    view_composer::{editor_frame, ComposerFrame},
+    web_search_config::WebSearchUrlField,
+};
+
+/// Which overlay owns a [`TextInput`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum TextInputTarget {
+    ConfigApiKey(WebSearchCredential),
+    ConfigUrl(WebSearchUrlField),
+    AgentField(AgentField),
+    /// One step of the `/login` endpoint wizard, which owns its own state.
+    CustomHost(super::custom_provider_login::CustomHostStep),
+    /// `code#state` paste for an OAuth login whose page shows the code
+    /// instead of redirecting locally.
+    LoginCode(&'static str),
+}
+
+/// Editable agent frontmatter fields that use the shared line editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AgentField {
+    Description,
+    Model,
+    Provider,
+    Tools,
+}
+
+impl AgentField {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Description => "description",
+            Self::Model => "model",
+            Self::Provider => "provider",
+            Self::Tools => "tools",
+        }
+    }
+
+    /// Stable picker item value used to restore position after a text edit.
+    pub(super) const fn value(self) -> &'static str {
+        match self {
+            Self::Description => "agent_field:description",
+            Self::Model => "agent_field:model",
+            Self::Provider => "agent_field:provider",
+            Self::Tools => "agent_field:tools",
+        }
+    }
+}
+
+/// Shared unmasked/masked single-line overlay input.
+#[derive(Clone, Debug)]
+pub(super) struct TextInput {
+    pub(super) target: TextInputTarget,
+    pub(super) editor: LineEditor,
+}
+
+impl TextInput {
+    pub(super) fn config_api_key(credential: WebSearchCredential, value: Option<String>) -> Self {
+        Self {
+            target: TextInputTarget::ConfigApiKey(credential),
+            editor: LineEditor::new(value.unwrap_or_default()),
+        }
+    }
+
+    pub(super) fn config_url(field: WebSearchUrlField, value: impl Into<String>) -> Self {
+        Self {
+            target: TextInputTarget::ConfigUrl(field),
+            editor: LineEditor::new(value),
+        }
+    }
+
+    pub(super) fn agent_field(field: AgentField, value: impl Into<String>) -> Self {
+        Self {
+            target: TextInputTarget::AgentField(field),
+            editor: LineEditor::new(value),
+        }
+    }
+
+    /// A wizard step, seeded with `value` so a rejected entry is not discarded.
+    pub(super) fn custom_host(
+        step: super::custom_provider_login::CustomHostStep,
+        value: impl Into<String>,
+    ) -> Self {
+        Self {
+            target: TextInputTarget::CustomHost(step),
+            editor: LineEditor::new(value),
+        }
+    }
+
+    /// Paste-code OAuth code entry.
+    pub(super) fn login_code(code_label: &'static str) -> Self {
+        Self {
+            target: TextInputTarget::LoginCode(code_label),
+            editor: LineEditor::new(String::new()),
+        }
+    }
+
+    pub(super) fn with_return_picker(mut self, picker: UiPicker) -> Self {
+        self.editor = self.editor.with_return_picker(picker);
+        self
+    }
+
+    pub(super) fn take_return_picker(&mut self) -> Option<UiPicker> {
+        self.editor.take_return_picker()
+    }
+
+    fn presentation(&self) -> EditorPresentation {
+        match self.target {
+            TextInputTarget::ConfigApiKey(_) => EditorPresentation::Masked,
+            TextInputTarget::ConfigUrl(_)
+            | TextInputTarget::AgentField(_)
+            | TextInputTarget::CustomHost(_)
+            | TextInputTarget::LoginCode(_) => EditorPresentation::Plain,
+        }
+    }
+
+    pub(super) fn label(&self) -> &str {
+        match &self.target {
+            TextInputTarget::ConfigApiKey(credential) => credential.label(),
+            TextInputTarget::ConfigUrl(field) => field.label(),
+            TextInputTarget::AgentField(field) => field.label(),
+            TextInputTarget::CustomHost(step) => step.label(),
+            TextInputTarget::LoginCode(code_label) => code_label,
+        }
+    }
+
+    /// Footer verb for Enter. A wizard step advances; everything else saves.
+    fn confirm_verb(&self) -> &'static str {
+        match &self.target {
+            TextInputTarget::CustomHost(_) => "Enter continue",
+            TextInputTarget::LoginCode(_) => "Enter submit",
+            TextInputTarget::ConfigApiKey(_)
+            | TextInputTarget::ConfigUrl(_)
+            | TextInputTarget::AgentField(_) => "Enter save",
+        }
+    }
+}
+
+pub(super) fn text_input_frame(input: &TextInput, width: usize) -> ComposerFrame {
+    let prompt = format!(
+        "edit {}  {}",
+        input.label(),
+        super::composer_chrome::join_footer_parts([input.confirm_verb(), "Esc cancel"])
+    );
+    let presentation = input.presentation();
+    editor_frame(&prompt, input.editor.viewport(presentation, width), width)
+}

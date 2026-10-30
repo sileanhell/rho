@@ -1,0 +1,71 @@
+Starlark in Rust
+================
+
+Workflow source parsing and prototype evaluation use starlark 0.14.2:
+
+  https://github.com/facebook/starlark-rust
+
+Copyright 2018 The Starlark in Rust Authors.
+Copyright (c) Meta Platforms, Inc. and affiliates.
+Licensed under the Apache License, Version 2.0:
+https://www.apache.org/licenses/LICENSE-2.0
+
+
+mermaid-rs-renderer
+===================
+
+Mermaid parsing and public intermediate-representation adaptation use
+mermaid-rs-renderer 0.3.1:
+
+  https://github.com/1jehuang/mermaid-rs-renderer/tree/v0.3.1
+
+Copyright (c) 2026 mermaid-rs-renderer contributors
+Licensed under the MIT License.
+
+
+Grok Build terminal Mermaid renderer
+====================================
+
+This product includes modified portions of the terminal Mermaid canvas,
+layout, routing, wrapping, and painter implementation from Grok Build:
+
+  https://github.com/xai-org/grok-build/blob/b189869b7755d2b482969acf6c92da3ecfeffd36/crates/codegen/xai-grok-markdown/src/mermaid.rs
+
+Copyright 2023-2026 SpaceXAI
+Licensed under the Apache License, Version 2.0:
+https://www.apache.org/licenses/LICENSE-2.0
+
+Rho's modifications replace the original Mermaid parser with adapters from
+mermaid-rs-renderer public parsed IR, separate validation and resource limits,
+and integrate the painter with Rho's panel, styling, caching, and fallback
+behavior.
+
+
+txm
+===
+
+Terminal LaTeX math layout and the Ratatui math widget use txm 0.1.6:
+
+  https://github.com/thatmagicalcat/txm
+
+Copyright (c) 2026 thatmagicalcat
+Licensed under the MIT License or Apache License, Version 2.0
+(https://www.apache.org/licenses/LICENSE-2.0).
+
+Rho paints the txm Ratatui widget into an off-screen buffer, then embeds the
+resulting Unicode art in Markdown history panels.
+
+
+two-face (bat syntax pack)
+==========================
+
+Fenced code-block highlighting loads extra syntect syntax definitions from
+two-face 0.5.x (the bat-derived dump), including TypeScript, TOML, Dockerfile,
+and related grammars:
+
+  https://codeberg.org/CosmicHarper/two-face
+  https://github.com/sharkdp/bat
+
+two-face is licensed under MIT OR Apache-2.0. Embedded syntax and theme assets
+retain their upstream licenses; see two-face's acknowledgement listing and
+bat's LICENSE and NOTICE files for the full set.

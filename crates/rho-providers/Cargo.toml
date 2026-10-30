@@ -1,0 +1,54 @@
+[package]
+name = "rho-providers"
+version = "2.24.0"
+edition = "2021"
+rust-version = "1.92"
+description = "Model provider runtimes, credentials, and model catalog for Rho"
+license = "MIT AND Apache-2.0"
+repository = "https://github.com/matthewyjiang/rho"
+
+[dependencies]
+rho-sdk = { version = "5.15.0", path = "../rho-sdk" }
+tokio = { version = "1", features = ["full"] }
+reqwest = { workspace = true }
+http = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+toml = "1.1"
+async-trait = "0.1"
+futures-util = "0.3"
+# Match the application's zip-enabled compression backend.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# Request bodies for hosts configured with `request_compression = "zstd"`.
+zstd = { version = "0.14", default-features = false }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+rustls = { workspace = true }
+rusqlite = { version = "0.40", features = ["fallible_uint"] }
+memchr = "2"
+libc = "0.2"
+rand = "0.10"
+sha2 = "0.11"
+hex = "0.4"
+base64 = "0.23"
+url = "2"
+webbrowser = "1"
+ssh-key = { version = "0.6", features = ["ed25519", "std", "alloc", "getrandom"] }
+signature = "2"
+gethostname = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
+
+[features]
+default = ["bundled-sqlite"]
+bundled-sqlite = ["rusqlite/bundled"]

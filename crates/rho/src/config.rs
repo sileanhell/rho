@@ -1,0 +1,996 @@
+use anyhow::Context;
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, fmt, fs, path::PathBuf, str::FromStr};
+
+use {
+    crate::compaction::CompactionConfig,
+    crate::credential_store::AppCredentialStore,
+    crate::keybindings::Keybindings,
+    crate::model_aliases::ModelAliases,
+    crate::paths,
+    crate::permission::PermissionMode,
+    crate::tools::mcp::config::McpConfig,
+    rho_providers::credentials::{
+        load_web_search_api_key, save_web_search_api_key, CredentialStore, WebSearchCredential,
+    },
+    rho_providers::model::catalog,
+    rho_providers::model::favorites::{favorite_model_values, normalized_favorite_models},
+    rho_providers::provider,
+    rho_providers::reasoning::ReasoningLevel,
+};
+
+#[path = "provider_config.rs"]
+mod provider_config;
+pub(crate) use provider_config::ensure_serves_chat;
+
+#[path = "config_streaming.rs"]
+mod streaming;
+pub use streaming::StreamingMode;
+
+#[path = "config_internal_agent.rs"]
+mod internal_agent;
+pub use internal_agent::{
+    InternalAgentModelConfig, InternalAgentTarget, ModelKind, RhoInternalAgentModel,
+};
+
+#[path = "config_format.rs"]
+mod format;
+use format::write_config;
+#[cfg(test)]
+pub use format::{EffectiveModelConfig, EffectiveModelSource};
+pub(crate) use format::{CURSOR_RUNTIME_KEY, RHO_RUNTIME_KEY};
+
+/// Non-fatal issue found while loading config.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigWarning {
+    Clamped {
+        key: &'static str,
+        from: String,
+        to: String,
+    },
+    Normalized {
+        key: &'static str,
+        from: String,
+        to: String,
+    },
+    Migrated {
+        key: &'static str,
+        from: String,
+        to: String,
+    },
+    /// A `[providers.custom.<name>]` table for the same host as a built-in
+    /// provider that later took its name. The built-in serves it now, so the
+    /// table is skipped.
+    ShadowedCustomProvider { name: String },
+}
+
+impl ConfigWarning {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Clamped { key, from, to } => {
+                format!("config `{key}` value {from} is out of range; using {to}")
+            }
+            Self::Normalized { key, from, to } => {
+                format!("config `{key}` value {from} is unsupported; using {to}")
+            }
+            Self::Migrated { key, from, to } => {
+                format!("config `{key}` {from} now maps to {to}")
+            }
+            Self::ShadowedCustomProvider { name } => format!(
+                "config `providers.custom.{name}` is ignored: {name} is now a built-in provider; remove the table"
+            ),
+        }
+    }
+}
+
+#[path = "config_web_search.rs"]
+mod web_search;
+pub(crate) use web_search::{
+    parse_search_endpoint_url, web_search_route, EXA_MCP_DEFAULT_URL, OPENAI_CODEX_RESPONSES_URL,
+};
+pub use web_search::{
+    ExaSearchConnection, OpenAiSearchConnection, SearchBackend, WebSearchMode, WebSearchRoute,
+    WebSearchSettings,
+};
+
+#[path = "config_load.rs"]
+mod load;
+
+pub(crate) use provider_config::ProviderConfigs;
+
+/// Keep in lockstep with [`rho_tools::DEFAULT_MAX_OUTPUT_BYTES`].
+pub(crate) const DEFAULT_MAX_OUTPUT_BYTES: usize = rho_tools::DEFAULT_MAX_OUTPUT_BYTES;
+pub(crate) const DEFAULT_PROMPT_HISTORY_LIMIT: usize = 1000;
+pub(crate) const MAX_PROMPT_HISTORY_LIMIT: usize = 10_000;
+/// Default live delegated-agent slots.
+///
+/// Receipt: 4 serialized a 6-way background fan-out behind a permit queue.
+/// 10 is the asked default; each slot is a full child agent, so this stays a
+/// tripwire rather than a hardware measurement.
+pub const DEFAULT_AGENT_CONCURRENCY: usize = 10;
+/// Named ceiling for `behavior.agent_concurrency`.
+///
+/// Receipt: generous versus the default of 10. A typo like 100000 must fail at
+/// check time instead of spawning. Raise this if a real workload hits it.
+pub const MAX_AGENT_CONCURRENCY: usize = 64;
+
+/// Persisted application configuration owned by `rho-coding-agent`.
+///
+/// This type is not part of the SDK contract. Convert it through
+/// `app::sdk_config::SdkBootstrapOptions`, then acquire credentials separately
+/// through the application credential adapter. Provider credentials are never
+/// stored in these fields; legacy web-search values are migrated to the OS
+/// credential store and redact their `Debug` representation.
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub questionnaire: QuestionnaireConfig,
+    pub codemode: CodemodeConfig,
+    pub provider: String,
+    pub model: String,
+    /// User-defined short names for concrete models; see `ModelAliases`.
+    pub model_aliases: ModelAliases,
+    /// Alias the current `provider`/`model` was resolved from, if any.
+    /// Consult it through `current_model_alias`, which drops it once the
+    /// selection no longer matches the alias table.
+    pub model_alias: Option<String>,
+    pub max_output_bytes: usize,
+    pub max_tool_output_lines: usize,
+    /// Sent composer prompts kept in the shared prompt-history database.
+    /// `0` disables persistence.
+    pub prompt_history_limit: usize,
+    pub auth: String,
+    pub reasoning: ReasoningLevel,
+    /// Faster serving for models that support `/fast`.
+    ///
+    /// Codex sends a priority service tier. xAI OAuth `grok-4.7` keeps that
+    /// model selected and sends `grok-4.7-build-fast`.
+    pub fast_mode: bool,
+    pub show_reasoning_output: bool,
+    /// Hide tool cards, reasoning, and activity chrome so only message text remains.
+    pub zen_mode: bool,
+    /// Reveal received text live, by paragraph, or at response completion.
+    pub output_streaming: StreamingMode,
+    /// Interactive TUI color theme id (`terminal`, built-in, or custom file stem).
+    pub theme: String,
+    pub auto_compact: bool,
+    pub compact_threshold_percent: u8,
+    pub compact_target_percent: u8,
+    /// Show a transcript notice after a turn that re-billed a large uncached prompt.
+    pub cache_miss_notices: bool,
+    /// Show the keyboard hint block in the session header. Signed-out sessions
+    /// keep their `/login` hints regardless.
+    pub show_header_hints: bool,
+    /// Notify through the terminal (OSC 9 or BEL) when a turn finishes or
+    /// needs the user while the terminal is unfocused. Ignored under Herdr.
+    pub notifications: bool,
+    /// Optional model selections for reserved internal agents, keyed by stable agent ID.
+    pub internal_agents: BTreeMap<String, InternalAgentModelConfig>,
+    pub favorite_models: Vec<String>,
+    /// Web-search mode, selected backend, and per-backend endpoints.
+    pub web_search: WebSearchSettings,
+    /// Attach xAI's hosted image generation tool on xAI create turns.
+    pub xai_image_generation: bool,
+    /// Selects the preferred built-in file edit tool exposed to models.
+    ///
+    /// [`EditTool::Auto`] resolves a concrete format from the active provider.
+    pub edit_tool: EditTool,
+    /// Selects the shell tool exposed to models (`bash` or `powershell`).
+    ///
+    /// [`ShellTool::Auto`] keeps the platform default. Applies when a session
+    /// binds its tools, so a running chat keeps the shell it started with.
+    pub shell_tool: ShellTool,
+
+    pub enable_subagents: bool,
+    /// Maximum delegated agents that may execute at once, including background.
+    pub agent_concurrency: usize,
+    /// Offer the `advisor` tool, which reviews the session with the model
+    /// configured for the `advisor` internal agent.
+    pub advisor_mode: bool,
+    /// Enables native-tool workspace checkpoints and `/rewind` (on by default).
+    pub workspace_rewind: bool,
+    /// Offer `keep_warm` on `process start`, letting the model keep the
+    /// provider prompt cache warm while it waits on a long background command.
+    pub keep_cache_warm: bool,
+    pub permission_mode: PermissionMode,
+    pub(crate) legacy_web_search_credentials: LegacyWebSearchCredentials,
+    pub rtk: bool,
+    pub inline_shell: String,
+    pub keybindings: Keybindings,
+    pub prompt_templates: crate::prompt_templates::PromptTemplates,
+    pub(crate) providers: ProviderConfigs,
+    pub(crate) mcp: McpConfig,
+    pub(crate) openapi: crate::tools::openapi::config::OpenApiConfig,
+}
+
+pub(crate) fn default_inline_shell() -> String {
+    if cfg!(windows) { "powershell" } else { "bash" }.into()
+}
+
+pub(super) fn inferred_provider_auth(
+    provider: &str,
+    current_provider: &str,
+    current_auth: &str,
+) -> String {
+    if provider == current_provider {
+        return current_auth.into();
+    }
+    provider::provider_descriptor(provider)
+        .map(|descriptor| descriptor.default_auth().id.into())
+        .unwrap_or_else(|| current_auth.into())
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        let compaction = CompactionConfig::default();
+        Self {
+            questionnaire: QuestionnaireConfig::default(),
+            codemode: CodemodeConfig::default(),
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            model_aliases: ModelAliases::default(),
+            model_alias: None,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            max_tool_output_lines: 10,
+            prompt_history_limit: DEFAULT_PROMPT_HISTORY_LIMIT,
+            auth: "api-key".into(),
+            reasoning: ReasoningLevel::Medium,
+            fast_mode: false,
+            show_reasoning_output: true,
+            zen_mode: false,
+            output_streaming: StreamingMode::default(),
+            theme: "terminal".into(),
+            auto_compact: compaction.auto_compact,
+            compact_threshold_percent: compaction.threshold_percent,
+            compact_target_percent: compaction.target_percent,
+            cache_miss_notices: false,
+            show_header_hints: true,
+            notifications: true,
+            internal_agents: BTreeMap::new(),
+            favorite_models: Vec::new(),
+            web_search: WebSearchSettings::default(),
+            xai_image_generation: true,
+            edit_tool: EditTool::default(),
+            shell_tool: ShellTool::default(),
+
+            enable_subagents: true,
+            agent_concurrency: DEFAULT_AGENT_CONCURRENCY,
+            advisor_mode: false,
+            workspace_rewind: true,
+            keep_cache_warm: true,
+            permission_mode: PermissionMode::Bypass,
+            legacy_web_search_credentials: LegacyWebSearchCredentials::default(),
+            rtk: true,
+            inline_shell: default_inline_shell(),
+            keybindings: Keybindings::default(),
+            prompt_templates: Default::default(),
+            providers: ProviderConfigs::default(),
+            mcp: McpConfig::default(),
+            openapi: Default::default(),
+        }
+    }
+}
+
+/// `[codemode]` settings, mirroring Pi's `codemode.mode`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodemodeConfig {
+    #[serde(default)]
+    pub mode: CodemodeMode,
+}
+
+impl CodemodeConfig {
+    pub(crate) fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// How the always-registered `codemode` tool presents other tools (Pi's
+/// `codemode.mode`). Neither mode changes authorization: nested calls follow
+/// `permission_mode`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodemodeMode {
+    /// Direct tools stay declared next to `codemode`; the model may use either.
+    #[default]
+    On,
+    /// Direct tools are hidden by default and reached through `codemode`, unless
+    /// top-level `tool_search` explicitly loads them for direct calls.
+    Only,
+}
+
+impl CodemodeMode {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "on" => Some(Self::On),
+            "only" => Some(Self::Only),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Only => "only",
+        }
+    }
+}
+
+/// User-owned timeout policy. Absence disables automatic questionnaire answers.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionnaireConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<std::num::NonZeroU64>,
+}
+
+impl QuestionnaireConfig {
+    pub(crate) fn is_disabled(&self) -> bool {
+        self.timeout_seconds.is_none()
+    }
+}
+
+/// Configured file-edit preference.
+///
+/// [`Self::Auto`] picks the preferred format for the active chat provider: a
+/// custom provider's `edit_tool` override if set, otherwise the built-in
+/// table. [`Self::Pinned`] freezes one [`rho_tools::EditFormat`] across
+/// provider changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EditTool {
+    /// Prefer the built-in format for the active provider.
+    #[default]
+    Auto,
+    /// Pin one concrete model-facing edit format.
+    Pinned(rho_tools::EditFormat),
+}
+
+impl EditTool {
+    /// Every supported preference, in UI display order.
+    ///
+    /// Pinned variants track [`rho_tools::EditFormat::ALL`] so newly added
+    /// formats appear here without a second hard-coded list.
+    pub fn all() -> Vec<Self> {
+        let mut all = Vec::with_capacity(1 + rho_tools::EditFormat::ALL.len());
+        all.push(Self::Auto);
+        all.extend(rho_tools::EditFormat::ALL.iter().copied().map(Self::Pinned));
+        all
+    }
+
+    /// Configured value and selector label (`behavior.edit_tool`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Pinned(format) => format.as_str(),
+        }
+    }
+
+    /// Short human-readable preference label.
+    pub const fn label(self) -> &'static str {
+        self.as_str()
+    }
+
+    /// Detail shown when selecting an edit preference.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Auto => {
+                "Pick the preferred format for the active provider and switch when the provider changes."
+            }
+            Self::Pinned(format) => format.detail(),
+        }
+    }
+
+    /// Whether this preference pins a format slated for removal.
+    ///
+    /// Lives here rather than on `rho_tools::EditFormat` so this crate keeps
+    /// building against the published `rho-agent-tools`.
+    pub const fn is_legacy(self) -> bool {
+        matches!(self, Self::Pinned(rho_tools::EditFormat::Hashline))
+    }
+}
+
+impl Config {
+    /// Resolves the edit preference for the configured provider.
+    pub(crate) fn resolved_edit_tool(&self) -> rho_tools::EditFormat {
+        self.resolved_edit_tool_for_provider(&self.provider)
+    }
+
+    /// Resolves the configured edit preference for a provider, including its
+    /// custom `auto` override. This explicit form supports a live provider that
+    /// differs from the last config saved to disk.
+    pub(crate) fn resolved_edit_tool_for_provider(&self, provider: &str) -> rho_tools::EditFormat {
+        match self.edit_tool {
+            EditTool::Auto => self
+                .providers
+                .auto_edit_format(provider)
+                .unwrap_or_else(|| preferred_edit_format_for_provider(provider)),
+            EditTool::Pinned(format) => format,
+        }
+    }
+
+    pub(crate) fn edit_tool_display_label(&self) -> String {
+        self.edit_tool_display_label_for_provider(&self.provider)
+    }
+
+    /// The shell tool this config offers a freshly bound session.
+    pub(crate) fn resolved_shell_tool(&self) -> rho_tools::ShellKind {
+        self.shell_tool.resolved()
+    }
+
+    pub(crate) fn shell_tool_display_label(&self) -> String {
+        match self.shell_tool {
+            ShellTool::Auto => format!("auto ({})", self.resolved_shell_tool().name()),
+            pinned => pinned.label().into(),
+        }
+    }
+
+    pub(crate) fn edit_tool_display_label_for_provider(&self, provider: &str) -> String {
+        match self.edit_tool {
+            EditTool::Auto => format!("auto ({})", self.resolved_edit_tool_for_provider(provider)),
+            EditTool::Pinned(format) => format.label().into(),
+        }
+    }
+}
+
+/// Built-in preferred edit format for a chat provider.
+///
+/// Product defaults, not user config. Many models train inside a first-party
+/// harness that supplies one edit tool, so Auto picks that familiar surface.
+/// Pin a concrete [`EditTool`] when a session should ignore this table.
+/// Unknown providers fall back to str_replace. Hashline is legacy and is only
+/// reachable by pinning it or through a custom provider override.
+pub fn preferred_edit_format_for_provider(provider: &str) -> rho_tools::EditFormat {
+    match provider {
+        // Codex harness trains on apply_patch documents.
+        "openai-codex" => rho_tools::EditFormat::ApplyPatch,
+        // Claude Code and xAI first-party agent tooling train on string replace.
+        "anthropic" | "xai" => rho_tools::EditFormat::StrReplace,
+        // Most reliable surface when no first-party match is known.
+        _ => rho_tools::EditFormat::StrReplace,
+    }
+}
+
+impl fmt::Display for EditTool {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for EditTool {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized == "auto" {
+            return Ok(Self::Auto);
+        }
+        if let Some(format) = rho_tools::EditFormat::from_config_value(&normalized) {
+            return Ok(Self::Pinned(format));
+        }
+        let expected = Self::all()
+            .into_iter()
+            .map(Self::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!(
+            "unknown edit tool {normalized:?}; expected {expected}"
+        ))
+    }
+}
+
+impl Serialize for EditTool {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for EditTool {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Configured model-facing shell preference (`behavior.shell_tool`).
+///
+/// [`Self::Auto`] offers the platform default: `bash` on Unix, `powershell`
+/// on Windows. Pinning `bash` works on every platform; `powershell` is only
+/// selectable on Windows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShellTool {
+    /// Offer the platform default shell.
+    #[default]
+    Auto,
+    /// Offer the `bash` tool (`bash -lc`).
+    Bash,
+    /// Offer the `powershell` tool (`powershell.exe -Command`). Windows only.
+    PowerShell,
+}
+
+impl ShellTool {
+    /// Every preference selectable on this platform, in UI display order.
+    ///
+    /// `powershell` is Windows-only: Unix builds offer just `bash`, so the
+    /// picker never presents a choice that cannot run.
+    pub fn all() -> Vec<Self> {
+        #[cfg(windows)]
+        {
+            vec![Self::Auto, Self::Bash, Self::PowerShell]
+        }
+        #[cfg(not(windows))]
+        {
+            vec![Self::Auto, Self::Bash]
+        }
+    }
+
+    /// Configured value and selector label (`behavior.shell_tool`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Bash => "bash",
+            Self::PowerShell => "powershell",
+        }
+    }
+
+    /// Short human-readable preference label.
+    pub const fn label(self) -> &'static str {
+        self.as_str()
+    }
+
+    /// Detail shown when selecting a shell preference.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Auto => {
+                "Offer the platform default: bash on Unix, powershell on Windows."
+            }
+            Self::Bash => "Expose the `bash` tool, running `bash -lc`, on every platform.",
+            Self::PowerShell => {
+                "Expose the `powershell` tool, running `powershell.exe -Command`, on every platform."
+            }
+        }
+    }
+
+    /// The concrete shell this preference resolves to.
+    ///
+    /// A `powershell` pin can still reach here from code paths that skip the
+    /// picker, so it degrades to `bash` off Windows rather than advertising a
+    /// tool that cannot run.
+    pub(crate) const fn resolved(self) -> rho_tools::ShellKind {
+        match self {
+            Self::Auto => rho_tools::ShellKind::platform_default(),
+            Self::Bash => rho_tools::ShellKind::Bash,
+            Self::PowerShell => {
+                if cfg!(windows) {
+                    rho_tools::ShellKind::PowerShell
+                } else {
+                    rho_tools::ShellKind::Bash
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for ShellTool {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ShellTool {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "bash" => Ok(Self::Bash),
+            // Parsed everywhere so config load can normalize with a warning
+            // instead of failing a config file shared across platforms.
+            "powershell" | "pwsh" => Ok(Self::PowerShell),
+            normalized => {
+                let expected = Self::all()
+                    .into_iter()
+                    .map(Self::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(format!(
+                    "unknown shell tool {normalized:?}; expected {expected}"
+                ))
+            }
+        }
+    }
+}
+
+impl Serialize for ShellTool {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ShellTool {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct LegacyWebSearchCredentials {
+    #[serde(
+        default,
+        rename = "web_search_openai_api_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    openai: Option<String>,
+    #[serde(
+        default,
+        rename = "web_search_exa_api_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    exa: Option<String>,
+    #[serde(
+        default,
+        rename = "web_search_brave_api_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    brave: Option<String>,
+}
+
+impl fmt::Debug for LegacyWebSearchCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LegacyWebSearchCredentials")
+            .field("openai", &self.openai.as_ref().map(|_| "[REDACTED]"))
+            .field("exa", &self.exa.as_ref().map(|_| "[REDACTED]"))
+            .field("brave", &self.brave.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+impl LegacyWebSearchCredentials {
+    fn get(&self, credential: WebSearchCredential) -> Option<&str> {
+        match credential {
+            WebSearchCredential::OpenAi => self.openai.as_deref(),
+            WebSearchCredential::Exa => self.exa.as_deref(),
+            WebSearchCredential::Brave => self.brave.as_deref(),
+            // Firecrawl never had a plaintext config key.
+            WebSearchCredential::Firecrawl => None,
+        }
+    }
+
+    fn clear(&mut self, credential: WebSearchCredential) {
+        match credential {
+            WebSearchCredential::OpenAi => self.openai = None,
+            WebSearchCredential::Exa => self.exa = None,
+            WebSearchCredential::Brave => self.brave = None,
+            WebSearchCredential::Firecrawl => {}
+        }
+    }
+}
+
+impl Config {
+    pub fn default_path() -> anyhow::Result<PathBuf> {
+        Ok(paths::rho_dir()?.join("config.toml"))
+    }
+
+    pub fn load(path: Option<PathBuf>) -> anyhow::Result<Self> {
+        let path = path.map(Ok).unwrap_or_else(Self::default_path)?;
+        // Settings only. Open/migrate the credential store once at process
+        // startup via credential_store::initialize_from_config.
+        Self::load_settings_only(path)
+    }
+
+    /// Load config settings without opening the credential store.
+    pub(crate) fn load_settings_only(path: PathBuf) -> anyhow::Result<Self> {
+        if !path.exists() {
+            let default = Config::default();
+            default.write_settings(path.clone())?;
+            return Ok(default);
+        }
+        Self::parse_file(path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_with_store(
+        path: PathBuf,
+        store: &dyn CredentialStore,
+    ) -> anyhow::Result<Self> {
+        let mut cfg = Self::load_settings_only(path.clone())?;
+        if matches!(cfg.migrate_legacy_web_search_credentials(store), Ok(true)) {
+            let _cleanup_result = write_config(&path, &cfg);
+        }
+        Ok(cfg)
+    }
+
+    fn parse_file(path: PathBuf) -> anyhow::Result<Self> {
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?;
+        let (cfg, warnings) = Self::parse_settings_with_warnings(&text)
+            .with_context(|| format!("failed to parse config file {}", path.display()))?;
+        load::emit_warnings(&path.display().to_string(), &warnings);
+        Ok(cfg)
+    }
+
+    pub(crate) fn parse_settings(text: &str) -> anyhow::Result<Self> {
+        Ok(Self::parse_settings_with_warnings(text)?.0)
+    }
+
+    pub(crate) fn parse_settings_with_warnings(
+        text: &str,
+    ) -> anyhow::Result<(Self, Vec<ConfigWarning>)> {
+        load::parse_settings(text)
+    }
+
+    pub fn save(&self, path: Option<PathBuf>) -> anyhow::Result<()> {
+        let path = path.map(Ok).unwrap_or_else(Self::default_path)?;
+        self.save_with_store(path, &AppCredentialStore)
+    }
+
+    /// Write config without opening or migrating credentials.
+    pub(crate) fn write_settings(&self, path: PathBuf) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut config = self.clone();
+        config.normalize_compaction_percentages();
+        config.favorite_models =
+            favorite_model_values(&normalized_favorite_models(&config.favorite_models));
+        write_config(&path, &config)
+    }
+
+    pub(crate) fn save_with_store(
+        &self,
+        path: PathBuf,
+        store: &dyn CredentialStore,
+    ) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut config = self.clone();
+        config.normalize_compaction_percentages();
+        config.favorite_models =
+            favorite_model_values(&normalized_favorite_models(&config.favorite_models));
+        let _migration_result = config.migrate_legacy_web_search_credentials(store);
+        write_config(&path, &config)?;
+        Ok(())
+    }
+
+    fn validate_model_aliases(&self) -> anyhow::Result<()> {
+        let implemented_providers = catalog::implemented_providers();
+        for (name, target) in self.model_aliases.iter() {
+            let Some(provider) = target.provider.as_deref() else {
+                continue;
+            };
+            if !implemented_providers.contains(&provider)
+                && !self.providers.custom.contains_key(provider)
+            {
+                anyhow::bail!("model alias '{name}' targets unknown provider '{provider}'");
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the configured session model reference to its concrete target.
+    ///
+    /// Runs once at load time, before any model-specific behavior, so every
+    /// downstream consumer sees only concrete model ids.
+    fn resolve_model_alias(&mut self) -> anyhow::Result<()> {
+        let resolved = self
+            .model_aliases
+            .resolve(&self.model)
+            .map_err(|error| anyhow::anyhow!("session model: {error}"))?;
+        self.model_alias = resolved.alias;
+        if let Some(provider) = resolved
+            .provider
+            .as_deref()
+            .filter(|provider| *provider != self.provider)
+        {
+            if let Some(descriptor) = provider::provider_descriptor(provider) {
+                self.auth = descriptor.default_auth().id.into();
+            }
+            self.provider = provider.to_string();
+        }
+        self.model = resolved.model;
+        Ok(())
+    }
+
+    /// Resolves `@alias` model references for internal agents.
+    fn resolve_internal_agent_model_aliases(&mut self) -> anyhow::Result<()> {
+        for (id, selection) in &mut self.internal_agents {
+            let InternalAgentTarget::Rho(rho) = &mut selection.target;
+            let resolved = self
+                .model_aliases
+                .resolve(&rho.model)
+                .map_err(|error| anyhow::anyhow!("internal agent '{id}' model: {error}"))?;
+            rho.model_alias = resolved.alias;
+            if let Some(provider) = resolved.provider {
+                if rho.provider != provider {
+                    if let Some(descriptor) = provider::provider_descriptor(&provider) {
+                        rho.auth = descriptor.default_auth().id.into();
+                    }
+                    rho.provider = provider;
+                }
+            }
+            rho.model = resolved.model;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn effective_internal_agent_model(&self, id: &str) -> EffectiveModelConfig {
+        match self.internal_agents.get(id) {
+            Some(selection) => {
+                let rho = selection.expect_rho();
+                EffectiveModelConfig {
+                    provider: rho.provider.clone(),
+                    model: rho.model.clone(),
+                    auth: rho.auth.clone(),
+                    source: EffectiveModelSource::Override,
+                }
+            }
+            None => EffectiveModelConfig {
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+                auth: self.auth.clone(),
+                source: EffectiveModelSource::Conversation,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_internal_agent_model(
+        &mut self,
+        id: impl Into<String>,
+        provider: String,
+        model: String,
+        auth: String,
+    ) {
+        self.set_internal_agent_model_config(
+            id,
+            InternalAgentModelConfig::new(provider, model, auth),
+        );
+    }
+
+    pub fn set_internal_agent_model_config(
+        &mut self,
+        id: impl Into<String>,
+        selection: InternalAgentModelConfig,
+    ) {
+        self.internal_agents.insert(id.into(), selection);
+    }
+
+    pub fn clear_internal_agent_model(&mut self, id: &str) {
+        self.internal_agents.remove(id);
+    }
+
+    /// The model explicitly configured for an internal agent, with no
+    /// conversation-model fallback. Agents that need their own model
+    /// (see `internal_agent_requires_model`) read this instead of
+    /// `effective_internal_agent_model`.
+    pub fn internal_agent_model(&self, id: &str) -> Option<&InternalAgentModelConfig> {
+        self.internal_agents.get(id)
+    }
+
+    #[cfg(test)]
+    pub fn current_internal_agent_model_alias(&self, id: &str) -> Option<&str> {
+        self.internal_agents
+            .get(id)?
+            .current_alias(&self.model_aliases)
+    }
+
+    /// The alias behind the current model selection, provided the alias table
+    /// still maps it there; stale aliases silently drop out.
+    pub fn current_model_alias(&self) -> Option<&str> {
+        let name = self.model_alias.as_deref()?;
+        let target = self.model_aliases.get(name)?;
+        (target.model == self.model
+            && target.provider.as_deref().unwrap_or(&self.provider) == self.provider)
+            .then_some(name)
+    }
+
+    pub fn set_compact_threshold_percent(&mut self, value: u8) {
+        self.compact_threshold_percent = clamp_percent(value);
+        self.normalize_compaction_percentages();
+    }
+
+    pub fn set_agent_concurrency(&mut self, value: usize) {
+        self.agent_concurrency = value.clamp(1, MAX_AGENT_CONCURRENCY);
+    }
+
+    pub fn set_compact_target_percent(&mut self, value: u8) {
+        self.compact_target_percent = clamp_percent(value);
+        self.normalize_compaction_percentages();
+    }
+
+    pub(crate) fn legacy_web_search_api_key(
+        &self,
+        credential: WebSearchCredential,
+    ) -> Option<&str> {
+        self.legacy_web_search_credentials.get(credential)
+    }
+
+    pub(crate) fn migrate_legacy_web_search_credentials(
+        &mut self,
+        store: &dyn CredentialStore,
+    ) -> rho_providers::credentials::CredentialResult<bool> {
+        let mut changed = false;
+        for credential in WebSearchCredential::ALL {
+            let Some(secret) = self
+                .legacy_web_search_credentials
+                .get(credential)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if load_web_search_api_key(store, credential)?.is_none() {
+                save_web_search_api_key(store, credential, &secret)?;
+            }
+            self.legacy_web_search_credentials.clear(credential);
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    fn normalize_compaction_percentages(&mut self) {
+        self.compact_threshold_percent = clamp_percent(self.compact_threshold_percent);
+        self.compact_target_percent = normalized_compact_target_percent(
+            self.compact_threshold_percent,
+            self.compact_target_percent,
+        );
+    }
+}
+
+impl From<&Config> for CompactionConfig {
+    fn from(config: &Config) -> Self {
+        let summarizer = config
+            .internal_agent_model(crate::agent::COMPACTION_AGENT_ID)
+            .and_then(|selection| {
+                // The compaction agent cannot delegate, so config load keeps
+                // every selection on Rho's stack.
+                let rho = selection.rho()?;
+                Some(crate::compaction::SummarizerModel {
+                    provider: rho.provider.clone(),
+                    model: rho.model.clone(),
+                    auth: rho.auth.clone(),
+                    reasoning: crate::agent::effective_internal_agent_reasoning(
+                        crate::agent::COMPACTION_AGENT_ID,
+                        selection,
+                    ),
+                })
+            });
+        Self {
+            auto_compact: config.auto_compact,
+            threshold_percent: config.compact_threshold_percent,
+            target_percent: config.compact_target_percent,
+            summarizer,
+        }
+    }
+}
+
+fn clamp_percent(value: u8) -> u8 {
+    value.clamp(1, 100)
+}
+
+fn normalized_compact_target_percent(threshold_percent: u8, target_percent: u8) -> u8 {
+    let threshold_percent = clamp_percent(threshold_percent);
+    let target_percent = clamp_percent(target_percent);
+    if threshold_percent == 1 {
+        1
+    } else {
+        target_percent.min(threshold_percent - 1)
+    }
+}

@@ -1,0 +1,451 @@
+use ratatui::{
+    layout::{Position, Rect},
+    text::Line,
+};
+
+use super::{
+    activity, composer_layout::content_width, render::display_width, scrollbar::HistoryScrollbar,
+    App, HistoryScroll,
+};
+
+/// Smallest width that still keeps prompt chrome and short status fields legible.
+///
+/// Below this, width helpers collapse to bare glyphs such as `>` / `→`.
+pub(super) const MIN_TERMINAL_WIDTH: u16 = 10;
+
+/// Smallest height that still fits composer (1) + bottom divider (1) + statusline (2).
+///
+/// Must stay aligned with [`super::statusline::StatusLine::height`].
+pub(super) const MIN_TERMINAL_HEIGHT: u16 = 4;
+
+/// True when the terminal can host the normal chrome layout.
+pub(super) fn terminal_meets_minimum(area: Rect) -> bool {
+    area.width >= MIN_TERMINAL_WIDTH && area.height >= MIN_TERMINAL_HEIGHT
+}
+
+/// Fixed bottom stack heights. Composer keeps a row before the statusline can grow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BottomChrome {
+    pub(super) statusline_height: usize,
+    pub(super) bottom_divider_height: usize,
+    pub(super) command_height: usize,
+}
+
+/// Allocate the fixed bottom chrome so a non-empty composer keeps at least one row.
+///
+/// Priority order (bottom-up after the composer reserve):
+/// 1. reserve one composer row when the composer has content
+/// 2. give the statusline up to its desired height from the remainder
+/// 3. place the bottom divider only when the statusline is visible and a free row remains
+/// 4. fill leftover bottom rows with command suggestions
+pub(super) fn bottom_chrome_heights(
+    height: usize,
+    desired_statusline_height: usize,
+    composer_line_count: usize,
+    command_line_count: usize,
+) -> BottomChrome {
+    let minimum_composer_height = usize::from(composer_line_count > 0);
+    let statusline_height =
+        desired_statusline_height.min(height.saturating_sub(minimum_composer_height));
+    let leftover = height.saturating_sub(minimum_composer_height + statusline_height);
+    let bottom_divider_height = usize::from(statusline_height > 0 && leftover > 0);
+    let command_height = command_line_count.min(leftover.saturating_sub(bottom_divider_height));
+    BottomChrome {
+        statusline_height,
+        bottom_divider_height,
+        command_height,
+    }
+}
+
+/// Consume `desired` rows from `remaining`, leaving at least `floor` unconsumed.
+fn claim_rows(remaining: &mut usize, desired: usize, floor: usize) -> usize {
+    let granted = desired.min(remaining.saturating_sub(floor));
+    *remaining = remaining.saturating_sub(granted);
+    granted
+}
+
+/// Heights claimed from the interactive stack above the top divider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InteractiveSplit {
+    pending_input: usize,
+    subagents: usize,
+    processes: usize,
+    workflows: usize,
+    composer: usize,
+    history: usize,
+}
+
+/// Inputs to [`split_interactive_budget`]. Named so call sites cannot swap rails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InteractiveBudget {
+    budget: usize,
+    composer_lines: usize,
+    desired_pending: usize,
+    desired_subagents: usize,
+    desired_processes: usize,
+    desired_workflows: usize,
+    activity_floor: usize,
+}
+
+/// Named rails for [`interactive_chrome`] so callers cannot swap heights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ChromeRails {
+    pub(super) height: usize,
+    pub(super) desired_statusline_height: usize,
+    pub(super) composer_line_count: usize,
+    pub(super) command_line_count: usize,
+    pub(super) desired_pending: usize,
+    pub(super) desired_subagents: usize,
+    pub(super) desired_processes: usize,
+    pub(super) desired_workflows: usize,
+    pub(super) activity_floor: usize,
+}
+
+/// Bottom chrome plus the interactive split derived from those heights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct InteractiveChrome {
+    pub(super) bottom: BottomChrome,
+    pub(super) show_top_divider: bool,
+    split: InteractiveSplit,
+}
+
+impl InteractiveChrome {
+    pub(super) fn history_height(self) -> usize {
+        self.split.history
+    }
+}
+
+/// One pass from bottom chrome through the interactive stack.
+pub(super) fn interactive_chrome(rails: ChromeRails) -> InteractiveChrome {
+    let bottom = bottom_chrome_heights(
+        rails.height,
+        rails.desired_statusline_height,
+        rails.composer_line_count,
+        rails.command_line_count,
+    );
+    let bottom_fixed_height =
+        bottom.bottom_divider_height + bottom.statusline_height + bottom.command_height;
+    let available_above_bottom = rails.height.saturating_sub(bottom_fixed_height);
+    let show_top_divider = available_above_bottom > 1 && rails.composer_line_count > 0;
+    let interactive_budget = available_above_bottom.saturating_sub(usize::from(show_top_divider));
+    let split = split_interactive_budget(InteractiveBudget {
+        budget: interactive_budget,
+        composer_lines: rails.composer_line_count,
+        desired_pending: rails.desired_pending,
+        desired_subagents: rails.desired_subagents,
+        desired_processes: rails.desired_processes,
+        desired_workflows: rails.desired_workflows,
+        activity_floor: rails.activity_floor,
+    });
+    InteractiveChrome {
+        bottom,
+        show_top_divider,
+        split,
+    }
+}
+
+/// Split the interactive budget in *allocation priority* order.
+///
+/// This is deliberately not the paint order — that lives in [`StackedBand::ORDER`],
+/// which paints pending input *below* the rails. Pending input is allocated
+/// first so a busy subagent/process rail can never starve a queued prompt out
+/// of the frame, then painted last so it sits adjacent to the composer it will
+/// feed. Do not "fix" the mismatch by aligning the two.
+///
+/// First pass (floors held for composer + a one-row activity history):
+/// pending reserve (capped at 2), subagents, processes, workflows, then composer.
+/// Second pass: pending may grow into leftover history up to its full desired
+/// height. Remainder is history.
+fn split_interactive_budget(input: InteractiveBudget) -> InteractiveSplit {
+    let composer_floor = usize::from(input.composer_lines > 0);
+    let keep = composer_floor + input.activity_floor;
+
+    let mut remaining = input.budget;
+    let pending_reserve = claim_rows(&mut remaining, input.desired_pending.min(2), keep);
+    let subagents = claim_rows(&mut remaining, input.desired_subagents, keep);
+    let processes = claim_rows(&mut remaining, input.desired_processes, keep);
+    let workflows = claim_rows(&mut remaining, input.desired_workflows, keep);
+    let composer = claim_rows(&mut remaining, input.composer_lines, input.activity_floor);
+
+    remaining = remaining.saturating_add(pending_reserve);
+    let pending_input = claim_rows(&mut remaining, input.desired_pending, input.activity_floor);
+    InteractiveSplit {
+        pending_input,
+        subagents,
+        processes,
+        workflows,
+        composer,
+        history: remaining,
+    }
+}
+
+pub(super) fn visible_composer_start(
+    cursor_line: usize,
+    line_count: usize,
+    visible_count: usize,
+    current_start: usize,
+) -> usize {
+    if visible_count == 0 || visible_count >= line_count {
+        return 0;
+    }
+    let max_start = line_count.saturating_sub(visible_count);
+    let current_start = current_start.min(max_start);
+    if cursor_line < current_start {
+        cursor_line
+    } else if cursor_line >= current_start.saturating_add(visible_count) {
+        cursor_line
+            .saturating_add(1)
+            .saturating_sub(visible_count)
+            .min(max_start)
+    } else {
+        current_start
+    }
+}
+
+/// Chrome bands stacked between the history panel and the top divider.
+///
+/// [`StackedBand::ORDER`] is the single source of truth for stack order:
+/// [`App::build_screen_layout`] walks it to assign rects, and every render path
+/// walks it to emit content. Reordering the stack means editing `ORDER` and
+/// nothing else — no render site can silently disagree with the geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StackedBand {
+    Subagents,
+    Processes,
+    Workflows,
+    PendingInput,
+}
+
+impl StackedBand {
+    /// Top-to-bottom paint order. See the type docs before reordering.
+    pub(super) const ORDER: [Self; 4] = [
+        Self::Subagents,
+        Self::Processes,
+        Self::Workflows,
+        Self::PendingInput,
+    ];
+
+    /// Whether this band is part of the activity tree drawn with `├`/`└`
+    /// connectors. Pending input is a separate band: it is queued user text,
+    /// not active work, so the tree terminates at the last rail above it.
+    fn is_rail(self) -> bool {
+        match self {
+            Self::Subagents | Self::Processes | Self::Workflows => true,
+            Self::PendingInput => false,
+        }
+    }
+
+    /// Background style for the band's paragraph. Rails share the activity-rail
+    /// surface; pending input inherits the base surface.
+    pub(super) fn style(self) -> ratatui::style::Style {
+        if self.is_rail() {
+            super::theme::Theme::activity_rail()
+        } else {
+            ratatui::style::Style::default()
+        }
+    }
+
+    fn height(self, split: InteractiveSplit) -> usize {
+        match self {
+            Self::Subagents => split.subagents,
+            Self::Processes => split.processes,
+            Self::Workflows => split.workflows,
+            Self::PendingInput => split.pending_input,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ScreenLayout {
+    /// Full history panel, including any bottom activity overlay band.
+    pub(super) history: Rect,
+    /// Region that may hold transcript lines. Excludes the bottom-follow activity band.
+    pub(super) history_content: Rect,
+    pub(super) history_scrollbar: Option<HistoryScrollbar>,
+    /// Blank breathing room above the rail while bottom-following with activity.
+    pub(super) activity_gap: Option<Rect>,
+    pub(super) activity_rail: Option<Rect>,
+    pub(super) jump_to_bottom: Option<Rect>,
+    pub(super) subagents: Rect,
+    pub(super) processes: Rect,
+    pub(super) workflows: Rect,
+    pub(super) pending_input: Rect,
+    pub(super) top_divider: Rect,
+    pub(super) composer: Rect,
+    pub(super) bottom_divider: Rect,
+    pub(super) statusline: Rect,
+    pub(super) commands: Rect,
+    pub(super) composer_start: usize,
+    pub(super) history_len: usize,
+}
+
+impl ScreenLayout {
+    /// Rect assigned to one stacked band.
+    pub(super) fn band(&self, band: StackedBand) -> Rect {
+        match band {
+            StackedBand::Subagents => self.subagents,
+            StackedBand::Processes => self.processes,
+            StackedBand::Workflows => self.workflows,
+            StackedBand::PendingInput => self.pending_input,
+        }
+    }
+
+    /// Whether another activity-tree rail is painted below `band`.
+    ///
+    /// Drives the `├` vs `└` connector on the last visible row, so the glyph is
+    /// derived from [`StackedBand::ORDER`] rather than hardcoded at call sites.
+    pub(super) fn rail_continues_below(&self, band: StackedBand) -> bool {
+        StackedBand::ORDER
+            .iter()
+            .skip_while(|candidate| **candidate != band)
+            .skip(1)
+            .any(|below| below.is_rail() && self.band(*below).height > 0)
+    }
+
+    /// Leftover rail cells for the live spinner after the jump chip.
+    pub(super) fn activity_label_width(&self) -> Option<usize> {
+        let rail = self.activity_rail?;
+        Some(self.jump_to_bottom.map_or(rail.width as usize, |jump| {
+            (rail.width as usize).saturating_sub(jump.width as usize + 1)
+        }))
+    }
+}
+
+impl App {
+    pub(super) fn build_screen_layout(
+        &mut self,
+        area: Rect,
+        history_len: usize,
+        composer_lines: &[Line<'_>],
+        composer_cursor: Position,
+        chrome: InteractiveChrome,
+    ) -> ScreenLayout {
+        let width = area.width as usize;
+        let cursor_line = (composer_cursor.y as usize).min(composer_lines.len().saturating_sub(1));
+        let statusline_height = chrome.bottom.statusline_height;
+        let bottom_divider_height = chrome.bottom.bottom_divider_height;
+        let command_height = chrome.bottom.command_height;
+        let show_top_divider = chrome.show_top_divider;
+        let split = chrome.split;
+        let history_height_without_jump = split.history;
+        let content_height_without_jump = self.history_content_height(history_height_without_jump);
+        let show_jump_to_bottom = content_height_without_jump > 0
+            && self.visible_history_start(history_len, content_height_without_jump)
+                < history_len.saturating_sub(content_height_without_jump);
+        let visible_composer_len = split.composer;
+        let composer_start = visible_composer_start(
+            cursor_line,
+            composer_lines.len(),
+            visible_composer_len,
+            self.input_ui.composer_view_start(),
+        );
+        self.input_ui
+            .retain_composer_paint(composer_start, content_width(width));
+        let history_height = split.history;
+
+        let mut y = area.y;
+        let history = Rect::new(area.x, y, area.width, history_height as u16);
+        y = y.saturating_add(history.height);
+
+        let activity_status = self.activity_status();
+        let activity_active = activity_status.is_some() && history.height > 0;
+        let bottom_follow = matches!(self.history.scroll(), HistoryScroll::Bottom);
+        let content_inset = activity::bottom_follow_activity_inset(activity_active, bottom_follow)
+            .min(history_height);
+        let content_height = history_height.saturating_sub(content_inset);
+        let history_content = Rect::new(history.x, history.y, history.width, content_height as u16);
+
+        let activity_y = history.bottom().saturating_sub(1);
+        let activity_gap = (content_inset
+            >= activity::ACTIVITY_RAIL_ROWS + activity::ACTIVITY_CONTENT_GAP_ROWS)
+            .then(|| {
+                Rect::new(
+                    history.x,
+                    activity_y.saturating_sub(activity::ACTIVITY_CONTENT_GAP_ROWS as u16),
+                    history.width,
+                    activity::ACTIVITY_CONTENT_GAP_ROWS as u16,
+                )
+            });
+
+        let jump_text =
+            show_jump_to_bottom.then(|| self.jump_to_bottom_text(width, self.jump_chip_state()));
+        let jump_width = jump_text.as_deref().map_or(0, display_width).min(width) as u16;
+        let jump_to_bottom = jump_text.map(|_| {
+            Rect::new(
+                history
+                    .x
+                    .saturating_add(history.width.saturating_sub(jump_width)),
+                activity_y,
+                jump_width,
+                1,
+            )
+        });
+        let activity_rail = (activity_status.is_some() && history.height > 0)
+            .then(|| Rect::new(history.x, activity_y, history.width, 1));
+        // Walking StackedBand::ORDER is what keeps geometry and every render path
+        // in agreement, and makes the bands contiguous by construction. Reorder
+        // the stack by editing ORDER, never by moving these assignments.
+        let empty = Rect::new(area.x, y, area.width, 0);
+        let (mut subagents, mut processes, mut workflows, mut pending_input) =
+            (empty, empty, empty, empty);
+        for band in StackedBand::ORDER {
+            let rect = Rect::new(area.x, y, area.width, band.height(split) as u16);
+            y = y.saturating_add(rect.height);
+            match band {
+                StackedBand::Subagents => subagents = rect,
+                StackedBand::Processes => processes = rect,
+                StackedBand::Workflows => workflows = rect,
+                StackedBand::PendingInput => pending_input = rect,
+            }
+        }
+        let top_divider = if show_top_divider {
+            let rect = Rect::new(area.x, y, area.width, 1);
+            y = y.saturating_add(1);
+            rect
+        } else {
+            Rect::new(area.x, y, area.width, 0)
+        };
+        let commands = Rect::new(area.x, y, area.width, command_height as u16);
+        y = y.saturating_add(commands.height);
+        let composer = Rect::new(area.x, y, area.width, visible_composer_len as u16);
+        y = y.saturating_add(composer.height);
+        let bottom_divider = Rect::new(area.x, y, area.width, bottom_divider_height as u16);
+        y = y.saturating_add(bottom_divider.height);
+        let statusline = Rect::new(area.x, y, area.width, statusline_height as u16);
+
+        ScreenLayout {
+            history,
+            history_content,
+            history_scrollbar: HistoryScrollbar::new(
+                history_content,
+                history_len,
+                self.visible_history_start(history_len, content_height),
+            ),
+            activity_gap,
+            activity_rail,
+            jump_to_bottom,
+            subagents,
+            processes,
+            workflows,
+            pending_input,
+            top_divider,
+            composer,
+            bottom_divider,
+            statusline,
+            commands,
+            composer_start,
+            history_len,
+        }
+    }
+
+    pub(super) fn history_content_inset(&self) -> usize {
+        activity::bottom_follow_activity_inset(
+            self.activity_status().is_some(),
+            matches!(self.history.scroll(), HistoryScroll::Bottom),
+        )
+    }
+
+    pub(super) fn history_content_height(&self, panel_height: usize) -> usize {
+        panel_height.saturating_sub(self.history_content_inset().min(panel_height))
+    }
+}

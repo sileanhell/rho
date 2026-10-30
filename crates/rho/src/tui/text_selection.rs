@@ -1,0 +1,327 @@
+use std::{
+    io,
+    ops::Range,
+    time::{Duration, Instant},
+};
+
+use ratatui::{
+    buffer::Buffer,
+    layout::{Alignment, Rect},
+    style::{Modifier, Style},
+    text::Line,
+    widgets::{Block, Borders, Clear, Paragraph},
+    Frame,
+};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+use super::{clipboard::CopyOutcome, theme::Theme};
+
+const COPY_NOTICE_DURATION: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct SelectionPosition {
+    pub(super) line: usize,
+    pub(super) column: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TextSelection {
+    anchor: SelectionPosition,
+    focus: SelectionPosition,
+    /// Leading columns of every row that hold layout chrome rather than
+    /// text, such as the transcript gutter. Highlight and copy skip them.
+    leading_gutter: usize,
+}
+
+impl TextSelection {
+    pub(super) fn new(position: SelectionPosition) -> Self {
+        Self::with_leading_gutter(position, /*leading_gutter*/ 0)
+    }
+
+    /// Anchors a selection whose rows start text after `leading_gutter`
+    /// columns. Pointer positions stay raw so a drag out of the gutter still
+    /// counts as movement; only the selected columns skip the gutter.
+    pub(super) fn with_leading_gutter(position: SelectionPosition, leading_gutter: usize) -> Self {
+        Self {
+            anchor: position,
+            focus: position,
+            leading_gutter,
+        }
+    }
+
+    pub(super) fn update(&mut self, position: SelectionPosition) {
+        self.focus = position;
+    }
+
+    pub(super) fn has_moved(self) -> bool {
+        self.anchor != self.focus
+    }
+
+    pub(super) fn selected_line_range(self) -> Range<usize> {
+        let (start, end) = self.ordered_positions();
+        start.line..end.line.saturating_add(1)
+    }
+
+    pub(super) fn selected_text(self, lines: &[Line<'_>], first_line: usize) -> Option<String> {
+        if !self.has_moved() {
+            return None;
+        }
+
+        let lines_range = self.selected_line_range();
+        let mut selected = Vec::with_capacity(lines_range.len());
+        for line_index in lines_range {
+            let line = lines.get(line_index.checked_sub(first_line)?)?;
+            let columns = self.selected_columns(line_index)?;
+            selected.push(
+                selectable_text_for_display_columns(line, columns)
+                    .trim_end_matches(' ')
+                    .to_string(),
+            );
+        }
+
+        let text = selected.join("\n");
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn selected_columns(self, line: usize) -> Option<Range<usize>> {
+        if !self.has_moved() {
+            return None;
+        }
+        let (start, end) = self.ordered_positions();
+        if !(start.line..=end.line).contains(&line) {
+            return None;
+        }
+
+        let start_column = if line == start.line {
+            start.column.max(self.leading_gutter)
+        } else {
+            self.leading_gutter
+        };
+        let end_column = if line == end.line {
+            end.column.saturating_add(1)
+        } else {
+            usize::MAX
+        };
+        Some(start_column..end_column)
+    }
+
+    fn ordered_positions(self) -> (SelectionPosition, SelectionPosition) {
+        if self.anchor <= self.focus {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        }
+    }
+}
+
+pub(super) fn highlight_selection(
+    buffer: &mut Buffer,
+    area: Rect,
+    first_visible_line: usize,
+    selection: TextSelection,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    for row_offset in 0..area.height as usize {
+        let line = first_visible_line.saturating_add(row_offset);
+        let Some(columns) = selection.selected_columns(line) else {
+            continue;
+        };
+        let start = columns.start.min(area.width as usize);
+        let end = columns.end.min(area.width as usize);
+        for column_offset in start..end {
+            buffer[(
+                area.x.saturating_add(column_offset as u16),
+                area.y.saturating_add(row_offset as u16),
+            )]
+                .set_style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+    }
+}
+
+/// Rebuilds the visible rows of a rendered buffer as plain lines so a
+/// screen-space selection can extract text from any part of the frame.
+pub(super) fn screen_lines(buffer: &Buffer, area: Rect) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(area.height as usize);
+    for row in area.top()..area.bottom() {
+        let mut text = String::new();
+        let mut covered_by_wide_symbol = 0usize;
+        for column in area.left()..area.right() {
+            if covered_by_wide_symbol > 0 {
+                covered_by_wide_symbol -= 1;
+                continue;
+            }
+            let symbol = buffer[(column, row)].symbol();
+            covered_by_wide_symbol = UnicodeWidthStr::width(symbol).saturating_sub(1);
+            text.push_str(symbol);
+        }
+        lines.push(Line::raw(text));
+    }
+    lines
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyNoticeTone {
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CopyNotice {
+    message: String,
+    tone: CopyNoticeTone,
+    visible_until: Instant,
+}
+
+impl CopyNotice {
+    pub(super) fn from_copy_result(
+        result: io::Result<CopyOutcome>,
+        character_count: usize,
+        now: Instant,
+    ) -> Self {
+        match result {
+            Ok(CopyOutcome::Confirmed) => {
+                Self::count_message(character_count, "copied", CopyNoticeTone::Success, now)
+            }
+            Ok(CopyOutcome::SentToTerminal) => Self::count_message(
+                character_count,
+                "sent to terminal",
+                CopyNoticeTone::Warning,
+                now,
+            ),
+            Err(error) => Self {
+                message: format!("copy failed: {error}"),
+                tone: CopyNoticeTone::Error,
+                visible_until: now + COPY_NOTICE_DURATION,
+            },
+        }
+    }
+
+    fn count_message(
+        character_count: usize,
+        suffix: &str,
+        tone: CopyNoticeTone,
+        now: Instant,
+    ) -> Self {
+        let unit = if character_count == 1 {
+            "char"
+        } else {
+            "chars"
+        };
+        Self {
+            message: format!("{character_count} {unit} {suffix}"),
+            tone,
+            visible_until: now + COPY_NOTICE_DURATION,
+        }
+    }
+
+    pub(super) fn visible_until(&self) -> Instant {
+        self.visible_until
+    }
+
+    pub(super) fn is_visible(&self, now: Instant) -> bool {
+        now < self.visible_until
+    }
+}
+
+pub(super) fn render_copy_notice(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    notice: &CopyNotice,
+    now: Instant,
+) {
+    if !notice.is_visible(now) || area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let popup_width = UnicodeWidthStr::width(notice.message.as_str())
+        .saturating_add(4)
+        .min(area.width as usize) as u16;
+    let popup_height = area.height.min(3);
+    let popup = Rect::new(
+        area.x
+            .saturating_add(area.width.saturating_sub(popup_width)),
+        area.y,
+        popup_width,
+        popup_height,
+    );
+    let style = match notice.tone {
+        CopyNoticeTone::Success => Theme::success(),
+        CopyNoticeTone::Warning => Theme::warning(),
+        CopyNoticeTone::Error => Theme::error(),
+    };
+
+    frame.render_widget(Clear, popup);
+    let base = Theme::surface();
+    if popup.width >= 3 && popup.height >= 3 {
+        frame.render_widget(
+            Paragraph::new(notice.message.as_str())
+                .alignment(Alignment::Center)
+                .style(base.patch(style))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(style)
+                        .style(base),
+                ),
+            popup,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(notice.message.as_str())
+                .alignment(Alignment::Right)
+                .style(base.patch(style)),
+            popup,
+        );
+    }
+}
+
+fn selectable_text_for_display_columns(line: &Line<'_>, columns: Range<usize>) -> String {
+    let mut column: usize = 0;
+    let mut selected = String::new();
+    for span in &line.spans {
+        let text: String = span
+            .content
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        let width = UnicodeWidthStr::width(text.as_str());
+        let span_columns = column..column.saturating_add(width);
+        if !is_code_block_copy_span(span) {
+            let relative_columns =
+                columns.start.saturating_sub(column)..columns.end.saturating_sub(column);
+            selected.push_str(&text_for_display_columns(&text, relative_columns));
+        }
+        column = span_columns.end;
+        if column >= columns.end {
+            break;
+        }
+    }
+    selected
+}
+
+pub(super) fn is_code_block_copy_span(span: &ratatui::text::Span<'_>) -> bool {
+    matches!(span.content.as_ref(), " COPY " | "COPY")
+        && span.style == Theme::markdown_code_copy_button(/*hovered*/ false)
+}
+
+fn text_for_display_columns(text: &str, columns: Range<usize>) -> String {
+    let mut column: usize = 0;
+    let mut selected = String::new();
+    for grapheme in text.graphemes(true) {
+        let width = UnicodeWidthStr::width(grapheme);
+        let next_column = column.saturating_add(width);
+        if next_column > columns.start && column < columns.end {
+            selected.push_str(grapheme);
+        }
+        column = next_column;
+        if column >= columns.end {
+            break;
+        }
+    }
+    selected
+}

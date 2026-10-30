@@ -1,0 +1,304 @@
+use std::{sync::Arc, time::Duration};
+
+use rho_sdk::{
+    tool::{
+        OperationKind, PreparedToolInvocation, Tool, ToolContext, ToolError, ToolErrorKind,
+        ToolInvocation, ToolMetadata, ToolOutput, ToolPreparationContext, ToolPrepareFuture,
+        ToolProgress, ToolResource, ToolResourceAccess, ToolSecurity,
+    },
+    CapabilityKind, CapabilityRequest, CapabilitySource, ProcessEnvironment, ProcessExecution,
+    ProcessOutputLimits,
+};
+use rho_tools::tool::{Tool as LegacyTool, ToolContext as LegacyToolContext};
+
+use super::{Process, ProcessArgs};
+
+pub(crate) struct SdkProcess {
+    process: Process,
+    max_output_bytes: usize,
+    environment: ProcessEnvironment,
+    mutation_observer: Arc<dyn rho_tools::WorkspaceMutationObserver>,
+}
+
+impl SdkProcess {
+    #[cfg(test)]
+    pub(crate) fn new(
+        process: Process,
+        max_output_bytes: usize,
+        environment: ProcessEnvironment,
+    ) -> Self {
+        Self::with_mutation_observer(process, max_output_bytes, environment, Arc::new(()))
+    }
+
+    pub(crate) fn with_mutation_observer(
+        process: Process,
+        max_output_bytes: usize,
+        environment: ProcessEnvironment,
+        mutation_observer: Arc<dyn rho_tools::WorkspaceMutationObserver>,
+    ) -> Self {
+        Self {
+            process,
+            max_output_bytes,
+            environment,
+            mutation_observer,
+        }
+    }
+
+    async fn execute(
+        &self,
+        args: ProcessArgs,
+        context: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        match args {
+            ProcessArgs::Start {
+                command,
+                timeout_seconds,
+                keep_warm,
+            } => {
+                let keep_warm = self.process.keep_warm_for(keep_warm);
+                self.execute_start(
+                    command,
+                    timeout_seconds.map(Duration::from_secs),
+                    keep_warm,
+                    context,
+                )
+                .await
+            }
+            args => {
+                self.mutation_observer.mark_untracked_effect(
+                    rho_tools::UntrackedWorkspaceEffect::MutatingTool,
+                    "process",
+                );
+                execute_prepared(
+                    &self.process,
+                    args,
+                    context.workspace_root(),
+                    self.max_output_bytes,
+                    context.cancellation(),
+                    context.progress(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn execute_start(
+        &self,
+        command: String,
+        timeout: Option<Duration>,
+        keep_warm: super::types::KeepWarm,
+        context: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let workspace = context.workspace().ok_or_else(|| {
+            ToolError::new(
+                ToolErrorKind::Execution,
+                "process requires a configured workspace",
+            )
+        })?;
+        let cwd = workspace
+            .resolve_for_read(workspace.root())
+            .map_err(|error| ToolError::new(ToolErrorKind::PolicyDenied, error.to_string()))?;
+        let execution = ProcessExecution::new(
+            cwd.path(),
+            self.process.shell_invocation(command),
+            self.environment.clone(),
+            ProcessOutputLimits::new(self.max_output_bytes, timeout),
+        );
+        context
+            .authorize(CapabilityRequest::process(
+                execution.clone(),
+                CapabilitySource::built_in_tool("process"),
+            ))
+            .await
+            .map_err(|error| {
+                if error.kind() == rho_sdk::AuthorizationDenialKind::Cancelled {
+                    ToolError::cancelled()
+                } else {
+                    ToolError::policy_denied(&error)
+                }
+            })?;
+        workspace
+            .revalidate(&cwd)
+            .map_err(|error| ToolError::new(ToolErrorKind::PolicyDenied, error.to_string()))?;
+
+        // Cancel only before spawn. Once start_execution begins, its result is
+        // the source of truth so a registered process is never dropped on a
+        // select race with cancellation.
+        if context.cancellation().is_cancelled() {
+            return Err(ToolError::cancelled());
+        }
+        self.mutation_observer
+            .mark_untracked_effect(rho_tools::UntrackedWorkspaceEffect::MutatingTool, "process");
+        let snapshot = self
+            .process
+            .start_execution(execution, keep_warm)
+            .await
+            .map_err(|error| ToolError::new(ToolErrorKind::Execution, error))?;
+        let mut updates = Vec::new();
+        let mut collect_update = |lines| updates.push(lines);
+        collect_update(super::display::snapshot_progress_lines(&snapshot));
+        for lines in updates {
+            if !context
+                .progress()
+                .send(ToolProgress::message(lines.join("\n")))
+                .await
+            {
+                break;
+            }
+        }
+        super::output::limit_process_data(
+            super::output::render_start(snapshot, keep_warm),
+            self.max_output_bytes,
+        )?
+        .limit_data(self.max_output_bytes)?
+        .into_tool_output(process_metadata())
+    }
+}
+
+impl Tool for SdkProcess {
+    fn spec(&self) -> rho_sdk::model::ToolSpec {
+        self.process.spec()
+    }
+
+    fn security(&self) -> ToolSecurity {
+        ToolSecurity::built_in([CapabilityKind::Process])
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        Some(rho_tools::output_schema::<super::output::ProcessOutput>())
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        invocation: ToolInvocation,
+        _context: ToolPreparationContext,
+    ) -> ToolPrepareFuture<'a> {
+        let args = parse_args(invocation.into_arguments());
+        Box::pin(async move {
+            let args = args?;
+            let metadata = process_metadata();
+            match &args {
+                ProcessArgs::Start { .. } => Ok(PreparedToolInvocation::exclusive(
+                    metadata,
+                    move |context| Box::pin(async move { self.execute(args, &context).await }),
+                )),
+                ProcessArgs::Poll { process_id, .. } => {
+                    let access =
+                        ToolResourceAccess::shared(ToolResource::managed_process(process_id));
+                    Ok(PreparedToolInvocation::resource_aware(
+                        [access],
+                        [],
+                        metadata,
+                        move |context| {
+                            Box::pin(async move {
+                                execute_prepared(
+                                    &self.process,
+                                    args,
+                                    context.workspace_root(),
+                                    self.max_output_bytes,
+                                    context.cancellation(),
+                                    context.progress(),
+                                )
+                                .await
+                            })
+                        },
+                    ))
+                }
+                ProcessArgs::Stop { process_id } => {
+                    let access =
+                        ToolResourceAccess::exclusive(ToolResource::managed_process(process_id));
+                    Ok(PreparedToolInvocation::resource_aware(
+                        [access],
+                        [],
+                        metadata,
+                        move |context| {
+                            Box::pin(async move {
+                                execute_prepared(
+                                    &self.process,
+                                    args,
+                                    context.workspace_root(),
+                                    self.max_output_bytes,
+                                    context.cancellation(),
+                                    context.progress(),
+                                )
+                                .await
+                            })
+                        },
+                    ))
+                }
+            }
+        })
+    }
+}
+
+fn parse_args(arguments: serde_json::Value) -> Result<ProcessArgs, ToolError> {
+    ProcessArgs::parse(arguments)
+        .map_err(|error| ToolError::new(ToolErrorKind::InvalidArguments, error.to_string()))
+}
+
+async fn execute_prepared(
+    process: &Process,
+    args: ProcessArgs,
+    workspace_root: Option<&std::path::Path>,
+    max_output_bytes: usize,
+    cancellation: &rho_sdk::CancellationToken,
+    progress: &rho_sdk::tool::ToolProgressSender,
+) -> Result<ToolOutput, ToolError> {
+    let cwd = workspace_root.ok_or_else(|| {
+        ToolError::new(
+            ToolErrorKind::Execution,
+            "process requires a configured workspace",
+        )
+    })?;
+    let mut updates = Vec::new();
+    let mut collect_update = |lines| updates.push(lines);
+    let execution = process.execute(
+        args,
+        LegacyToolContext {
+            cwd: cwd.to_path_buf(),
+            max_output_bytes,
+        },
+        &mut collect_update,
+    );
+    let run = tokio::select! {
+        result = execution => result,
+        () = cancellation.cancelled() => return Err(ToolError::cancelled()),
+    }
+    .map_err(map_legacy_error)?;
+    for lines in updates {
+        if !progress.send(ToolProgress::message(lines.join("\n"))).await {
+            break;
+        }
+    }
+    super::output::limit_process_data(run, max_output_bytes)?
+        .limit_data(max_output_bytes)?
+        .into_tool_output(process_metadata())
+}
+
+fn process_metadata() -> ToolMetadata {
+    ToolMetadata::new().operation(OperationKind::Execute)
+}
+
+fn map_legacy_error(error: rho_tools::tool::ToolError) -> ToolError {
+    match error {
+        rho_tools::tool::ToolError::InvalidArguments(error) => {
+            ToolError::new(ToolErrorKind::InvalidArguments, error.to_string())
+        }
+        rho_tools::tool::ToolError::Cancelled => ToolError::cancelled(),
+        error => ToolError::new(ToolErrorKind::Execution, error.to_string()),
+    }
+}
+
+pub(super) fn tool(
+    process: Process,
+    max_output_bytes: usize,
+    environment: ProcessEnvironment,
+    mutation_observer: Arc<dyn rho_tools::WorkspaceMutationObserver>,
+) -> Arc<dyn rho_sdk::tool::Tool> {
+    Arc::new(SdkProcess::with_mutation_observer(
+        process,
+        max_output_bytes,
+        environment,
+        mutation_observer,
+    ))
+}

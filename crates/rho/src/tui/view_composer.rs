@@ -1,0 +1,438 @@
+//! Composer chrome rendering: input lines, cursor, divider, and palette suggestions.
+
+use ratatui::{
+    layout::Position,
+    text::{Line, Span},
+};
+
+use super::{
+    advisor_status::AdvisorStatus,
+    approval_frame,
+    composer_chrome::ComposerDividerSlot,
+    composer_layout::{content_width, prompt_width, PROMPT_PREFIX},
+    composer_pointer::{ComposerChoice, ComposerHit},
+    composer_vim::{normal_cursor, VimMode},
+    config_number_input_frame,
+    copy_interaction::CopyHit,
+    display_width,
+    divider::{labeled_divider_line, DividerCaption},
+    file_picker,
+    inline_choice::inline_choice_frame,
+    inline_shell, input_frame,
+    line_editor_view::{EditorViewport, EditorWindow},
+    list_picker_frame,
+    login::secret_input_frame,
+    login_presentation::login_composer_view,
+    palette::{ActivePalette, PaletteFrame, PaletteRow},
+    questionnaire_frame, styled_line,
+    text_input::text_input_frame,
+    transcript_search::transcript_search_frame,
+    truncate_one_line, App, ComposerMode, InputFrame, LineFill, Theme, MAX_COMMAND_SUGGESTIONS,
+    MIN_COMMAND_DESCRIPTION_WIDTH,
+};
+
+/// Composer rows plus the caret or focused row that the viewport must keep
+/// visible, and any pointer targets painted with them.
+#[derive(Debug)]
+pub(super) struct ComposerFrame {
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) cursor: Position,
+    pub(super) copy_hit: Option<CopyHit>,
+    pub(super) choice_hits: Vec<ComposerHit<ComposerChoice>>,
+    /// Proposed window of a single-line field. Retained only when this frame
+    /// is painted, never by history measurements or pointer hit testing.
+    pub(super) editor_window: Option<EditorWindow>,
+}
+
+impl ComposerFrame {
+    pub(super) fn new(lines: Vec<Line<'static>>, cursor: Position) -> Self {
+        Self {
+            lines,
+            cursor,
+            copy_hit: None,
+            choice_hits: Vec::new(),
+            editor_window: None,
+        }
+    }
+}
+
+/// Composer chrome consumes the projected text and caret together. The window
+/// travels with the frame so measurement remains read-only until paint.
+pub(super) fn editor_frame(prompt: &str, viewport: EditorViewport, width: usize) -> ComposerFrame {
+    ComposerFrame {
+        editor_window: Some(viewport.window),
+        ..ComposerFrame::new(
+            vec![
+                styled_line(
+                    truncate_one_line(prompt, width),
+                    width,
+                    Theme::dim(),
+                    LineFill::Natural,
+                ),
+                styled_line(viewport.value, width, Theme::text(), LineFill::Natural),
+            ],
+            Position {
+                x: viewport.cursor_column as u16,
+                y: 1,
+            },
+        )
+    }
+}
+
+impl App {
+    /// Called only by the session/setup paint paths, after resolving the real
+    /// field width. Other frame consumers must not retain the proposed window.
+    pub(super) fn retain_composer_window(&mut self, frame: &ComposerFrame) {
+        let Some(window) = frame.editor_window else {
+            return;
+        };
+        match self.input_ui.composer_mut() {
+            ComposerMode::SecretInput(input) => input.editor.retain_window(window),
+            ComposerMode::ConfigNumberInput(input) => input.editor.retain_window(window),
+            ComposerMode::TextInput(input) => input.editor.retain_window(window),
+            ComposerMode::TranscriptSearch(search) => search.editor.retain_window(window),
+            ComposerMode::Input
+            | ComposerMode::Picker(_)
+            | ComposerMode::InteractivePending(_)
+            | ComposerMode::InlineChoice(_)
+            | ComposerMode::Questionnaire(_)
+            | ComposerMode::Approval(_)
+            | ComposerMode::Panel(_)
+            | ComposerMode::Side => {}
+        }
+    }
+
+    pub(super) fn divider_line(&self, width: usize, slot: ComposerDividerSlot) -> Line<'static> {
+        let width = width.max(1);
+        let style = match self.input_ui.composer() {
+            ComposerMode::Input => Theme::reasoning_input_border(self.info.runtime.reasoning),
+            ComposerMode::Picker(_)
+            | ComposerMode::Panel(_)
+            | ComposerMode::Side
+            | ComposerMode::Questionnaire(_)
+            | ComposerMode::Approval(_)
+            | ComposerMode::InlineChoice(_)
+            | ComposerMode::TranscriptSearch(_) => Theme::input_prompt(),
+            ComposerMode::SecretInput(_)
+            | ComposerMode::ConfigNumberInput(_)
+            | ComposerMode::TextInput(_)
+            | ComposerMode::InteractivePending(_) => Theme::dim(),
+        };
+        let left = (slot == ComposerDividerSlot::Top)
+            .then(|| self.composer_mode_captions())
+            .and_then(|captions| DividerCaption::new(captions, style));
+        // Stay on the top rule in every composer mode so overlays do not hide
+        // the reviewer. Follow the rule color; warning only when no model.
+        let right = (slot == ComposerDividerSlot::Top)
+            .then(|| AdvisorStatus::from_runtime(&self.info.runtime))
+            .and_then(|status| {
+                DividerCaption::new(
+                    status.divider_labels(),
+                    if status.needs_model() {
+                        Theme::warning()
+                    } else {
+                        style
+                    },
+                )
+            });
+        labeled_divider_line(left, right, style, width)
+    }
+
+    /// Longest-first left captions for the top rule: the vim mode, the
+    /// shell mode, or both, while the free-text composer is showing.
+    fn composer_mode_captions(&self) -> Vec<String> {
+        if !matches!(self.input_ui.composer(), ComposerMode::Input) {
+            return Vec::new();
+        }
+        let shell = self
+            .input_ui
+            .shell_mode()
+            .map_or(&[][..], inline_shell::mode_divider_labels);
+        match self.composer_vim_mode() {
+            None => shell.iter().map(|label| (*label).to_owned()).collect(),
+            Some(mode) => shell
+                .iter()
+                .map(|label| format!("{} · {label}", mode.label()))
+                .chain(std::iter::once(mode.label().to_owned()))
+                .collect(),
+        }
+    }
+
+    /// Composer rows and the caret position for one frame, derived together.
+    ///
+    /// Deriving both from the same walk keeps layout and cursor paint agreeing
+    /// without wrapping the composer text twice per frame.
+    pub(super) fn composer_frame(&mut self, width: usize, viewport_height: usize) -> ComposerFrame {
+        self.refresh_composer_attachment_layout_cache(width);
+        let composer_copy_hovered = self.input_ui.hovered_composer_copy();
+        match self.input_ui.composer() {
+            ComposerMode::Input => {
+                let focused_paste = self
+                    .focused_paste_segment()
+                    .map(|segment| segment.start..segment.end());
+                let highlighted = self.input_ui.selection_range().or(focused_paste);
+                let mut lines = self.composer_attachment_lines(width);
+                let InputFrame {
+                    lines: text_lines,
+                    cursor,
+                } = input_frame(
+                    self.input_ui.text(),
+                    if self.composer_vim_mode() == Some(VimMode::Normal) {
+                        normal_cursor(self.input_ui.buffer())
+                    } else {
+                        self.input_ui.cursor()
+                    },
+                    content_width(width),
+                    highlighted,
+                );
+                let mut text_lines = text_lines;
+                for (index, line) in text_lines.iter_mut().enumerate() {
+                    line.spans.insert(
+                        0,
+                        if index == 0 {
+                            Span::styled(PROMPT_PREFIX, Theme::dim())
+                        } else {
+                            Span::raw(" ".repeat(prompt_width()))
+                        },
+                    );
+                }
+                if self.input_ui.text().is_empty() && self.input_ui.shell_mode().is_none() {
+                    let placeholder = if self.composer_shows_abort_hint() {
+                        "esc abort"
+                    } else {
+                        "Type a message"
+                    };
+                    text_lines[0]
+                        .spans
+                        .push(Span::styled(placeholder, Theme::dim()));
+                }
+                lines.extend(text_lines);
+                ComposerFrame::new(
+                    lines,
+                    Position {
+                        x: (cursor.x + prompt_width() as u16).min(width.saturating_sub(1) as u16),
+                        y: cursor
+                            .y
+                            .saturating_add(self.composer_attachment_row_count(width) as u16),
+                    },
+                )
+            }
+            // Overlay pickers paint over the composer, so they own no rows here.
+            ComposerMode::Picker(picker) => {
+                let cursor = Position {
+                    x: display_width(&picker.filter)
+                        .saturating_add(2)
+                        .min(width.saturating_sub(1)) as u16,
+                    y: 0,
+                };
+                if picker.is_overlay() {
+                    return ComposerFrame::new(Vec::new(), cursor);
+                }
+                let frame = list_picker_frame(picker, width, viewport_height);
+                ComposerFrame {
+                    choice_hits: frame
+                        .hits
+                        .into_iter()
+                        .map(|hit| hit.map_target(ComposerChoice::PickerRow))
+                        .collect(),
+                    ..ComposerFrame::new(frame.lines, cursor)
+                }
+            }
+            ComposerMode::SecretInput(secret) => secret_input_frame(secret, width),
+            ComposerMode::ConfigNumberInput(input) => config_number_input_frame(input, width),
+            ComposerMode::TextInput(input) => text_input_frame(input, width),
+            ComposerMode::TranscriptSearch(search) => transcript_search_frame(search, width),
+            ComposerMode::InteractivePending(pending) => {
+                let view =
+                    login_composer_view(pending, width, /*hovered*/ composer_copy_hovered);
+                ComposerFrame {
+                    copy_hit: view.copy_hit,
+                    ..ComposerFrame::new(view.lines, Position { x: 0, y: 0 })
+                }
+            }
+            ComposerMode::InlineChoice(modal) => inline_choice_frame(
+                &modal.choice,
+                width,
+                /*return_to_parent*/ modal.parent_picker.is_some(),
+            ),
+            ComposerMode::Questionnaire(questionnaire) => {
+                let frame = questionnaire_frame(questionnaire, width);
+                ComposerFrame {
+                    choice_hits: frame
+                        .hits
+                        .into_iter()
+                        .map(|hit| hit.map_target(ComposerChoice::Questionnaire))
+                        .collect(),
+                    ..ComposerFrame::new(frame.lines, frame.cursor)
+                }
+            }
+            ComposerMode::Approval(approval) => {
+                let frame = approval_frame(approval, width, viewport_height);
+                ComposerFrame {
+                    choice_hits: frame
+                        .hits
+                        .into_iter()
+                        .map(|hit| hit.map_target(ComposerChoice::Approval))
+                        .collect(),
+                    ..ComposerFrame::new(frame.lines, Position { x: 0, y: 0 })
+                }
+            }
+            ComposerMode::Panel(_) | ComposerMode::Side => {
+                ComposerFrame::new(Vec::new(), Position { x: 0, y: 0 })
+            }
+        }
+    }
+
+    /// Suggestion rows for whichever palette the composer shows, with a hit
+    /// span per pickable row.
+    ///
+    /// One [`App::active_palette`] resolution decides the palette and yields
+    /// its matches, so nothing here asks "visible?" and then matches again.
+    /// Hits carry absolute match indices, so a pointer picks the same row the
+    /// scrolled window painted; the highlighted row's hit is marked active.
+    pub(super) fn command_suggestion_lines(&mut self, width: usize) -> PaletteFrame {
+        let mut frame = PaletteFrame::default();
+        match self.active_palette() {
+            Some(ActivePalette::Command(matches)) => {
+                let selected_index = self
+                    .input_ui
+                    .command_selection()
+                    .min(matches.len().saturating_sub(1));
+                let (start, _, _) = file_picker::file_palette_scroll_counts(
+                    matches.len(),
+                    selected_index,
+                    MAX_COMMAND_SUGGESTIONS,
+                    self.input_ui.palette_window_start(),
+                );
+                self.input_ui.set_palette_window_start(start);
+
+                let usage_width = matches
+                    .iter()
+                    .skip(start)
+                    .take(MAX_COMMAND_SUGGESTIONS)
+                    .map(|command| display_width(&command.usage))
+                    .max()
+                    .unwrap_or(1)
+                    .min(
+                        width
+                            .saturating_sub(MIN_COMMAND_DESCRIPTION_WIDTH + 3)
+                            .max(1),
+                    );
+
+                for (index, command) in matches
+                    .into_iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(MAX_COMMAND_SUGGESTIONS)
+                {
+                    let selected = index == selected_index;
+                    let marker = if selected { ">" } else { " " };
+                    let description_width = width.saturating_sub(usage_width + 3).max(1);
+                    let usage = truncate_one_line(&command.usage, usage_width);
+                    let description = truncate_one_line(&command.description, description_width);
+                    let usage_padding =
+                        " ".repeat(usage_width.saturating_sub(display_width(&usage)));
+                    let text = format!("{marker} {usage}{usage_padding} {description}");
+                    frame.push_row(
+                        styled_line(
+                            text,
+                            width.max(1),
+                            palette_row_style(selected),
+                            LineFill::Natural,
+                        ),
+                        PaletteRow::Command(index),
+                        selected,
+                    );
+                }
+            }
+            Some(ActivePalette::File(matches)) => {
+                let selected_index = self
+                    .input_ui
+                    .file_selection()
+                    .min(matches.len().saturating_sub(1));
+                let (start, above, below) = file_picker::file_palette_scroll_counts(
+                    matches.len(),
+                    selected_index,
+                    MAX_COMMAND_SUGGESTIONS,
+                    self.input_ui.palette_window_start(),
+                );
+                self.input_ui.set_palette_window_start(start);
+
+                for (index, entry) in matches.rows(start, MAX_COMMAND_SUGGESTIONS) {
+                    let selected = index == selected_index;
+                    let marker = if selected { ">" } else { " " };
+                    let text = format!("{marker} {}", file_palette_row(&entry, matches.source));
+                    frame.push_row(
+                        styled_line(
+                            truncate_one_line(&text, width.max(1)),
+                            width.max(1),
+                            palette_row_style(selected),
+                            LineFill::Natural,
+                        ),
+                        PaletteRow::File(index),
+                        selected,
+                    );
+                }
+
+                // The footer reports scroll position; it is not a row to pick.
+                if let Some(footer) = file_picker::file_palette_scroll_footer(
+                    above,
+                    below,
+                    matches.len(),
+                    matches.incomplete,
+                ) {
+                    frame.push_line(styled_line(
+                        truncate_one_line(&footer, width.max(1)),
+                        width.max(1),
+                        Theme::dim(),
+                        LineFill::Natural,
+                    ));
+                }
+            }
+            None => {}
+        }
+        frame
+    }
+}
+
+/// Palette row ink: the highlighted row stands out and the rest recede.
+fn palette_row_style(selected: bool) -> ratatui::style::Style {
+    if selected {
+        Theme::brand()
+    } else {
+        Theme::dim()
+    }
+}
+
+/// One path palette row.
+///
+/// A workspace file shows what picking it inserts: `@path` for a mention, the
+/// bare path for a shell word. A resource shows its server, its own label, and
+/// whether picking it attaches content or writes a template the user still
+/// has to fill in, because those look identical otherwise and behave
+/// differently.
+fn file_palette_row(
+    entry: &file_picker::FilePaletteEntry,
+    source: file_picker::PathTokenSource,
+) -> String {
+    let prefix = match source {
+        file_picker::PathTokenSource::Mention => "@",
+        file_picker::PathTokenSource::ShellWord => "",
+    };
+    match entry {
+        file_picker::FilePaletteEntry::WorkspaceFile(path) => format!("{prefix}{path}"),
+        file_picker::FilePaletteEntry::McpResource(resource) => {
+            let suffix = if resource.templated {
+                " · template"
+            } else {
+                ""
+            };
+            format!(
+                "{prefix}{}  {}:{}{suffix}",
+                resource.uri,
+                resource.server,
+                resource.label()
+            )
+        }
+    }
+}

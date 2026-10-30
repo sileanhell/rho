@@ -1,0 +1,131 @@
+pub mod advisor;
+pub mod agent;
+mod agent_output;
+pub(crate) mod code_mode;
+mod coding;
+pub(crate) mod computer_use;
+pub(crate) mod host_io;
+pub(crate) mod mcp;
+mod notification_format;
+pub(crate) mod openapi;
+pub(crate) mod plan_exit;
+pub(crate) mod process;
+pub mod rho;
+mod sdk_features;
+mod sessions;
+pub(crate) mod todo;
+pub(crate) mod tool_name;
+pub(crate) use sdk_features::message_parent_bundle;
+pub mod sdk_registry;
+#[cfg(debug_assertions)]
+pub(crate) mod tui_fixture;
+pub mod web;
+pub(crate) mod workflow;
+mod workflow_output;
+pub(crate) mod workflow_tracker;
+
+/// Executable the model-facing shell tools launch for `kind`.
+///
+/// On Windows a configured `bash` resolves past PATH to the copy Git for
+/// Windows keeps beside `git.exe`, then to Rho's managed `bash.exe`; the bare
+/// name stays as the fallback so a missing bash fails at spawn under its own
+/// name. Everywhere else the kind's PATH-resolved name is used.
+pub(crate) fn shell_executable(kind: rho_tools::ShellKind) -> std::path::PathBuf {
+    #[cfg(windows)]
+    if kind == rho_tools::ShellKind::Bash {
+        return crate::tui::managed_shell::model_bash_executable();
+    }
+    std::path::PathBuf::from(kind.default_executable())
+}
+
+/// Returns the stable union of model-facing and host-only built-in tool names.
+///
+/// Capability filtering may disable a model-facing entry for a particular run.
+/// Host-only entries are never sent to a model, but public contracts such as
+/// hook matchers still validate against this owning registry.
+pub(crate) fn canonical_tool_names() -> &'static [&'static str] {
+    static NAMES: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+        let mut names = vec![
+            "advisor",
+            "agent",
+            "agents",
+            "bash",
+            "computer",
+            "codemode",
+            "exit_plan_mode",
+            "fetch_content",
+            "get_search_content",
+            "glob",
+            "grep",
+            "list_dir",
+            "message_parent",
+            "powershell",
+            "process",
+            "questionnaire",
+            "read_file",
+            "request_parent_action",
+            "rho",
+            "sessions",
+            "tool_search",
+            "todo",
+            "skill",
+            "web_search",
+            "workflow",
+            "workflow_command",
+            "write",
+        ];
+        names.extend(
+            rho_tools::EditFormat::ALL
+                .iter()
+                .copied()
+                .map(rho_tools::EditFormat::tool_name),
+        );
+        names.sort_unstable();
+        names.dedup();
+        names
+    });
+    NAMES.as_slice()
+}
+
+/// Returns whether a canonical built-in tool can mutate workspace or run state.
+pub(crate) fn canonical_tool_is_mutating(name: &str) -> Option<bool> {
+    match name {
+        "agent" | "agents" | "bash" | "codemode" | "computer" | "powershell" | "process"
+        | "workflow" | "workflow_command" | "write" => Some(true),
+        name if rho_tools::EditFormat::is_edit_tool_name(name) => Some(true),
+        "advisor"
+        | "exit_plan_mode"
+        | "fetch_content"
+        | "get_search_content"
+        | "glob"
+        | "grep"
+        | "list_dir"
+        | "message_parent"
+        | "questionnaire"
+        | "read_file"
+        | "request_parent_action"
+        | "rho"
+        | "sessions"
+        | "skill"
+        | "todo"
+        | "web_search" => Some(false),
+        _ => None,
+    }
+}
+
+/// Function tools advertised as async on Responses when the model allows it.
+///
+/// v1: the `agent` tool is the only async tool. The provider stamps `"async":
+/// true` only when the model supports it and the name is in the request.
+pub(crate) fn async_tool_names(_config: &crate::config::Config) -> Vec<String> {
+    vec!["agent".into()]
+}
+
+/// Built-ins registered only on provider-free host tool registries.
+#[cfg(test)]
+pub(crate) const HOST_ONLY_TOOL_NAMES: &[&str] = &["workflow_command"];
+
+/// Model-facing built-ins registered only when a parent notice channel is bound.
+#[cfg(test)]
+pub(crate) const DELEGATED_OPT_IN_TOOL_NAMES: &[&str] =
+    &["message_parent", "request_parent_action"];

@@ -1,0 +1,145 @@
+#[cfg(any(debug_assertions, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Termination {
+    Error,
+    Panic,
+}
+
+pub(super) fn matrix_enabled() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os("RHO_TUI_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("matrix"))
+}
+
+/// Acknowledge a notification boundary, not merely the child's enqueue. The PTY
+/// releases the next notice only after the parent has checked the previous one.
+#[cfg(debug_assertions)]
+pub(super) fn quiet_notice_boundary(queued: usize) {
+    #[cfg(unix)]
+    if matrix_enabled() {
+        thread_local! {
+            static LAST_ACKNOWLEDGED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        LAST_ACKNOWLEDGED.with(|last| {
+            acknowledge_notice_boundary(
+                queued,
+                last,
+                std::path::Path::new(".quiet-parent-pty.sock"),
+            );
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = queued;
+}
+
+#[cfg(all(debug_assertions, unix))]
+fn acknowledge_notice_boundary(
+    queued: usize,
+    last: &std::cell::Cell<usize>,
+    path: &std::path::Path,
+) {
+    if queued == last.get() {
+        return;
+    }
+    if queued == 0 {
+        last.set(0);
+        return;
+    }
+    let send = || -> std::io::Result<()> {
+        let socket = std::os::unix::net::UnixDatagram::unbound()?;
+        socket.set_nonblocking(true)?;
+        socket.send_to(format!("boundary:{queued}").as_bytes(), path)?;
+        Ok(())
+    };
+    // A full or retired observer must never stall or crash the TUI. Retry an
+    // unsent state at the next boundary; suppress duplicates only after success.
+    if send().is_ok() {
+        last.set(queued);
+    }
+}
+
+/// Version shown in TUI chrome (session header, setup welcome).
+///
+/// Production always uses the package version. Debug matrix runs may override
+/// via `RHO_TUI_DISPLAY_VERSION` so the docs proof plate stays stable across
+/// release bumps without post-processing the SVG.
+pub(super) fn display_version() -> String {
+    resolve_display_version(
+        matrix_enabled(),
+        std::env::var("RHO_TUI_DISPLAY_VERSION").ok().as_deref(),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn resolve_display_version(matrix: bool, override_version: Option<&str>, package: &str) -> String {
+    if matrix {
+        if let Some(value) = override_version
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return value.to_owned();
+        }
+    }
+    package.to_owned()
+}
+
+/// Cached-model providers list rows from the on-disk model cache, which is
+/// empty in an isolated matrix HOME. Seed the fixture provider's models so
+/// `/model` and internal-agent model pickers have rows without a network
+/// refresh.
+#[cfg(debug_assertions)]
+pub(super) fn seed_matrix_model_cache() {
+    if matrix_enabled() {
+        use rho_providers::model::provider_models::{
+            replace_cached_provider_models_for_tests, ProviderModel,
+        };
+        // One model per provider keeps scripted picker navigation stable.
+        // Poolside is visible only in scenarios injecting its credential; its
+        // Off/Max capabilities exercise normalization without network metadata.
+        for (provider, model) in [("openai", "gpt-5.5"), ("poolside", "laguna-m.1")] {
+            let models = [ProviderModel {
+                provider: provider.into(),
+                model: model.into(),
+                display_name: model.into(),
+                context_window: Some(400_000),
+                max_output_tokens: Some(128_000),
+                reasoning_capabilities: Default::default(),
+            }];
+            // A failed seed leaves pickers empty, which scenario assertions report.
+            let _ = replace_cached_provider_models_for_tests(provider, &models);
+        }
+    }
+}
+
+pub(super) fn after_terminal_init() -> anyhow::Result<()> {
+    #[cfg(debug_assertions)]
+    {
+        // Allow injection from Herdr smoke tests or the matrix fixture / PTY harness.
+        let herdr = std::env::var_os("HERDR_ENV").is_some();
+        let matrix = matrix_enabled();
+        if !herdr && !matrix {
+            return Ok(());
+        }
+        let Some(value) = std::env::var_os("RHO_TUI_TEST_TERMINATION") else {
+            return Ok(());
+        };
+        let value = value
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("RHO_TUI_TEST_TERMINATION must be valid UTF-8"))?;
+        match parse_termination(&value)? {
+            Termination::Error => anyhow::bail!("deterministic injected TUI application error"),
+            Termination::Panic => panic!("deterministic injected TUI panic"),
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    Ok(())
+}
+
+#[cfg(any(debug_assertions, test))]
+fn parse_termination(value: &str) -> anyhow::Result<Termination> {
+    match value {
+        "error" => Ok(Termination::Error),
+        "panic" => Ok(Termination::Panic),
+        _ => anyhow::bail!("unknown RHO_TUI_TEST_TERMINATION value '{value}'"),
+    }
+}

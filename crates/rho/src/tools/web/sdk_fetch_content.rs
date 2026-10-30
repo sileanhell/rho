@@ -1,0 +1,488 @@
+use rho_sdk::{
+    tool::{
+        OperationKind, Tool, ToolContext, ToolError, ToolErrorKind, ToolFuture, ToolInvocation,
+        ToolMetadata, ToolOutput, ToolSecurity,
+    },
+    CapabilityKind, CapabilityRequest, CapabilitySource, NetworkTarget, ResolvedWorkspacePath,
+    WorkspacePathError, WorkspacePathErrorKind,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use url::Url;
+
+use super::{
+    fetch::{self, github, FetchedTarget},
+    fetch_response::{build_fetch_content_output, FETCH_CONTENT_TOOL},
+    storage::{self, StoredContent, StoredItem, WebAccessStore},
+    util,
+};
+
+mod github_clone;
+
+use github_clone::{GitHubCloneConfig, GitHubClonePlan};
+
+const DEFAULT_FRAMES: usize = 6;
+
+pub(in crate::tools) struct SdkFetchContent {
+    /// Fixed-host GitHub API client. Generic URL fetches build their own client
+    /// pinned to SSRF-vetted addresses, so they never borrow this one.
+    github_client: reqwest::Client,
+    max_output_bytes: usize,
+    process_environment: rho_sdk::ProcessEnvironment,
+    store: WebAccessStore,
+    /// Test-only override installed around the tool future so the fetch choke
+    /// point can allow loopback without threading policy through plan types.
+    #[cfg(test)]
+    allow_ranges_override: Option<Vec<super::ssrf::Cidr>>,
+}
+
+impl SdkFetchContent {
+    pub(in crate::tools) fn new(
+        max_output_bytes: usize,
+        process_environment: rho_sdk::ProcessEnvironment,
+        store: WebAccessStore,
+    ) -> Self {
+        Self {
+            github_client: util::http_client(),
+            max_output_bytes,
+            process_environment,
+            store,
+            #[cfg(test)]
+            allow_ranges_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_allow_ranges(
+        max_output_bytes: usize,
+        allow_ranges: Vec<super::ssrf::Cidr>,
+    ) -> Self {
+        Self {
+            github_client: util::http_client(),
+            max_output_bytes,
+            process_environment: rho_sdk::ProcessEnvironment::InheritAll,
+            store: WebAccessStore::new(),
+            allow_ranges_override: Some(allow_ranges),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchContentArgs {
+    url: Option<String>,
+    urls: Option<Vec<String>>,
+    prompt: Option<String>,
+    timestamp: Option<String>,
+    frames: Option<usize>,
+    force_clone: Option<bool>,
+}
+
+struct TargetOptions<'a> {
+    response_id: &'a str,
+    target_index: usize,
+    prompt: Option<&'a str>,
+    timestamp: Option<&'a str>,
+    frames: usize,
+    force_clone: bool,
+    max_output_bytes: usize,
+    process_environment: rho_sdk::ProcessEnvironment,
+    store: WebAccessStore,
+}
+
+struct FetchPlan {
+    response_id: String,
+    prompt: Option<String>,
+    targets: Vec<TargetPlan>,
+    store: WebAccessStore,
+}
+
+enum TargetPlan {
+    Local(LocalPlan),
+    Http(HttpPlan),
+    Placeholder(PlaceholderPlan),
+    GitHubApi(GitHubApiPlan),
+    GitHubClone(GitHubClonePlan),
+}
+
+struct LocalPlan {
+    requested: String,
+    resolved: ResolvedWorkspacePath,
+    prompt: Option<String>,
+    timestamp: Option<String>,
+    frames: usize,
+}
+
+struct HttpPlan {
+    requested: String,
+    url: Url,
+    prompt: Option<String>,
+}
+
+struct PlaceholderPlan {
+    requested: String,
+    kind: PlaceholderKind,
+    prompt: Option<String>,
+    timestamp: Option<String>,
+    frames: usize,
+}
+
+enum PlaceholderKind {
+    YouTube,
+}
+
+struct GitHubApiPlan {
+    requested: String,
+    target: github::GitHubTarget,
+    api_url: String,
+}
+
+impl FetchPlan {
+    fn parse(
+        arguments: Value,
+        context: &ToolContext,
+        max_output_bytes: usize,
+        process_environment: rho_sdk::ProcessEnvironment,
+        store: WebAccessStore,
+    ) -> Result<Self, ToolError> {
+        let arguments: FetchContentArgs = serde_json::from_value(arguments).map_err(|error| {
+            ToolError::new(
+                ToolErrorKind::InvalidArguments,
+                format!("invalid arguments: {error}"),
+            )
+        })?;
+        let targets = collect_targets(arguments.url, arguments.urls)?;
+        let frames = arguments.frames.unwrap_or(DEFAULT_FRAMES).clamp(1, 12);
+        let force_clone = arguments.force_clone.unwrap_or(false);
+        let response_id = storage::new_response_id();
+        let workspace = context.workspace().ok_or_else(|| {
+            ToolError::new(
+                ToolErrorKind::Execution,
+                "workspace is required for fetch_content",
+            )
+        })?;
+        let mut plans = Vec::with_capacity(targets.len());
+        for (target_index, target) in targets.into_iter().enumerate() {
+            plans.push(TargetPlan::parse(
+                target,
+                workspace,
+                TargetOptions {
+                    response_id: &response_id,
+                    target_index,
+                    prompt: arguments.prompt.as_deref(),
+                    timestamp: arguments.timestamp.as_deref(),
+                    frames,
+                    force_clone,
+                    max_output_bytes,
+                    process_environment: process_environment.clone(),
+                    store: store.clone(),
+                },
+            )?);
+        }
+        Ok(Self {
+            response_id,
+            prompt: arguments.prompt,
+            targets: plans,
+            store,
+        })
+    }
+
+    async fn authorize(&self, context: &ToolContext) -> Result<(), ToolError> {
+        for target in &self.targets {
+            target.authorize(context).await?;
+        }
+        Ok(())
+    }
+
+    async fn execute(
+        self,
+        github_client: &reqwest::Client,
+        context: &ToolContext,
+        max_output_bytes: usize,
+    ) -> Result<ToolOutput, ToolError> {
+        let mut items = Vec::with_capacity(self.targets.len());
+        for target in self.targets {
+            let requested = target.requested().to_owned();
+            let fetched = target.execute(github_client, context).await?;
+            items.push(StoredItem {
+                url: Some(requested),
+                query: self.prompt.clone(),
+                title: fetched.title,
+                content: fetched.content,
+                metadata: fetched.metadata,
+            });
+        }
+
+        let content = build_fetch_content_output(&self.response_id, &items, max_output_bytes);
+        self.store
+            .store(
+                self.response_id,
+                StoredContent {
+                    kind: FETCH_CONTENT_TOOL.into(),
+                    items,
+                },
+            )
+            .map_err(map_app_tool_error)?;
+        Ok(ToolOutput::text(content)
+            .metadata(ToolMetadata::new().operation(OperationKind::Network)))
+    }
+}
+
+impl TargetPlan {
+    fn parse(
+        requested: String,
+        workspace: &rho_sdk::Workspace,
+        options: TargetOptions<'_>,
+    ) -> Result<Self, ToolError> {
+        if let Some(target) = github::parse_url(&requested) {
+            if options.force_clone && target.kind != github::GitHubKind::Commit {
+                return Ok(Self::GitHubClone(GitHubClonePlan::new(
+                    requested,
+                    target,
+                    GitHubCloneConfig {
+                        response_id: options.response_id.to_owned(),
+                        target_index: options.target_index,
+                        working_directory: workspace.root().to_path_buf(),
+                        max_output_bytes: options.max_output_bytes,
+                        process_environment: options.process_environment,
+                        store: options.store,
+                    },
+                )));
+            }
+            let api_url = github::api_url(&target);
+            return Ok(Self::GitHubApi(GitHubApiPlan {
+                requested,
+                target,
+                api_url,
+            }));
+        }
+
+        if util::is_youtube_url(&requested) {
+            return Ok(Self::Placeholder(PlaceholderPlan {
+                requested,
+                kind: PlaceholderKind::YouTube,
+                prompt: options.prompt.map(str::to_owned),
+                timestamp: options.timestamp.map(str::to_owned),
+                frames: options.frames,
+            }));
+        }
+
+        if let Ok(url) = Url::parse(&requested) {
+            if matches!(url.scheme(), "http" | "https") {
+                return Ok(Self::Http(HttpPlan {
+                    requested,
+                    url,
+                    prompt: options.prompt.map(str::to_owned),
+                }));
+            }
+        }
+
+        let resolved = workspace
+            .resolve_for_read(&requested)
+            .map_err(map_workspace_path_error)?;
+        Ok(Self::Local(LocalPlan {
+            requested,
+            resolved,
+            prompt: options.prompt.map(str::to_owned),
+            timestamp: options.timestamp.map(str::to_owned),
+            frames: options.frames,
+        }))
+    }
+
+    fn requested(&self) -> &str {
+        match self {
+            Self::Local(plan) => &plan.requested,
+            Self::Http(plan) => &plan.requested,
+            Self::Placeholder(plan) => &plan.requested,
+            Self::GitHubApi(plan) => &plan.requested,
+            Self::GitHubClone(plan) => plan.requested(),
+        }
+    }
+
+    async fn authorize(&self, context: &ToolContext) -> Result<(), ToolError> {
+        match self {
+            Self::Local(plan) => {
+                authorize(
+                    context,
+                    CapabilityRequest::read_path(
+                        plan.resolved.path(),
+                        plan.resolved.scope().clone(),
+                        capability_source(),
+                    ),
+                )
+                .await
+            }
+            Self::Http(plan) => {
+                authorize(
+                    context,
+                    CapabilityRequest::network(
+                        NetworkTarget::Url(plan.url.as_str().to_owned()),
+                        capability_source(),
+                    ),
+                )
+                .await
+            }
+            Self::Placeholder(_) => Ok(()),
+            Self::GitHubApi(plan) => {
+                authorize(
+                    context,
+                    CapabilityRequest::network(
+                        NetworkTarget::Url(plan.api_url.clone()),
+                        capability_source(),
+                    ),
+                )
+                .await
+            }
+            Self::GitHubClone(plan) => plan.authorize(context).await,
+        }
+    }
+
+    async fn execute(
+        self,
+        github_client: &reqwest::Client,
+        context: &ToolContext,
+    ) -> Result<FetchedTarget, ToolError> {
+        match self {
+            Self::Local(plan) => {
+                let workspace = context.workspace().ok_or_else(|| {
+                    ToolError::new(
+                        ToolErrorKind::Execution,
+                        "workspace is required for fetch_content",
+                    )
+                })?;
+                workspace
+                    .revalidate(&plan.resolved)
+                    .map_err(map_workspace_path_error)?;
+                fetch::fetch_local_path(
+                    plan.resolved.path(),
+                    plan.prompt.as_deref(),
+                    plan.timestamp.as_deref(),
+                    plan.frames,
+                )
+                .await
+                .map_err(map_app_tool_error)
+            }
+            Self::Http(plan) => fetch::fetch_http_url(&plan.url, plan.prompt.as_deref())
+                .await
+                .map_err(map_app_tool_error),
+            Self::Placeholder(plan) => Ok(match plan.kind {
+                PlaceholderKind::YouTube => fetch::youtube_placeholder(
+                    &plan.requested,
+                    plan.prompt.as_deref(),
+                    plan.timestamp.as_deref(),
+                    plan.frames,
+                ),
+            }),
+            Self::GitHubApi(plan) => github::fetch_via_api(github_client, &plan.target)
+                .await
+                .map_err(map_app_tool_error),
+            Self::GitHubClone(plan) => plan.execute().await,
+        }
+    }
+}
+
+impl Tool for SdkFetchContent {
+    fn spec(&self) -> rho_sdk::model::ToolSpec {
+        rho_sdk::model::ToolSpec {
+            name: FETCH_CONTENT_TOOL.into(),
+            description: "Fetch URLs, GitHub repos/files, YouTube/local videos, PDFs, local files, or web pages. A single successful target returns readable content inline when it fits the tool output limit. Oversized or multi-target results keep a responseId for get_search_content. Do not read_file cache paths.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "urls": {"type": "array", "items": {"type": "string"}, "description": "URLs or local paths. Use one item for a single fetch, or multiple items to fetch several targets."},
+                    "prompt": {"type": "string", "description": "Question for video or page analysis. Also stored as the exact query selector for get_search_content."},
+                    "timestamp": {"type": "string", "description": "Video frame timestamp or range, e.g. 23:41 or 23:41-25:00."},
+                    "frames": {"type": "integer", "minimum": 1, "maximum": 12},
+                    "forceClone": {"type": "boolean", "description": "Clone GitHub repos even over the 350MB threshold."}
+                },
+                "required": ["urls"]
+            }),
+        }
+    }
+
+    fn security(&self) -> ToolSecurity {
+        ToolSecurity::built_in([
+            CapabilityKind::Read,
+            CapabilityKind::Network,
+            CapabilityKind::Process,
+        ])
+    }
+
+    fn start_metadata(&self, _arguments: &Value) -> ToolMetadata {
+        ToolMetadata::new().operation(OperationKind::Network)
+    }
+
+    fn call<'a>(&'a self, invocation: ToolInvocation, context: ToolContext) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let plan = FetchPlan::parse(
+                invocation.into_arguments(),
+                &context,
+                self.max_output_bytes,
+                self.process_environment.clone(),
+                self.store.clone(),
+            )?;
+            plan.authorize(&context).await?;
+            let execute = plan.execute(&self.github_client, &context, self.max_output_bytes);
+            #[cfg(test)]
+            if let Some(ranges) = self.allow_ranges_override.clone() {
+                return super::ssrf::with_allow_ranges(ranges, execute).await;
+            }
+            execute.await
+        })
+    }
+}
+
+async fn authorize(context: &ToolContext, request: CapabilityRequest) -> Result<(), ToolError> {
+    context
+        .authorize(request)
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            if error.kind() == rho_sdk::AuthorizationDenialKind::Cancelled {
+                ToolError::cancelled()
+            } else {
+                ToolError::policy_denied(&error)
+            }
+        })
+}
+
+fn capability_source() -> CapabilitySource {
+    CapabilitySource::built_in_tool(FETCH_CONTENT_TOOL)
+}
+
+fn collect_targets(
+    singular: Option<String>,
+    plural: Option<Vec<String>>,
+) -> Result<Vec<String>, ToolError> {
+    let targets = plural.or_else(|| singular.map(|value| vec![value]));
+    match targets {
+        Some(targets) if !targets.is_empty() => Ok(targets),
+        _ => Err(ToolError::new(
+            ToolErrorKind::InvalidArguments,
+            "fetch_content requires at least one URL or local path",
+        )),
+    }
+}
+
+fn map_workspace_path_error(error: WorkspacePathError) -> ToolError {
+    let kind = match error.kind() {
+        WorkspacePathErrorKind::ParentTraversal
+        | WorkspacePathErrorKind::OutsideGrantedRoots
+        | WorkspacePathErrorKind::InvalidPlatformPath
+        | WorkspacePathErrorKind::ChangedAfterAuthorization => ToolErrorKind::PolicyDenied,
+        _ => ToolErrorKind::Execution,
+    };
+    ToolError::new(kind, error.to_string())
+}
+
+fn map_app_tool_error(error: rho_tools::tool::ToolError) -> ToolError {
+    let message = error.to_string();
+    let kind = match error {
+        rho_tools::tool::ToolError::InvalidArguments(_) => ToolErrorKind::InvalidArguments,
+        rho_tools::tool::ToolError::Cancelled => return ToolError::cancelled(),
+        rho_tools::tool::ToolError::Io(_)
+        | rho_tools::tool::ToolError::Utf8(_)
+        | rho_tools::tool::ToolError::Message(_) => ToolErrorKind::Execution,
+    };
+    ToolError::new(kind, message)
+}

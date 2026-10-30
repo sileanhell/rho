@@ -1,0 +1,750 @@
+use std::collections::BTreeMap;
+
+use serde::Deserialize;
+
+use {
+    crate::keybindings::Keybindings,
+    crate::model_aliases::ModelAliases,
+    crate::permission::PermissionMode,
+    rho_providers::model::favorites::{favorite_model_values, normalized_favorite_models},
+    rho_providers::reasoning::ReasoningLevel,
+};
+
+use super::{
+    inferred_provider_auth, provider_config::PartialProviderConfigs, web_search, Config,
+    ConfigWarning, EditTool, InternalAgentModelConfig, InternalAgentTarget,
+    LegacyWebSearchCredentials, ModelKind, ShellTool,
+};
+
+pub(super) fn emit_warnings(path_display: &str, warnings: &[ConfigWarning]) {
+    for warning in warnings {
+        eprintln!("warning: {path_display}: {}", warning.message());
+    }
+}
+
+pub(super) fn parse_settings(text: &str) -> anyhow::Result<(Config, Vec<ConfigWarning>)> {
+    let file = toml::from_str::<PartialConfig>(text)?.normalize_legacy()?;
+    let mut cfg = Config::default();
+    let mut warnings = Vec::new();
+
+    if let Some(providers) = file.providers {
+        cfg.providers.apply(providers, &mut warnings)?;
+    }
+
+    if let Some(v) = file.prompt_templates {
+        crate::prompt_templates::validate(&v)?;
+        cfg.prompt_templates = v;
+    }
+    if let Some(mcp) = file.mcp {
+        cfg.mcp = mcp;
+    }
+    if let Some(openapi) = file.openapi {
+        cfg.openapi = openapi;
+    }
+    if let Some(v) = file.provider {
+        cfg.provider = v;
+    }
+    if let Some(v) = file.auth {
+        cfg.auth = v;
+    }
+    if let Some(v) = file.reasoning {
+        cfg.reasoning = v;
+    }
+    if let Some(v) = file.fast_mode {
+        cfg.fast_mode = v;
+    }
+    if let Some(v) = file.favorite_models {
+        cfg.favorite_models = favorite_model_values(&normalized_favorite_models(&v));
+    }
+    match file.model {
+        Some(ModelSetting::Name(model)) => cfg.model = model,
+        Some(ModelSetting::Group(group)) => {
+            if let Some(provider) = group.provider {
+                cfg.provider = provider;
+            }
+            if let Some(model) = group.model {
+                cfg.model = model;
+            }
+            if let Some(auth) = group.auth {
+                cfg.auth = auth;
+            }
+            if let Some(reasoning) = group.reasoning {
+                cfg.reasoning = reasoning;
+            }
+            if let Some(fast_mode) = group.fast_mode {
+                cfg.fast_mode = fast_mode;
+            }
+            if let Some(models) = group.favorite_models {
+                cfg.favorite_models = favorite_model_values(&normalized_favorite_models(&models));
+            }
+            if let Some(aliases) = group.aliases {
+                cfg.model_aliases = aliases;
+            }
+        }
+        None => {}
+    }
+    cfg.validate_model_aliases()?;
+    cfg.resolve_model_alias()?;
+    if let Some(group) = file.questionnaire {
+        cfg.questionnaire = group;
+    }
+    if let Some(group) = file.codemode {
+        cfg.codemode = group;
+    }
+    if let Some(group) = file.display {
+        if let Some(value) = group.show_reasoning_output {
+            cfg.show_reasoning_output = value;
+        }
+        if let Some(value) = group.zen_mode {
+            cfg.zen_mode = value;
+        }
+        if let Some(value) = group.output_streaming {
+            cfg.output_streaming = value;
+        }
+        if let Some(value) = group.theme {
+            let trimmed = value.trim();
+            cfg.theme = if trimmed.is_empty() {
+                "terminal".into()
+            } else {
+                trimmed.to_string()
+            };
+        }
+        if let Some(value) = group.max_tool_output_lines {
+            let clamped = value.max(1);
+            if clamped != value {
+                warnings.push(ConfigWarning::Clamped {
+                    key: "display.max_tool_output_lines",
+                    from: value.to_string(),
+                    to: clamped.to_string(),
+                });
+            }
+            cfg.max_tool_output_lines = clamped;
+        }
+        if let Some(value) = group.prompt_history_limit {
+            let clamped = value.min(crate::config::MAX_PROMPT_HISTORY_LIMIT);
+            if clamped != value {
+                warnings.push(ConfigWarning::Clamped {
+                    key: "display.prompt_history_limit",
+                    from: value.to_string(),
+                    to: clamped.to_string(),
+                });
+            }
+            cfg.prompt_history_limit = clamped;
+        }
+        if let Some(value) = group.cache_miss_notices {
+            cfg.cache_miss_notices = value;
+        }
+        if let Some(value) = group.show_header_hints {
+            cfg.show_header_hints = value;
+        }
+        if let Some(value) = group.notifications {
+            cfg.notifications = value;
+        }
+    }
+    if let Some(group) = file.output {
+        if let Some(value) = group.max_output_bytes {
+            cfg.max_output_bytes = value;
+        }
+    }
+    if let Some(group) = file.compaction {
+        if let Some(value) = group.auto_compact {
+            cfg.auto_compact = value;
+        }
+        if let Some(value) = group.compact_threshold_percent {
+            cfg.set_compact_threshold_percent(value);
+            note_if_changed(
+                &mut warnings,
+                "compaction.compact_threshold_percent",
+                value,
+                cfg.compact_threshold_percent,
+            );
+        }
+        if let Some(value) = group.compact_target_percent {
+            cfg.set_compact_target_percent(value);
+            note_if_changed(
+                &mut warnings,
+                "compaction.compact_target_percent",
+                value,
+                cfg.compact_target_percent,
+            );
+        }
+    }
+    cfg.internal_agents = file
+        .internal_agents
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(id, group)| {
+            if catalog_entry_cannot_override(&id, &group, &cfg.model_aliases) {
+                warnings.push(ConfigWarning::Normalized {
+                    key: "internal_agents",
+                    from: format!("for agent '{id}'"),
+                    to: "no override; a catalog agent's entry must name a Rho provider and model"
+                        .into(),
+                });
+                return None;
+            }
+            let selection = internal_agent_selection(&id, group, &cfg, &mut warnings);
+            Some((id, selection))
+        })
+        .collect();
+    if let Some(group) = file.title {
+        let provider = group.provider.unwrap_or_else(|| cfg.provider.clone());
+        let auth = group
+            .auth
+            .unwrap_or_else(|| inferred_provider_auth(&provider, &cfg.provider, &cfg.auth));
+        let model = group.model.unwrap_or_else(|| cfg.model.clone());
+        cfg.internal_agents
+            .entry("session-title".into())
+            .or_insert_with(|| InternalAgentModelConfig::new(provider, model, auth));
+    }
+    cfg.resolve_internal_agent_model_aliases()?;
+    cfg.normalize_provider_profiles()?;
+    if let Some(group) = file.web_search {
+        cfg.legacy_web_search_credentials = LegacyWebSearchCredentials {
+            openai: group.openai_api_key.clone().and_then(non_empty_secret),
+            exa: group.exa_api_key.clone().and_then(non_empty_secret),
+            brave: group.brave_api_key.clone().and_then(non_empty_secret),
+        };
+        cfg.web_search = web_search::resolve_web_search_settings(group, &mut warnings)?;
+    }
+    if let Some(group) = file.xai {
+        if let Some(image_generation) = group.image_generation {
+            cfg.xai_image_generation = image_generation;
+        }
+    }
+    if let Some(group) = file.behavior {
+        // `check_for_updates` was removed; the key is still accepted so old
+        // configs load, but it has no effect.
+        if let Some(value) = group.enable_subagents {
+            cfg.enable_subagents = value;
+        }
+        if let Some(value) = group.agent_concurrency {
+            cfg.set_agent_concurrency(value);
+            note_if_changed_usize(
+                &mut warnings,
+                "behavior.agent_concurrency",
+                value,
+                cfg.agent_concurrency,
+            );
+        }
+        if let Some(value) = group.advisor_mode {
+            cfg.advisor_mode = value;
+        }
+        if let Some(value) = group.workspace_rewind {
+            cfg.workspace_rewind = value;
+        }
+        if let Some(value) = group.keep_cache_warm {
+            cfg.keep_cache_warm = value;
+        }
+        if let Some(value) = group.permission_mode {
+            cfg.permission_mode = value;
+        }
+        if let Some(value) = group.edit_tool {
+            cfg.edit_tool = value;
+        }
+        if let Some(value) = group.shell_tool {
+            cfg.shell_tool = value;
+            // `powershell` parses everywhere so a config shared with Windows
+            // still loads; on Unix only `bash` is offered, so the pin
+            // normalizes to `auto` instead of advertising a tool that cannot run.
+            #[cfg(not(windows))]
+            if value == ShellTool::PowerShell {
+                warnings.push(ConfigWarning::Normalized {
+                    key: "behavior.shell_tool",
+                    from: "powershell".into(),
+                    to: "auto; powershell is only selectable on Windows".into(),
+                });
+                cfg.shell_tool = ShellTool::Auto;
+            }
+        }
+        if let Some(value) = group.rtk {
+            cfg.rtk = value;
+        }
+        if let Some(value) = group.inline_shell.filter(|value| !value.trim().is_empty()) {
+            cfg.inline_shell = value;
+        }
+    }
+    if let Some(keybindings) = file.keybindings {
+        cfg.keybindings = keybindings;
+    }
+    Ok((cfg, warnings))
+}
+
+fn note_if_changed(
+    warnings: &mut Vec<ConfigWarning>,
+    key: &'static str,
+    requested: u8,
+    actual: u8,
+) {
+    note_if_changed_usize(warnings, key, requested as usize, actual as usize);
+}
+
+fn note_if_changed_usize(
+    warnings: &mut Vec<ConfigWarning>,
+    key: &'static str,
+    requested: usize,
+    actual: usize,
+) {
+    if requested != actual {
+        warnings.push(ConfigWarning::Clamped {
+            key,
+            from: requested.to_string(),
+            to: actual.to_string(),
+        });
+    }
+}
+
+fn non_empty_secret(secret: String) -> Option<String> {
+    let secret = secret.trim().to_string();
+    (!secret.is_empty()).then_some(secret)
+}
+
+/// Raw file shape. Serde rejects unknown fields so a misspelled key fails loudly.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialConfig {
+    questionnaire: Option<super::QuestionnaireConfig>,
+    codemode: Option<super::CodemodeConfig>,
+    provider: Option<String>,
+    model: Option<ModelSetting>,
+    max_output_bytes: Option<usize>,
+    max_tool_output_lines: Option<usize>,
+    auth: Option<String>,
+    reasoning: Option<ReasoningLevel>,
+    fast_mode: Option<bool>,
+    reasoning_effort: Option<String>,
+    show_reasoning_output: Option<bool>,
+    zen_mode: Option<bool>,
+    auto_compact: Option<bool>,
+    compact_threshold_percent: Option<u8>,
+    compact_target_percent: Option<u8>,
+    title_provider: Option<String>,
+    title_model: Option<String>,
+    title_auth: Option<String>,
+    favorite_models: Option<Vec<String>>,
+    web_search_provider: Option<String>,
+    check_for_updates: Option<bool>,
+    enable_subagents: Option<bool>,
+    permission_mode: Option<PermissionMode>,
+    web_search_openai_api_key: Option<String>,
+    web_search_exa_api_key: Option<String>,
+    web_search_brave_api_key: Option<String>,
+    rtk: Option<bool>,
+    inline_shell: Option<String>,
+    display: Option<PartialDisplayConfig>,
+    output: Option<PartialOutputConfig>,
+    compaction: Option<PartialCompactionConfig>,
+    title: Option<PartialTitleConfig>,
+    internal_agents: Option<BTreeMap<String, PartialInternalAgentModelConfig>>,
+    web_search: Option<web_search::PartialWebSearchConfig>,
+    xai: Option<PartialXaiConfig>,
+    behavior: Option<PartialBehaviorConfig>,
+    keybindings: Option<Keybindings>,
+    prompt_templates: Option<crate::prompt_templates::PromptTemplates>,
+    mcp: Option<crate::tools::mcp::config::McpConfig>,
+    openapi: Option<crate::tools::openapi::config::OpenApiConfig>,
+    providers: Option<PartialProviderConfigs>,
+}
+
+impl PartialConfig {
+    /// Fold every legacy top-level key into its modern group.
+    ///
+    /// Group values win when both a flat key and a group field are present,
+    /// matching the previous parse order where groups were applied second.
+    fn normalize_legacy(mut self) -> anyhow::Result<Self> {
+        if self.reasoning.is_none() {
+            if let Some(effort) = self.reasoning_effort.take() {
+                self.reasoning = Some(effort.parse()?);
+            }
+        } else {
+            self.reasoning_effort = None;
+        }
+
+        let show_reasoning_output = self.show_reasoning_output.take();
+        let zen_mode = self.zen_mode.take();
+        let max_tool_output_lines = self.max_tool_output_lines.take();
+        if show_reasoning_output.is_some()
+            || zen_mode.is_some()
+            || max_tool_output_lines.is_some()
+            || self.display.is_some()
+        {
+            let group = self.display.take().unwrap_or_default();
+            self.display = Some(PartialDisplayConfig {
+                show_reasoning_output: group.show_reasoning_output.or(show_reasoning_output),
+                zen_mode: group.zen_mode.or(zen_mode),
+                output_streaming: group.output_streaming,
+                theme: group.theme,
+                max_tool_output_lines: group.max_tool_output_lines.or(max_tool_output_lines),
+                prompt_history_limit: group.prompt_history_limit,
+                cache_miss_notices: group.cache_miss_notices,
+                show_header_hints: group.show_header_hints,
+                notifications: group.notifications,
+            });
+        }
+
+        let max_output_bytes = self.max_output_bytes.take();
+        if max_output_bytes.is_some() || self.output.is_some() {
+            let group = self.output.take().unwrap_or(PartialOutputConfig {
+                max_output_bytes: None,
+            });
+            self.output = Some(PartialOutputConfig {
+                max_output_bytes: group.max_output_bytes.or(max_output_bytes),
+            });
+        }
+
+        let auto_compact = self.auto_compact.take();
+        let compact_threshold_percent = self.compact_threshold_percent.take();
+        let compact_target_percent = self.compact_target_percent.take();
+        if auto_compact.is_some()
+            || compact_threshold_percent.is_some()
+            || compact_target_percent.is_some()
+            || self.compaction.is_some()
+        {
+            let group = self.compaction.take().unwrap_or(PartialCompactionConfig {
+                auto_compact: None,
+                compact_threshold_percent: None,
+                compact_target_percent: None,
+            });
+            self.compaction = Some(PartialCompactionConfig {
+                auto_compact: group.auto_compact.or(auto_compact),
+                compact_threshold_percent: group
+                    .compact_threshold_percent
+                    .or(compact_threshold_percent),
+                compact_target_percent: group.compact_target_percent.or(compact_target_percent),
+            });
+        }
+
+        let _ = self.check_for_updates.take();
+        let enable_subagents = self.enable_subagents.take();
+        let permission_mode = self.permission_mode.take();
+        let rtk = self.rtk.take();
+        let inline_shell = self.inline_shell.take();
+        if enable_subagents.is_some()
+            || permission_mode.is_some()
+            || rtk.is_some()
+            || inline_shell.is_some()
+            || self.behavior.is_some()
+        {
+            let group = self.behavior.take().unwrap_or(PartialBehaviorConfig {
+                check_for_updates: None,
+                enable_subagents: None,
+                agent_concurrency: None,
+                advisor_mode: None,
+                workspace_rewind: None,
+                keep_cache_warm: None,
+                _legacy_workspace_rewind: None,
+                permission_mode: None,
+                edit_tool: None,
+                credential_store: None,
+                rtk: None,
+                inline_shell: None,
+                shell_tool: None,
+            });
+            self.behavior = Some(PartialBehaviorConfig {
+                check_for_updates: group.check_for_updates,
+                enable_subagents: group.enable_subagents.or(enable_subagents),
+                agent_concurrency: group.agent_concurrency,
+                advisor_mode: group.advisor_mode,
+                workspace_rewind: group.workspace_rewind,
+                keep_cache_warm: group.keep_cache_warm,
+                _legacy_workspace_rewind: None,
+                permission_mode: group.permission_mode.or(permission_mode),
+                edit_tool: group.edit_tool,
+                credential_store: group.credential_store,
+                rtk: group.rtk.or(rtk),
+                inline_shell: group.inline_shell.or(inline_shell),
+                shell_tool: group.shell_tool,
+            });
+        }
+
+        let web_search_provider = self.web_search_provider.take();
+        let openai_api_key = self.web_search_openai_api_key.take();
+        let exa_api_key = self.web_search_exa_api_key.take();
+        let brave_api_key = self.web_search_brave_api_key.take();
+        if web_search_provider.is_some()
+            || openai_api_key.is_some()
+            || exa_api_key.is_some()
+            || brave_api_key.is_some()
+            || self.web_search.is_some()
+        {
+            let group = self.web_search.take().unwrap_or_default();
+            self.web_search = Some(web_search::PartialWebSearchConfig {
+                hosted: group.hosted,
+                provider: group.provider.or(web_search_provider),
+                mode: group.mode,
+                backend: group.backend,
+                openai_api_key: group.openai_api_key.or(openai_api_key),
+                exa_api_key: group.exa_api_key.or(exa_api_key),
+                brave_api_key: group.brave_api_key.or(brave_api_key),
+                openai: group.openai,
+                exa: group.exa,
+                brave: group.brave,
+                firecrawl: group.firecrawl,
+            });
+        }
+
+        let title_provider = self.title_provider.take();
+        let title_model = self.title_model.take();
+        let title_auth = self.title_auth.take();
+        match self.title.take() {
+            Some(group)
+                if group.provider.is_none() && group.model.is_none() && group.auth.is_none() =>
+            {
+                // Empty `[title]` is a no-op. Legacy top-level title_* keys still apply.
+                if title_provider.is_some() || title_model.is_some() || title_auth.is_some() {
+                    self.title = Some(PartialTitleConfig {
+                        provider: title_provider,
+                        model: title_model,
+                        auth: title_auth,
+                    });
+                }
+            }
+            Some(group) => {
+                self.title = Some(PartialTitleConfig {
+                    provider: group.provider.or(title_provider),
+                    model: group.model.or(title_model),
+                    auth: group.auth.or(title_auth),
+                });
+            }
+            None if title_provider.is_some() || title_model.is_some() || title_auth.is_some() => {
+                self.title = Some(PartialTitleConfig {
+                    provider: title_provider,
+                    model: title_model,
+                    auth: title_auth,
+                });
+            }
+            None => {}
+        }
+
+        self.model = match self.model.take() {
+            Some(ModelSetting::Group(mut group)) => {
+                group.provider = group.provider.or(self.provider.take());
+                group.auth = group.auth.or(self.auth.take());
+                group.reasoning = group.reasoning.or(self.reasoning.take());
+                group.fast_mode = group.fast_mode.or(self.fast_mode.take());
+                group.favorite_models = group.favorite_models.or(self.favorite_models.take());
+                Some(ModelSetting::Group(group))
+            }
+            other => other,
+        };
+
+        Ok(self)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ModelSetting {
+    Name(String),
+    Group(PartialModelConfig),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialModelConfig {
+    provider: Option<String>,
+    model: Option<String>,
+    auth: Option<String>,
+    reasoning: Option<ReasoningLevel>,
+    fast_mode: Option<bool>,
+    favorite_models: Option<Vec<String>>,
+    aliases: Option<ModelAliases>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialDisplayConfig {
+    show_reasoning_output: Option<bool>,
+    zen_mode: Option<bool>,
+    output_streaming: Option<super::StreamingMode>,
+    theme: Option<String>,
+    max_tool_output_lines: Option<usize>,
+    prompt_history_limit: Option<usize>,
+    cache_miss_notices: Option<bool>,
+    show_header_hints: Option<bool>,
+    notifications: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialOutputConfig {
+    max_output_bytes: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialCompactionConfig {
+    auto_compact: Option<bool>,
+    compact_threshold_percent: Option<u8>,
+    compact_target_percent: Option<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialInternalAgentModelConfig {
+    /// `rho` (default). Absent means Rho, so entries written
+    /// before the runtime key existed keep loading unchanged.
+    runtime: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    auth: Option<String>,
+    /// How a decision-model entry asks its model; see [`ModelKind`].
+    kind: Option<ModelKind>,
+    /// The P(allow) percent at which a decision-model permission screen
+    /// allows. Range-checked where the screen is built, so a bad value names
+    /// its limit instead of failing the whole config load.
+    allow_threshold_percent: Option<u8>,
+    reasoning: Option<ReasoningLevel>,
+}
+
+/// Whether an entry for a catalog agent (an id Rho does not reserve, such
+/// as a plugin agent's) fails to name an explicit Rho provider and model.
+/// A `@alias` model whose target names a provider names both.
+/// Such an entry replaces the model the agent's file names, so the
+/// conversation-model fallback internal agents use would swap models nobody
+/// asked to swap; config load drops it instead.
+fn catalog_entry_cannot_override(
+    id: &str,
+    group: &PartialInternalAgentModelConfig,
+    aliases: &ModelAliases,
+) -> bool {
+    let catalog =
+        crate::agent::AgentId::new(id).is_ok_and(|id| !crate::agent::is_reserved_agent_id(&id));
+    let rho = matches!(
+        group.runtime.as_deref(),
+        None | Some(crate::config::RHO_RUNTIME_KEY)
+    );
+    // An undefined alias counts as named, so alias resolution fails the load
+    // loudly instead of this check dropping the entry.
+    let alias_names_provider = |model: &str| {
+        aliases
+            .resolve(model)
+            .map_or(true, |resolved| resolved.provider.is_some())
+    };
+    let names_model = match (&group.provider, group.model.as_deref()) {
+        (Some(_), Some(_)) => true,
+        (None, Some(model)) => model.starts_with('@') && alias_names_provider(model),
+        (_, None) => false,
+    };
+    catalog && !(rho && names_model)
+}
+
+/// Builds one internal-agent selection, filling Rho defaults from the
+/// conversation model.
+///
+/// An unusable `runtime` value falls back to the whole conversation selection
+/// rather than failing the config load, and Rho-only keys on a `claude-cli`
+/// entry are reported instead of silently dropped.
+fn internal_agent_selection(
+    id: &str,
+    group: PartialInternalAgentModelConfig,
+    cfg: &Config,
+    warnings: &mut Vec<ConfigWarning>,
+) -> InternalAgentModelConfig {
+    let runtime = internal_agent_runtime_key(id, group.runtime.as_deref(), warnings);
+    let mut selection = match runtime {
+        InternalAgentRuntimeKey::Rho => {
+            let provider = group.provider.unwrap_or_else(|| cfg.provider.clone());
+            let auth = group
+                .auth
+                .unwrap_or_else(|| inferred_provider_auth(&provider, &cfg.provider, &cfg.auth));
+            let model = group.model.unwrap_or_else(|| cfg.model.clone());
+            let mut selection = InternalAgentModelConfig::new(provider, model, auth);
+            let InternalAgentTarget::Rho(rho) = &mut selection.target;
+            rho.kind = group.kind;
+            rho.allow_threshold_percent = group.allow_threshold_percent;
+            selection
+        }
+        // A rejected runtime takes the whole entry with it. Provider, model,
+        // and auth were written to work together under the runtime we are not
+        // using, so keeping any one of them risks a pairing no runtime asked
+        // for - a conversation model routed through the entry's credentials.
+        InternalAgentRuntimeKey::Rejected => {
+            InternalAgentModelConfig::new(cfg.provider.clone(), cfg.model.clone(), cfg.auth.clone())
+        }
+    };
+    // `reasoning` is Rho vocabulary on both runtimes, so it survives either way.
+    selection.reasoning = group.reasoning;
+    selection
+}
+
+/// Reads the `runtime` key of one `[internal_agents.<id>]` entry, reporting
+/// every value it cannot honor.
+fn internal_agent_runtime_key(
+    _id: &str,
+    runtime: Option<&str>,
+    warnings: &mut Vec<ConfigWarning>,
+) -> InternalAgentRuntimeKey {
+    let (from, to) = match runtime {
+        None | Some(crate::config::RHO_RUNTIME_KEY) => return InternalAgentRuntimeKey::Rho,
+        Some(crate::config::CURSOR_RUNTIME_KEY) => (
+            crate::config::CURSOR_RUNTIME_KEY,
+            format!(
+                "\"{}\" with the conversation selection; [internal_agents] runtime stays rho, not cursor",
+                crate::config::RHO_RUNTIME_KEY
+            ),
+        ),
+        Some(other) => (
+            other,
+            format!(
+                "\"{}\" with the conversation selection",
+                crate::config::RHO_RUNTIME_KEY
+            ),
+        ),
+    };
+    warnings.push(ConfigWarning::Normalized {
+        key: "internal_agents.runtime",
+        from: format!("\"{from}\""),
+        to,
+    });
+    InternalAgentRuntimeKey::Rejected
+}
+
+/// Parsed `runtime` key for an internal-agent entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InternalAgentRuntimeKey {
+    Rho,
+    /// A value we cannot honor. Runs on Rho with the conversation provider,
+    /// model, and auth, ignoring every override on the entry.
+    Rejected,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialTitleConfig {
+    provider: Option<String>,
+    model: Option<String>,
+    auth: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialXaiConfig {
+    image_generation: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialBehaviorConfig {
+    // Legacy key: accepted so old configs parse under `deny_unknown_fields`,
+    // ignored since the update check was removed.
+    check_for_updates: Option<bool>,
+    enable_subagents: Option<bool>,
+    agent_concurrency: Option<usize>,
+    advisor_mode: Option<bool>,
+    workspace_rewind: Option<bool>,
+    keep_cache_warm: Option<bool>,
+    // Rho saved every key, including the old false default. Accept but ignore it;
+    // only the new workspace_rewind key can opt out. Saving drops this legacy key.
+    #[serde(rename = "experimental_workspace_rewind")]
+    _legacy_workspace_rewind: Option<bool>,
+    #[serde(default)]
+    permission_mode: Option<PermissionMode>,
+    edit_tool: Option<EditTool>,
+    // Legacy key: accepted so old configs parse under `deny_unknown_fields`,
+    // ignored since credentials always use the file store. Saving drops it.
+    credential_store: Option<String>,
+    rtk: Option<bool>,
+    inline_shell: Option<String>,
+    shell_tool: Option<ShellTool>,
+}

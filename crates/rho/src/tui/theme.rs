@@ -1,0 +1,968 @@
+use std::collections::HashMap;
+#[cfg(not(test))]
+use std::sync::Mutex;
+use std::sync::OnceLock;
+
+use ratatui::{
+    style::{Color, Modifier, Style},
+    text::Line,
+};
+
+use super::{
+    markdown::HeadingLevel,
+    theme_scheme::{
+        self, is_terminal_theme_id, normalize_theme_id, resolve_fixed_scheme, ColorScheme, Rgb,
+        TERMINAL_THEME_ID,
+    },
+    theme_terminal::{AnsiColor, TerminalPalette},
+};
+
+#[path = "theme_diff.rs"]
+mod theme_diff;
+
+const USER_BACKGROUND_ALPHA: f32 = 0.10;
+const NEUTRAL_TOOL_BACKGROUND_ALPHA: f32 = 0.10;
+// Blend strength for hovered tool-card text. Enough to read as a lift at a
+// glance without turning the card into a highlight.
+const HOVER_LIFT_ALPHA: f32 = 0.35;
+// Light/dark split for palette-derived chrome. Matches the existing block
+// contrast threshold used by block_foreground.
+const LIGHT_BACKGROUND_LUMINANCE: f32 = 0.55;
+// Dim candidate band: stay muted and readable against the terminal background.
+// 0.75 ≈ #c0c0c0 (above this, dark-bg dim collapses into body white).
+const DIM_MAX_LUMINANCE_ON_DARK: f32 = 0.75;
+// 0.12 ≈ #383838 (below this, dark-bg dim vanishes into the background).
+const DIM_MIN_LUMINANCE_ON_DARK: f32 = 0.12;
+// 0.45 rejects mid/light bright-black samples on light backgrounds.
+const DIM_MAX_LUMINANCE_ON_LIGHT: f32 = 0.45;
+// Minimum luminance gap so muted text neither matches the wash nor the body.
+const DIM_CONTRAST_MARGIN: f32 = 0.08;
+// Last-resort muted ink: pull body toward the wash so chrome stays dim, not body.
+const DIM_BLEND_ALPHA: f32 = 0.55;
+// Status/role ink (warning, success, ...) vs surface. Bright yellow on light
+// surfaces is the usual failure; require a clear darker/lighter separation.
+const ROLE_INK_MARGIN: f32 = 0.22;
+
+/// Host terminal sample captured once at startup.
+static TERMINAL_SAMPLE: OnceLock<TerminalPalette> = OnceLock::new();
+
+/// Active theme selection (terminal-matched or a fixed scheme).
+///
+/// The running app shares one selection across the process. Tests get one per
+/// thread instead, so a test that switches themes cannot rewrite the styles a
+/// concurrently running test is comparing against.
+#[cfg(not(test))]
+static THEME_STATE: Mutex<ThemeState> = Mutex::new(ThemeState::new());
+
+#[cfg(test)]
+thread_local! {
+    static THEME_STATE: std::cell::RefCell<ThemeState> =
+        const { std::cell::RefCell::new(ThemeState::new()) };
+}
+
+/// Run `update` with exclusive access to the active theme selection. Callers
+/// must not re-enter: the production lock is not reentrant.
+fn with_theme_state<R>(update: impl FnOnce(&mut ThemeState) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        update(
+            &mut THEME_STATE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        )
+    }
+    #[cfg(test)]
+    {
+        THEME_STATE.with_borrow_mut(update)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ThemeState {
+    /// Configured / committed theme id (`terminal`, `one-half-dark`, ...).
+    committed_id: String,
+    /// Id currently driving colors (may be a live picker preview).
+    active_id: String,
+    /// Fixed scheme when `active_id` is not terminal.
+    active_scheme: Option<ColorScheme>,
+    /// Bumps when active colors change so history cache rebuilds.
+    generation: u64,
+    /// Derived palette for the active colors. Style accessors run per span on
+    /// render hot paths, so the blend/luminance work happens once per theme
+    /// change instead of once per call.
+    palette: Option<Palette>,
+    /// Schemes retained from the open theme picker so preview/apply do not
+    /// re-read custom theme files while browsing.
+    picker_catalog: Option<HashMap<String, ColorScheme>>,
+}
+
+impl ThemeState {
+    const fn new() -> Self {
+        Self {
+            committed_id: String::new(),
+            active_id: String::new(),
+            active_scheme: None,
+            generation: 0,
+            palette: None,
+            picker_catalog: None,
+        }
+    }
+}
+
+impl Rgb {
+    fn color(self) -> Color {
+        Color::Rgb(self.red, self.green, self.blue)
+    }
+
+    /// True when this sample can serve as muted chrome against `background_luminance`.
+    fn is_usable_dim(self, background_luminance: f32) -> bool {
+        let luminance = self.luminance();
+        if is_light_background(background_luminance) {
+            luminance + DIM_CONTRAST_MARGIN < background_luminance
+                && luminance < DIM_MAX_LUMINANCE_ON_LIGHT
+        } else {
+            (DIM_MIN_LUMINANCE_ON_DARK..=DIM_MAX_LUMINANCE_ON_DARK).contains(&luminance)
+                && luminance >= background_luminance + DIM_CONTRAST_MARGIN
+        }
+    }
+}
+
+impl TerminalPalette {
+    fn blended_background(&self, color: AnsiColor, alpha: f32) -> Option<BlockColor> {
+        self.ansi.get(&color).map(|ansi| {
+            let rgb = self.background.blend_toward(*ansi, alpha);
+            BlockColor::from_rgb(rgb)
+        })
+    }
+
+    fn dim_foreground(&self) -> Color {
+        // Dim chrome comes from ANSI bright black (index 8), never white (index 7).
+        // Terminal mode keeps named ANSI fallbacks so the host palette paints them.
+        let background_luminance = self.background.luminance();
+        let fallback = if is_light_background(background_luminance) {
+            Color::Black
+        } else {
+            Color::DarkGray
+        };
+        self.ansi
+            .get(&AnsiColor::BrightBlack)
+            .copied()
+            .filter(|rgb| rgb.is_usable_dim(background_luminance))
+            .map_or(fallback, Rgb::color)
+    }
+}
+
+fn scheme_dim_candidates(scheme: &ColorScheme) -> [Rgb; 3] {
+    [
+        scheme_ansi(scheme, AnsiColor::BrightBlack),
+        scheme.ansi[0], // black (ANSI 0 has no AnsiColor variant)
+        scheme.foreground,
+    ]
+}
+
+/// Prefer a candidate that is muted and readable on `background`; otherwise stay
+/// muted by blending body ink into the wash instead of jumping to full contrast.
+fn dim_on_background(
+    background: Rgb,
+    candidates: impl IntoIterator<Item = Rgb>,
+    body: Rgb,
+) -> Color {
+    let background_luminance = background.luminance();
+    for candidate in candidates {
+        if candidate.is_usable_dim(background_luminance) {
+            return candidate.color();
+        }
+    }
+    background.blend_toward(body, DIM_BLEND_ALPHA).color()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockColor {
+    color: Color,
+    rgb: Option<Rgb>,
+}
+
+impl BlockColor {
+    fn from_rgb(rgb: Rgb) -> Self {
+        Self {
+            color: rgb.color(),
+            rgb: Some(rgb),
+        }
+    }
+
+    const fn from_color(color: Color) -> Self {
+        Self { color, rgb: None }
+    }
+}
+
+fn panel_dim_from_terminal(
+    dim: Color,
+    panel: BlockColor,
+    terminal: Option<&TerminalPalette>,
+) -> Color {
+    let Some(background) = panel.rgb else {
+        // Named collision with no RGB: keep a muted slot, not body white.
+        return if dim == panel.color { Color::Gray } else { dim };
+    };
+    let body = if is_light_background(background.luminance()) {
+        Rgb::new(0, 0, 0)
+    } else {
+        Rgb::new(255, 255, 255)
+    };
+    dim_on_background(
+        background,
+        terminal.and_then(|palette| palette.ansi.get(&AnsiColor::BrightBlack).copied()),
+        body,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Palette {
+    /// Body text. `None` keeps the host default foreground (terminal theme).
+    text: Option<Color>,
+    /// Full-screen surface. `None` keeps the host default background.
+    surface: Option<Color>,
+    dim: Color,
+    /// Muted ink that still reads on `neutral_tool_background`.
+    panel_dim: Color,
+    accent: Color,
+    success: Color,
+    warning: Color,
+    error: Color,
+    skill: Color,
+    user_background: BlockColor,
+    neutral_tool_background: BlockColor,
+    /// Add-side row wash. Absent without sampled RGB.
+    diff_add_wash: Option<BlockColor>,
+    /// Delete-side row wash. Absent without sampled RGB.
+    diff_del_wash: Option<BlockColor>,
+}
+
+impl Palette {
+    fn current() -> Self {
+        with_theme_state(|state| {
+            if let Some(palette) = state.palette {
+                return palette;
+            }
+            let palette = match state.active_scheme.as_ref() {
+                Some(scheme) => Self::from_scheme(scheme),
+                None => Self::from_terminal(TERMINAL_SAMPLE.get()),
+            };
+            state.palette = Some(palette);
+            palette
+        })
+    }
+
+    fn from_terminal(terminal: Option<&TerminalPalette>) -> Self {
+        let surface = terminal.map(|palette| palette.background);
+        let (diff_add_wash, diff_del_wash) = theme_diff::terminal_diff_washes(terminal);
+        let dim = terminal.map_or(Color::DarkGray, TerminalPalette::dim_foreground);
+        let panel = blended_or_fallback(
+            terminal,
+            AnsiColor::White,
+            NEUTRAL_TOOL_BACKGROUND_ALPHA,
+            BlockColor::from_color(Color::DarkGray),
+        );
+        Self {
+            text: None,
+            surface: None,
+            dim,
+            panel_dim: panel_dim_from_terminal(dim, panel, terminal),
+            // Prefer sampled RGB when the host answered palette queries so brand,
+            // version, and status colors track the real terminal theme instead of
+            // generic named ANSI (which often looks "hardcoded").
+            accent: role_ink(sampled_or_named(terminal, AnsiColor::Cyan), surface),
+            success: role_ink(sampled_or_named(terminal, AnsiColor::Green), surface),
+            warning: role_ink(sampled_or_named(terminal, AnsiColor::Yellow), surface),
+            error: role_ink(sampled_or_named(terminal, AnsiColor::Red), surface),
+            skill: role_ink(sampled_or_named(terminal, AnsiColor::Magenta), surface),
+            user_background: panel,
+            // Same blend recipe as user prompts today; keep a dedicated field so
+            // tool chrome can diverge later without rewriting call sites.
+            neutral_tool_background: panel,
+            diff_add_wash,
+            diff_del_wash,
+        }
+    }
+
+    fn from_scheme(scheme: &ColorScheme) -> Self {
+        let panel = scheme_panel_background(scheme);
+        let surface = scheme.background;
+        let (diff_add_wash, diff_del_wash) = theme_diff::scheme_diff_washes(scheme);
+        let dim_candidates = scheme_dim_candidates(scheme);
+        let dim = dim_on_background(scheme.background, dim_candidates, scheme.foreground);
+        let panel_dim = match panel.rgb {
+            Some(background) => dim_on_background(background, dim_candidates, scheme.foreground),
+            None => dim,
+        };
+        Self {
+            text: Some(scheme.foreground.color()),
+            surface: Some(scheme.background.color()),
+            dim,
+            panel_dim,
+            accent: role_ink(scheme_ansi(scheme, AnsiColor::Cyan).color(), Some(surface)),
+            success: role_ink(scheme_ansi(scheme, AnsiColor::Green).color(), Some(surface)),
+            warning: role_ink(
+                scheme_ansi(scheme, AnsiColor::Yellow).color(),
+                Some(surface),
+            ),
+            error: role_ink(scheme_ansi(scheme, AnsiColor::Red).color(), Some(surface)),
+            skill: role_ink(
+                scheme_ansi(scheme, AnsiColor::Magenta).color(),
+                Some(surface),
+            ),
+            user_background: panel,
+            neutral_tool_background: panel,
+            diff_add_wash,
+            diff_del_wash,
+        }
+    }
+}
+
+/// Soft panel wash: blend dark ink into light surfaces, light ink into dark ones.
+fn scheme_panel_background(scheme: &ColorScheme) -> BlockColor {
+    let background = scheme.background;
+    let wash = if is_light_background(background.luminance()) {
+        scheme.ansi[0] // black
+    } else {
+        scheme_ansi(scheme, AnsiColor::White)
+    };
+    BlockColor::from_rgb(background.blend_toward(wash, USER_BACKGROUND_ALPHA))
+}
+
+fn scheme_ansi(scheme: &ColorScheme, color: AnsiColor) -> Rgb {
+    scheme.ansi[color.index() as usize]
+}
+
+/// Sampled host RGB when available, else the named ANSI fallback.
+fn sampled_or_named(terminal: Option<&TerminalPalette>, color: AnsiColor) -> Color {
+    terminal
+        .and_then(|palette| palette.ansi.get(&color).copied())
+        .map(Rgb::color)
+        .unwrap_or_else(|| color.color())
+}
+
+/// Make role ink readable as text on the UI surface.
+///
+/// Keeps the hue family (yellow stays warm, red stays red) but pulls bright
+/// inks darker on light surfaces and invisible dark inks lighter on dark ones.
+/// Named ANSI colors pass through unchanged so the host can still paint them.
+fn role_ink(ink: Color, surface: Option<Rgb>) -> Color {
+    let Color::Rgb(red, green, blue) = ink else {
+        return ink;
+    };
+    let Some(surface) = surface else {
+        return ink;
+    };
+    let ink = Rgb::new(red, green, blue);
+    let surface_luminance = surface.luminance();
+    let ink_luminance = ink.luminance();
+
+    if is_light_background(surface_luminance) {
+        // Light UI: role text must sit clearly below the surface luminance.
+        if ink_luminance + ROLE_INK_MARGIN <= surface_luminance {
+            return ink.color();
+        }
+        return pull_ink_until(ink, Rgb::new(0, 0, 0), |candidate| {
+            candidate.luminance() + ROLE_INK_MARGIN <= surface_luminance
+        });
+    }
+
+    // Dark UI: keep any ink already brighter than the surface; only lift
+    // colors that disappear into the background.
+    if ink_luminance > surface_luminance {
+        return ink.color();
+    }
+    pull_ink_until(ink, Rgb::new(255, 255, 255), |candidate| {
+        candidate.luminance() > surface_luminance
+    })
+}
+
+fn pull_ink_until(start: Rgb, target: Rgb, acceptable: impl Fn(Rgb) -> bool) -> Color {
+    if acceptable(start) {
+        return start.color();
+    }
+    let mut best = start.blend_toward(target, 0.95);
+    for alpha in [0.25_f32, 0.4, 0.55, 0.7, 0.85, 0.95] {
+        let candidate = start.blend_toward(target, alpha);
+        if acceptable(candidate) {
+            return candidate.color();
+        }
+        best = candidate;
+    }
+    best.color()
+}
+
+/// Color for an ANSI role under the active theme.
+fn active_ansi_color(color: AnsiColor) -> Color {
+    with_theme_state(|state| match state.active_scheme.as_ref() {
+        Some(scheme) => scheme_ansi(scheme, color).color(),
+        None => sampled_or_named(TERMINAL_SAMPLE.get(), color),
+    })
+}
+
+/// Syntax-highlighting roles for code fences and diff bodies. The highlighter
+/// maps syntect scopes onto these; the theme maps them onto the palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SyntaxRole {
+    Comment,
+    String,
+    Constant,
+    Keyword,
+    Function,
+    Type,
+}
+
+pub(super) struct Theme;
+
+impl Theme {
+    /// Probe and install the palette before any terminal event reader starts.
+    ///
+    /// The query reads stdin directly, so it must run before crossterm owns
+    /// that descriptor, or the two race for the same bytes and user keys go
+    /// missing. It runs whatever the configured theme is, because `/theme` can
+    /// select `terminal` later and this is the only safe moment to ask.
+    ///
+    /// This is the one startup tail still on the first-frame path. A terminal
+    /// that answers costs a few milliseconds; one that never answers costs the
+    /// 80 ms read deadline in [`super::terminal_probe::probe_terminal`].
+    pub(super) fn initialize_from_terminal() {
+        Self::initialize_palette(super::terminal_probe::probe_terminal().palette);
+    }
+
+    /// Install the palette sampled by shared startup terminal detection.
+    pub(super) fn initialize_palette(palette: Option<TerminalPalette>) {
+        if let Some(palette) = palette {
+            let _ = TERMINAL_SAMPLE.set(palette);
+            // The sample feeds the terminal-mode palette; drop any derived
+            // palette computed before the sample landed.
+            with_theme_state(|state| state.palette = None);
+        }
+    }
+
+    /// Retain fixed schemes from the open theme picker so preview uses them
+    /// directly instead of re-resolving custom files on each row change.
+    pub(super) fn set_picker_catalog(entries: &[theme_scheme::ThemeEntry]) {
+        let mut catalog = HashMap::new();
+        for entry in entries {
+            if let theme_scheme::ThemeEntry::Fixed(scheme) = entry {
+                catalog.insert(scheme.id.clone(), scheme.clone());
+            }
+        }
+        with_theme_state(|state| state.picker_catalog = Some(catalog));
+    }
+
+    pub(super) fn clear_picker_catalog() {
+        with_theme_state(|state| state.picker_catalog = None);
+    }
+
+    /// Apply the committed config theme (startup and after successful apply).
+    pub(super) fn apply_committed(id: &str) {
+        apply_theme_id(id, /*commit*/ true);
+    }
+
+    /// Live preview while browsing the theme picker. Does not change commit.
+    /// Prefers schemes retained in the picker catalog.
+    pub(super) fn preview(id: &str) {
+        apply_theme_id(id, /*commit*/ false);
+    }
+
+    /// Abandon a live preview and restore the last committed theme.
+    pub(super) fn cancel_preview() {
+        let previewing = with_theme_state(|state| {
+            (state.active_id != state.committed_id).then(|| normalize_theme_id(&state.committed_id))
+        });
+        if let Some(id) = previewing {
+            apply_theme_id(&id, /*commit*/ false);
+        }
+    }
+
+    pub(super) fn committed_id() -> String {
+        with_theme_state(|state| normalize_theme_id(&state.committed_id))
+    }
+
+    pub(super) fn active_id() -> String {
+        with_theme_state(|state| normalize_theme_id(&state.active_id))
+    }
+
+    /// Cache key: changes when the active palette changes.
+    pub(super) fn generation() -> u64 {
+        with_theme_state(|state| state.generation)
+    }
+
+    /// Full-frame / popup base style. Fixed schemes set fg+bg; terminal leaves host defaults.
+    pub(super) fn surface() -> Style {
+        let palette = Palette::current();
+        let mut style = Style::default().remove_modifier(Modifier::UNDERLINED);
+        if let Some(fg) = palette.text {
+            style = style.fg(fg);
+        }
+        if let Some(bg) = palette.surface {
+            style = style.bg(bg);
+        }
+        style
+    }
+
+    /// Ink that contrasts with a solid fill (RGB under fixed themes).
+    pub(super) fn contrasting_ink_on(background: Color) -> Color {
+        match background {
+            Color::Rgb(red, green, blue) => block_foreground(Some(Rgb::new(red, green, blue))),
+            _ if is_light_surface(background) => Color::Black,
+            _ => Color::White,
+        }
+    }
+
+    pub(super) fn text() -> Style {
+        let mut style = Style::default().remove_modifier(Modifier::UNDERLINED);
+        if let Some(fg) = Palette::current().text {
+            style = style.fg(fg);
+        }
+        style
+    }
+
+    pub(super) fn text_strong() -> Style {
+        Self::text().add_modifier(Modifier::BOLD)
+    }
+
+    pub(super) fn dim() -> Style {
+        Style::default().fg(Palette::current().dim)
+    }
+
+    pub(super) fn dim_italic() -> Style {
+        Self::dim().add_modifier(Modifier::ITALIC)
+    }
+
+    pub(super) fn accent() -> Style {
+        Style::default().fg(Palette::current().accent)
+    }
+
+    pub(super) fn brand() -> Style {
+        Self::accent().add_modifier(Modifier::BOLD)
+    }
+
+    pub(super) fn activity_rail() -> Style {
+        let background = Palette::current().neutral_tool_background;
+        Style::reset()
+            .fg(block_foreground(background.rgb))
+            .bg(background.color)
+    }
+
+    /// Muted rail ink that still reads on the rail wash.
+    ///
+    /// Foreground only: `RailRow::into_line()` patches this onto `row_style`, so a
+    /// background here would replace the hovered/pressed wash.
+    pub(super) fn activity_rail_dim() -> Style {
+        Style::default().fg(Palette::current().panel_dim)
+    }
+
+    pub(super) fn activity_rail_success() -> Style {
+        Self::activity_rail().fg(Palette::current().success)
+    }
+
+    pub(super) fn activity_rail_error() -> Style {
+        Self::activity_rail().fg(Palette::current().error)
+    }
+
+    pub(super) fn activity_rail_warning() -> Style {
+        Self::activity_rail().fg(Palette::current().warning)
+    }
+
+    pub(super) fn jump_to_bottom() -> Style {
+        Self::activity_rail().fg(Palette::current().accent)
+    }
+
+    /// Attention variant for chip states that need action (response ready,
+    /// approval/input needed). Bold keeps it calmer than a color change.
+    pub(super) fn jump_to_bottom_attention() -> Style {
+        Self::jump_to_bottom().add_modifier(Modifier::BOLD)
+    }
+
+    pub(super) fn jump_to_bottom_shortcut() -> Style {
+        Self::activity_rail().fg(Palette::current().panel_dim)
+    }
+
+    pub(super) fn activity_rail_row(state: super::activity::RailRowState) -> Style {
+        use super::activity::RailRowState;
+        match state {
+            RailRowState::Idle => Self::activity_rail(),
+            RailRowState::Hovered => Self::activity_rail().fg(Palette::current().accent),
+            RailRowState::Pressed => {
+                let accent = Palette::current().accent;
+                Style::default()
+                    .fg(Self::contrasting_ink_on(accent))
+                    .bg(accent)
+                    .add_modifier(Modifier::BOLD)
+            }
+        }
+    }
+
+    pub(super) fn success() -> Style {
+        Style::default()
+            .fg(Palette::current().success)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub(super) fn warning() -> Style {
+        Style::default()
+            .fg(Palette::current().warning)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub(super) fn error() -> Style {
+        Style::default()
+            .fg(Palette::current().error)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub(super) fn input_prompt() -> Style {
+        Style::default()
+            .fg(Palette::current().accent)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub(super) fn user_message() -> Style {
+        Self::dim_block(Palette::current().user_background)
+    }
+
+    pub(super) fn reasoning_output(lines: &mut [Line<'static>]) {
+        let reasoning_style = Self::dim();
+        for line in lines {
+            line.style = reasoning_style
+                .patch(line.style)
+                .remove_modifier(Modifier::DIM);
+            for span in &mut line.spans {
+                span.style = reasoning_style
+                    .patch(span.style)
+                    .remove_modifier(Modifier::DIM);
+            }
+        }
+    }
+
+    pub(super) fn reasoning_input_border(level: rho_providers::reasoning::ReasoningLevel) -> Style {
+        let color = match level {
+            rho_providers::reasoning::ReasoningLevel::Off => return Theme::dim(),
+            rho_providers::reasoning::ReasoningLevel::Minimal => active_ansi_color(AnsiColor::Blue),
+            rho_providers::reasoning::ReasoningLevel::Low => active_ansi_color(AnsiColor::Cyan),
+            rho_providers::reasoning::ReasoningLevel::Medium => active_ansi_color(AnsiColor::Green),
+            rho_providers::reasoning::ReasoningLevel::High => active_ansi_color(AnsiColor::Yellow),
+            rho_providers::reasoning::ReasoningLevel::Xhigh => {
+                active_ansi_color(AnsiColor::Magenta)
+            }
+            rho_providers::reasoning::ReasoningLevel::Max => active_ansi_color(AnsiColor::Red),
+        };
+        Style::default().fg(color)
+    }
+
+    pub(super) fn markdown_heading(level: HeadingLevel) -> Style {
+        let color = match level {
+            HeadingLevel::H1 => active_ansi_color(AnsiColor::Magenta),
+            HeadingLevel::H2 => active_ansi_color(AnsiColor::Blue),
+            HeadingLevel::H3 => active_ansi_color(AnsiColor::Cyan),
+            HeadingLevel::H4 => active_ansi_color(AnsiColor::Green),
+            HeadingLevel::H5 => active_ansi_color(AnsiColor::Yellow),
+            HeadingLevel::H6 => active_ansi_color(AnsiColor::BrightBlack),
+        };
+        let style = Style::default()
+            .fg(color)
+            .remove_modifier(Modifier::UNDERLINED);
+        match level {
+            HeadingLevel::H1 | HeadingLevel::H2 | HeadingLevel::H3 => {
+                style.add_modifier(Modifier::BOLD)
+            }
+            HeadingLevel::H4 | HeadingLevel::H5 | HeadingLevel::H6 => style,
+        }
+    }
+
+    pub(super) fn markdown_inline_code() -> Style {
+        Style::default()
+            .fg(Palette::current().warning)
+            .remove_modifier(Modifier::UNDERLINED)
+    }
+
+    /// Plain style for code, Mermaid, and math content (not chrome).
+    pub(super) fn code_text() -> Style {
+        // Match assistant body text so source reads as content rather than
+        // accent-colored chrome.
+        Self::text()
+    }
+
+    /// Style for one syntax-highlighting role.
+    /// Colors track the active ANSI palette so every theme, including
+    /// terminal-sampled ones, keeps highlighted code readable.
+    pub(super) fn syntax(role: SyntaxRole) -> Style {
+        let color = match role {
+            SyntaxRole::Comment => active_ansi_color(AnsiColor::BrightBlack),
+            SyntaxRole::String => active_ansi_color(AnsiColor::Green),
+            SyntaxRole::Constant => active_ansi_color(AnsiColor::Magenta),
+            SyntaxRole::Keyword => active_ansi_color(AnsiColor::Blue),
+            SyntaxRole::Function => active_ansi_color(AnsiColor::Yellow),
+            SyntaxRole::Type => active_ansi_color(AnsiColor::Cyan),
+        };
+        Style::default()
+            .fg(color)
+            .remove_modifier(Modifier::UNDERLINED)
+    }
+
+    /// Grep/search match overlay on top of plain or syntax-colored text.
+    ///
+    /// Keeps the underlying foreground when present, adds a warning-tinted
+    /// background and bold so hits stay visible without erasing language roles.
+    pub(super) fn search_match(base: Style) -> Style {
+        let palette = Palette::current();
+        let bg = palette.warning;
+        base.bg(bg)
+            .fg(Self::contrasting_ink_on(bg))
+            .add_modifier(Modifier::BOLD)
+            .remove_modifier(Modifier::UNDERLINED)
+    }
+
+    /// Focused transcript find hit. Other hits use [`Self::search_match`].
+    pub(super) fn transcript_search_focus() -> Style {
+        let accent = Palette::current().accent;
+        Style::default()
+            .bg(accent)
+            .fg(Self::contrasting_ink_on(accent))
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub(super) fn markdown_code_copy_button(hovered: bool) -> Style {
+        let palette = Palette::current();
+        if hovered {
+            Style::default()
+                .fg(Self::contrasting_ink_on(palette.accent))
+                .bg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Self::dim_block(palette.neutral_tool_background).add_modifier(Modifier::BOLD)
+        }
+    }
+
+    /// Lifted foreground for hovered tool-card text, or `None` to fall back to
+    /// a bold modifier.
+    ///
+    /// RGB ink blends toward the surface-opposite extreme (white on dark UIs,
+    /// black on light ones) so the lift stays in the ink's hue family. Named
+    /// and default ink (unsampled terminal themes) cannot blend; callers add
+    /// bold so hover still gives feedback.
+    pub(super) fn hover_lifted(fg: Color) -> Option<Color> {
+        let Color::Rgb(red, green, blue) = fg else {
+            return None;
+        };
+        let palette = Palette::current();
+        // Surface luminance picks the lift direction. Unsampled terminal
+        // themes leave the surface to the host; assume dark, the common case.
+        let dark_surface = palette
+            .surface
+            .is_none_or(|surface| !is_light_surface(surface));
+        let target = if dark_surface {
+            Rgb::new(255, 255, 255)
+        } else {
+            Rgb::new(0, 0, 0)
+        };
+        Some(
+            Rgb::new(red, green, blue)
+                .blend_toward(target, HOVER_LIFT_ALPHA)
+                .color(),
+        )
+    }
+
+    pub(super) fn markdown_bold() -> Style {
+        Self::text()
+            .add_modifier(Modifier::BOLD)
+            .remove_modifier(Modifier::UNDERLINED)
+    }
+
+    pub(super) fn markdown_italic() -> Style {
+        Self::text()
+            .add_modifier(Modifier::ITALIC)
+            .remove_modifier(Modifier::UNDERLINED)
+    }
+
+    pub(super) fn markdown_link() -> Style {
+        Style::default()
+            .fg(Palette::current().accent)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+
+    /// Status marker color for Call + Children tool cards.
+    pub(super) fn tool_marker(status: rho_tools::tool_card::ToolStatus) -> Style {
+        use rho_tools::tool_card::ToolStatus;
+        match status {
+            ToolStatus::Running => Self::accent(),
+            ToolStatus::Ok => Self::success(),
+            ToolStatus::Error => Self::error(),
+            ToolStatus::Interrupted => Self::warning(),
+        }
+    }
+
+    /// Family color for the tool verb / shell prompt.
+    pub(super) fn tool_verb(family: rho_tools::tool_card::ToolFamily) -> Style {
+        use rho_tools::tool_card::ToolFamily;
+        let palette = Palette::current();
+        match family {
+            ToolFamily::FileCommand | ToolFamily::FileDiff => Style::default().fg(palette.success),
+            ToolFamily::Web => Style::default().fg(active_ansi_color(AnsiColor::Blue)),
+            ToolFamily::Skill => Style::default().fg(palette.skill),
+            ToolFamily::Form => Style::default().fg(palette.warning),
+            ToolFamily::Agent => Self::text(),
+            ToolFamily::Default => Self::dim(),
+        }
+    }
+
+    /// Primary argument style in the header.
+    pub(super) fn tool_primary() -> Style {
+        Self::text()
+    }
+
+    pub(super) fn tool_tree() -> Style {
+        Self::dim()
+    }
+
+    pub(super) fn tool_meta() -> Style {
+        Self::dim()
+    }
+
+    pub(super) fn tool_path() -> Style {
+        Self::dim()
+    }
+
+    pub(super) fn tool_stat_add() -> Style {
+        Style::default().fg(Palette::current().success)
+    }
+
+    pub(super) fn tool_stat_del() -> Style {
+        Style::default().fg(Palette::current().error)
+    }
+
+    /// Line-number gutter. The sign carries the change, so numbers stay chrome.
+    pub(super) fn tool_diff_gutter() -> Style {
+        Self::dim()
+    }
+
+    pub(super) fn tool_exit(status: rho_tools::tool_card::ToolStatus) -> Style {
+        use rho_tools::tool_card::ToolStatus;
+        match status {
+            ToolStatus::Ok | ToolStatus::Running => Self::success(),
+            ToolStatus::Error | ToolStatus::Interrupted => Self::error(),
+        }
+    }
+
+    pub(super) fn tool_error_text() -> Style {
+        Self::error()
+    }
+
+    /// Explicit padding style for tool cards (never sample the marker span).
+    pub(super) fn tool_card_padding() -> Style {
+        Self::text()
+    }
+
+    fn dim_block(background: BlockColor) -> Style {
+        Style::default()
+            .fg(block_foreground(background.rgb))
+            .bg(background.color)
+    }
+}
+
+fn apply_theme_id(id: &str, commit: bool) {
+    let id = normalize_theme_id(id);
+    let scheme = if is_terminal_theme_id(&id) {
+        None
+    } else {
+        // Prefer the scheme already loaded into the open picker catalog.
+        let cached = with_theme_state(|state| {
+            state
+                .picker_catalog
+                .as_ref()
+                .and_then(|catalog| catalog.get(&id).cloned())
+        });
+        // Unknown id falls back to terminal so a bad config never blanks the
+        // UI. Resolve from disk without holding the state lock.
+        cached.or_else(|| resolve_fixed_scheme(&id))
+    };
+    let resolved_id = if scheme.is_none() {
+        TERMINAL_THEME_ID.to_string()
+    } else {
+        id
+    };
+
+    with_theme_state(|state| {
+        let changed = state.active_id != resolved_id
+            || state.active_scheme.as_ref().map(|s| s.id.as_str())
+                != scheme.as_ref().map(|s| s.id.as_str());
+        if commit {
+            state.committed_id = resolved_id.clone();
+        }
+        if changed {
+            state.active_id = resolved_id;
+            state.active_scheme = scheme;
+            state.generation = state.generation.saturating_add(1);
+            state.palette = None;
+        }
+    });
+}
+
+// Re-export catalog helpers used by the picker and config layers.
+pub(super) use theme_scheme::{
+    list_themes, theme_display_name, ThemeEntry, TERMINAL_THEME_ID as THEME_TERMINAL_ID,
+};
+
+fn block_foreground(background: Option<Rgb>) -> Color {
+    let on_light = background.is_some_and(|rgb| is_light_background(rgb.luminance()));
+    let scheme_inks = with_theme_state(|state| {
+        state
+            .active_scheme
+            .as_ref()
+            .map(|scheme| (scheme.foreground, scheme.background))
+    });
+    if let Some((fg, bg)) = scheme_inks {
+        // Prefer the scheme ink that actually contrasts with the panel wash.
+        return if on_light {
+            if fg.luminance() <= bg.luminance() {
+                fg.color()
+            } else {
+                bg.color()
+            }
+        } else if fg.luminance() >= bg.luminance() {
+            fg.color()
+        } else {
+            bg.color()
+        };
+    }
+    if on_light {
+        Color::Black
+    } else {
+        Color::White
+    }
+}
+
+fn is_light_background(luminance: f32) -> bool {
+    luminance > LIGHT_BACKGROUND_LUMINANCE
+}
+
+/// Light-host classification shared by contrasting ink and hover lift.
+/// White, gray, and yellow are light-host chrome; every other named color
+/// is dark.
+fn is_light_surface(color: Color) -> bool {
+    match color {
+        Color::Rgb(red, green, blue) => is_light_background(Rgb::new(red, green, blue).luminance()),
+        Color::White | Color::Gray | Color::Yellow => true,
+        _ => false,
+    }
+}
+
+fn blended_or_fallback(
+    terminal: Option<&TerminalPalette>,
+    color: AnsiColor,
+    alpha: f32,
+    fallback: BlockColor,
+) -> BlockColor {
+    optional_blended(terminal, color, alpha).unwrap_or(fallback)
+}
+
+fn optional_blended(
+    terminal: Option<&TerminalPalette>,
+    color: AnsiColor,
+    alpha: f32,
+) -> Option<BlockColor> {
+    terminal.and_then(|palette| palette.blended_background(color, alpha))
+}

@@ -1,0 +1,740 @@
+use std::{future::Future, pin::Pin};
+
+use crate::{
+    auth::{
+        anthropic_oauth, browser, codex_oauth, github_copilot_device, kimi_oauth, meta_oauth,
+        ollama_device, openrouter_oauth, xai_oauth,
+    },
+    credentials::{
+        self, AnthropicTokens, CodexTokens, CredentialResult, CredentialStore, GitHubCopilotTokens,
+        KimiTokens, MetaTokens, XaiTokens,
+    },
+    provider::{
+        self, AuthMode, BearerCredentialAcquisition, BrowserOAuthFlow, ProviderAuthKind,
+        ResolvedProviderProfile,
+    },
+};
+
+pub type AuthenticationFuture = Pin<
+    Box<dyn Future<Output = Result<CompletedAuthentication, AuthenticationError>> + Send + 'static>,
+>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthenticationMethod {
+    None,
+    ApiKey { entry_label: &'static str },
+    Interactive { provider_label: &'static str },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InteractiveLoginMode {
+    Browser,
+    Device,
+}
+
+pub use super::browser::{BrowserAvailability, BrowserEnvironment, BrowserOpen};
+use super::login_prompt::LoginPrompt;
+
+/// Deprecated presentation of an interactive login.
+///
+/// # Next major
+///
+/// NEXT_MAJOR(rho-providers): remove InteractiveUserAction and the InteractiveLogin::user_action field; LoginPrompt is the only login presentation surface
+///
+/// This minor keeps the 2.0 variants so existing matches still compile. New
+/// code should read [`LoginPrompt`] from [`InteractiveLogin::prompt`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[deprecated(
+    since = "2.1.0",
+    note = "use InteractiveLogin::prompt (LoginPrompt) instead of matching InteractiveUserAction"
+)]
+pub enum InteractiveUserAction {
+    BrowserOpened,
+    /// Show a URL to open manually (no device code). Used by Ollama device-key connect.
+    OpenUrl {
+        url: String,
+        instruction: String,
+    },
+    DeviceCode {
+        verification_uri: String,
+        user_code: String,
+        verification_uri_complete: Option<String>,
+    },
+}
+
+#[allow(deprecated)]
+impl From<&LoginPrompt> for InteractiveUserAction {
+    fn from(prompt: &LoginPrompt) -> Self {
+        if let Some(user_code) = prompt.user_code.clone() {
+            Self::DeviceCode {
+                verification_uri: prompt.url.clone(),
+                user_code,
+                verification_uri_complete: prompt.url_with_code.clone(),
+            }
+        } else if prompt.browser == BrowserOpen::Launched {
+            Self::BrowserOpened
+        } else {
+            Self::OpenUrl {
+                url: prompt.url.clone(),
+                instruction: prompt.instruction.clone(),
+            }
+        }
+    }
+}
+
+pub enum InteractiveLoginCompletion {
+    Confirm(AuthenticationFuture),
+    /// The provider's OAuth page shows a `code#state` pair instead of
+    /// redirecting to a local listener; the host collects the pasted value and
+    /// hands it to `exchange`, which yields the token-exchange future.
+    PasteCode {
+        /// Label for the pasted value in host prompts.
+        code_label: &'static str,
+        exchange: Box<dyn FnOnce(String) -> AuthenticationFuture + Send>,
+    },
+    /// The external setup has started, but the provider cannot reliably confirm completion.
+    Unconfirmed {
+        instruction: &'static str,
+    },
+}
+
+impl std::fmt::Debug for InteractiveLoginCompletion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Confirm(_) => formatter.write_str("Confirm(<authentication future>)"),
+            Self::PasteCode { code_label, .. } => formatter
+                .debug_struct("PasteCode")
+                .field("code_label", code_label)
+                .finish_non_exhaustive(),
+            Self::Unconfirmed { instruction } => formatter
+                .debug_struct("Unconfirmed")
+                .field("instruction", instruction)
+                .finish(),
+        }
+    }
+}
+
+#[allow(deprecated)]
+pub struct InteractiveLogin {
+    pub provider_label: &'static str,
+    pub prompt: LoginPrompt,
+    /// Deprecated dual-emit of [`Self::prompt`].
+    ///
+    /// # Next major
+    ///
+    /// NEXT_MAJOR(rho-providers): remove InteractiveUserAction and the InteractiveLogin::user_action field; LoginPrompt is the only login presentation surface
+    #[deprecated(
+        since = "2.1.0",
+        note = "use InteractiveLogin::prompt (LoginPrompt) instead of user_action"
+    )]
+    pub user_action: InteractiveUserAction,
+    pub completion: InteractiveLoginCompletion,
+}
+
+impl std::fmt::Debug for InteractiveLogin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[allow(deprecated)]
+        formatter
+            .debug_struct("InteractiveLogin")
+            .field("provider_label", &self.provider_label)
+            .field("prompt", &self.prompt)
+            .field("user_action", &self.user_action)
+            .field("completion", &self.completion)
+            .finish()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AuthenticationError {
+    #[error("unsupported login provider '{0}'")]
+    UnsupportedProvider(String),
+    #[error(
+        "provider '{provider}' has multiple auth modes; specify one of: {auth_ids}",
+        auth_ids = .auth_ids.join(", ")
+    )]
+    AmbiguousProvider {
+        provider: String,
+        auth_ids: Vec<&'static str>,
+    },
+    #[error("provider '{0}' does not use interactive login")]
+    NotInteractive(String),
+    #[error("{0}")]
+    Flow(String),
+}
+
+pub struct CompletedAuthentication {
+    credentials: LoginCredentials,
+}
+
+impl CompletedAuthentication {
+    pub fn save(self, store: &dyn CredentialStore) -> CredentialResult<()> {
+        match self.credentials {
+            LoginCredentials::Anthropic(tokens) => {
+                credentials::save_anthropic_tokens(store, &tokens)
+            }
+            LoginCredentials::Codex(tokens) => credentials::save_codex_tokens(store, &tokens),
+            LoginCredentials::GithubCopilot(tokens) => {
+                credentials::save_github_copilot_tokens(store, &tokens)
+            }
+            LoginCredentials::Kimi(tokens) => credentials::save_kimi_tokens(store, &tokens),
+            LoginCredentials::Meta(tokens) => credentials::save_meta_tokens(store, &tokens),
+            LoginCredentials::OpenRouter(key) => {
+                credentials::save_openrouter_oauth_key(store, &key)
+            }
+            LoginCredentials::Xai(tokens) => credentials::save_xai_tokens(store, &tokens),
+        }
+    }
+}
+
+impl std::fmt::Debug for CompletedAuthentication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CompletedAuthentication([REDACTED])")
+    }
+}
+
+enum LoginCredentials {
+    Anthropic(AnthropicTokens),
+    Codex(CodexTokens),
+    GithubCopilot(GitHubCopilotTokens),
+    Kimi(KimiTokens),
+    Meta(MetaTokens),
+    OpenRouter(String),
+    Xai(XaiTokens),
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProviderAuthentication;
+
+impl ProviderAuthentication {
+    pub fn method(provider_or_auth: &str) -> Result<AuthenticationMethod, AuthenticationError> {
+        let profile = resolve_login_profile(provider_or_auth)?;
+        Ok(match profile.auth_kind() {
+            ProviderAuthKind::None => AuthenticationMethod::None,
+            ProviderAuthKind::ApiKey { entry_label, .. } => {
+                AuthenticationMethod::ApiKey { entry_label }
+            }
+            ProviderAuthKind::AnthropicOAuth { .. } => AuthenticationMethod::Interactive {
+                provider_label: "Anthropic",
+            },
+            ProviderAuthKind::CodexOAuth { .. } => AuthenticationMethod::Interactive {
+                provider_label: "Codex",
+            },
+            ProviderAuthKind::GithubCopilotDevice { .. } => AuthenticationMethod::Interactive {
+                provider_label: "GitHub Copilot",
+            },
+            ProviderAuthKind::KimiOAuth { .. } => AuthenticationMethod::Interactive {
+                provider_label: "Kimi",
+            },
+            ProviderAuthKind::MetaOAuth { .. } => AuthenticationMethod::Interactive {
+                provider_label: "Meta",
+            },
+            ProviderAuthKind::XaiOAuth { .. } => AuthenticationMethod::Interactive {
+                provider_label: "SpaceXAI",
+            },
+            ProviderAuthKind::OllamaDeviceKey { .. } => AuthenticationMethod::Interactive {
+                provider_label: "Ollama Cloud",
+            },
+            ProviderAuthKind::BearerCredential { acquisition, .. } => match acquisition {
+                BearerCredentialAcquisition::BrowserOAuth(flow) => {
+                    AuthenticationMethod::Interactive {
+                        provider_label: flow.provider_label(),
+                    }
+                }
+            },
+        })
+    }
+
+    pub fn supports_device_login(provider_or_auth: &str) -> bool {
+        resolve_login_profile(provider_or_auth).is_ok_and(|profile| {
+            matches!(
+                profile.auth_kind(),
+                ProviderAuthKind::CodexOAuth { .. }
+                    | ProviderAuthKind::GithubCopilotDevice { .. }
+                    | ProviderAuthKind::KimiOAuth { .. }
+                    | ProviderAuthKind::MetaOAuth { .. }
+                    | ProviderAuthKind::XaiOAuth { .. }
+                    | ProviderAuthKind::OllamaDeviceKey { .. }
+            )
+        })
+    }
+
+    /// Headless sessions prefer device-code when the provider actually has both
+    /// grants. GitHub, Kimi, and Ollama are always their device/URL flow;
+    /// OpenRouter is always the browser grant.
+    pub fn preferred_mode(
+        provider_or_auth: &str,
+        availability: BrowserAvailability,
+    ) -> InteractiveLoginMode {
+        if availability == BrowserAvailability::Headless && selects_device_grant(provider_or_auth) {
+            InteractiveLoginMode::Device
+        } else {
+            InteractiveLoginMode::Browser
+        }
+    }
+
+    /// Start an interactive login using process browser availability.
+    ///
+    /// # Next major
+    ///
+    /// NEXT_MAJOR(rho-providers): remove the 2-arg start_interactive_login wrapper and rename start_interactive_login_with_availability back to start_interactive_login
+    ///
+    /// Prefer [`Self::start_interactive_login_with_availability`] so callers
+    /// pass availability explicitly instead of sniffing the process.
+    #[deprecated(
+        since = "2.1.0",
+        note = "use start_interactive_login_with_availability so browser availability is explicit"
+    )]
+    pub async fn start_interactive_login(
+        provider_or_auth: &str,
+        mode: InteractiveLoginMode,
+    ) -> Result<InteractiveLogin, AuthenticationError> {
+        Self::start_interactive_login_with_availability(
+            provider_or_auth,
+            mode,
+            BrowserAvailability::from_process(),
+        )
+        .await
+    }
+
+    /// Start an interactive login. Bind or device setup finishes before return
+    /// so [`InteractiveLogin::prompt`] already has the authorize URL.
+    pub async fn start_interactive_login_with_availability(
+        provider_or_auth: &str,
+        mode: InteractiveLoginMode,
+        availability: BrowserAvailability,
+    ) -> Result<InteractiveLogin, AuthenticationError> {
+        let profile = resolve_login_profile(provider_or_auth)?;
+        let started = match profile.auth_kind() {
+            ProviderAuthKind::None | ProviderAuthKind::ApiKey { .. } => {
+                return Err(AuthenticationError::NotInteractive(provider_or_auth.into()));
+            }
+            ProviderAuthKind::AnthropicOAuth { .. } => start_anthropic().await?,
+            ProviderAuthKind::CodexOAuth { .. } => start_codex(mode).await?,
+            ProviderAuthKind::GithubCopilotDevice { .. } => start_github_copilot().await?,
+            ProviderAuthKind::KimiOAuth { .. } => start_kimi().await?,
+            ProviderAuthKind::MetaOAuth { .. } => start_meta().await?,
+            ProviderAuthKind::XaiOAuth { .. } => start_xai(mode).await?,
+            ProviderAuthKind::OllamaDeviceKey { .. } => start_ollama_device().await?,
+            ProviderAuthKind::BearerCredential { acquisition, .. } => match acquisition {
+                BearerCredentialAcquisition::BrowserOAuth(BrowserOAuthFlow::OpenRouter) => {
+                    // OpenRouter has no device-code grant. `--device-auth` still
+                    // runs the browser/PKCE flow; the printed URL works headless.
+                    start_openrouter().await?
+                }
+            },
+        };
+        Ok(interactive_login(started, availability))
+    }
+
+    pub fn save_api_key(
+        store: &dyn CredentialStore,
+        provider_or_auth: &str,
+        key: &str,
+    ) -> CredentialResult<()> {
+        credentials::save_provider_api_key(store, provider_or_auth, key)
+    }
+
+    /// Deletes credentials for an auth profile id, or every mode on a provider name.
+    ///
+    /// Auth profile ids are preferred. Provider names delete all modes for that
+    /// provider (used by doctor/logout at provider granularity).
+    pub fn delete_credentials(
+        store: &dyn CredentialStore,
+        provider_or_auth: &str,
+    ) -> CredentialResult<bool> {
+        if provider::resolve_auth_mode(provider_or_auth).is_some() {
+            credentials::delete_auth_credentials(store, provider_or_auth)
+        } else {
+            credentials::delete_provider_credentials(store, provider_or_auth)
+        }
+    }
+
+    /// Records a login that finished as [`InteractiveLoginCompletion::Unconfirmed`].
+    ///
+    /// # Next major
+    ///
+    /// NEXT_MAJOR(rho-providers): carry an acceptance handle on InteractiveLoginCompletion::Unconfirmed (mirroring CompletedAuthentication::save) and remove accept_unconfirmed_login
+    ///
+    /// The provider sends no completion callback, so Rho trusts the user.
+    /// Interactive hosts should call this once the user confirms they approved;
+    /// hosts that cannot ask may call it after showing the instruction. Without
+    /// it, the mode (the Ollama Cloud device key) never becomes signed in.
+    pub fn accept_unconfirmed_login(
+        store: &dyn CredentialStore,
+        provider_or_auth: &str,
+    ) -> CredentialResult<()> {
+        // Unknown ids could not have started a login, so there is nothing to record.
+        let Ok(profile) = resolve_login_profile(provider_or_auth) else {
+            return Ok(());
+        };
+        match profile.auth_kind() {
+            ProviderAuthKind::OllamaDeviceKey { .. } => credentials::sign_in_ollama_device(store),
+            ProviderAuthKind::None
+            | ProviderAuthKind::ApiKey { .. }
+            | ProviderAuthKind::AnthropicOAuth { .. }
+            | ProviderAuthKind::CodexOAuth { .. }
+            | ProviderAuthKind::GithubCopilotDevice { .. }
+            | ProviderAuthKind::XaiOAuth { .. }
+            | ProviderAuthKind::BearerCredential { .. }
+            | ProviderAuthKind::KimiOAuth { .. }
+            | ProviderAuthKind::MetaOAuth { .. } => Ok(()),
+        }
+    }
+
+    /// True when the auth profile or any mode on the provider has credentials.
+    ///
+    /// Auth profile ids check one mode. Provider names check any mode (doctor).
+    pub fn has_credentials(
+        store: &dyn CredentialStore,
+        provider_or_auth: &str,
+    ) -> CredentialResult<bool> {
+        if provider::resolve_auth_mode(provider_or_auth).is_some() {
+            credentials::auth_has_credentials(store, provider_or_auth)
+        } else if provider::provider_descriptor(provider_or_auth).is_some() {
+            credentials::provider_has_credentials(store, provider_or_auth)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn has_stored_credentials(
+        store: &dyn CredentialStore,
+        provider_or_auth: &str,
+    ) -> CredentialResult<bool> {
+        if provider::resolve_auth_mode(provider_or_auth).is_some() {
+            credentials::auth_has_stored_credentials(store, provider_or_auth)
+        } else if provider::provider_descriptor(provider_or_auth).is_some() {
+            credentials::provider_has_stored_credentials(store, provider_or_auth)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn has_environment_override(provider_or_auth: &str) -> bool {
+        if provider::resolve_auth_mode(provider_or_auth).is_some() {
+            credentials::auth_has_env_override(provider_or_auth)
+        } else {
+            credentials::provider_has_env_override(provider_or_auth)
+        }
+    }
+
+    /// First auth profile sharing keys with `auth` that has a stored API key,
+    /// so login can offer it instead of asking for the same key again.
+    ///
+    /// Nothing is offered when `auth` already has its own stored key, so a
+    /// blank Enter cannot replace it with a different workspace's key.
+    /// Environment overrides are not offered: reusing one would persist a
+    /// secret the user only exported.
+    pub fn reusable_api_key_source(
+        store: &dyn CredentialStore,
+        auth: &str,
+    ) -> CredentialResult<Option<AuthMode>> {
+        if credentials::auth_has_stored_credentials(store, auth)? {
+            return Ok(None);
+        }
+        for sibling in provider::shared_api_key_auths(auth) {
+            if credentials::auth_has_stored_credentials(store, sibling)? {
+                return Ok(provider::resolve_auth_mode(sibling).map(|(_, mode)| mode));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The stored API key of `source` when it also works for `auth`.
+    ///
+    /// `None` when the profiles do not share keys or `source` has no stored key.
+    pub fn shared_api_key(
+        store: &dyn CredentialStore,
+        source: AuthMode,
+        auth: &str,
+    ) -> CredentialResult<Option<String>> {
+        match source.auth_kind {
+            ProviderAuthKind::ApiKey { account, .. }
+                if provider::shared_api_key_auths(auth).any(|sibling| sibling == source.id) =>
+            {
+                Ok(store
+                    .get_secret(account)?
+                    .filter(|key| !key.trim().is_empty()))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+fn resolve_login_profile(
+    provider_or_auth: &str,
+) -> Result<ResolvedProviderProfile, AuthenticationError> {
+    if let Some((provider, mode)) = provider::resolve_auth_mode(provider_or_auth) {
+        return Ok(ResolvedProviderProfile {
+            provider,
+            auth: mode,
+        });
+    }
+    let descriptor = provider::provider_descriptor(provider_or_auth)
+        .ok_or_else(|| AuthenticationError::UnsupportedProvider(provider_or_auth.into()))?;
+    match descriptor.auth_modes {
+        [only] => Ok(ResolvedProviderProfile {
+            provider: descriptor,
+            auth: *only,
+        }),
+        modes => Err(AuthenticationError::AmbiguousProvider {
+            provider: provider_or_auth.into(),
+            auth_ids: modes
+                .iter()
+                .map(|mode| mode.id)
+                .filter(|id| *id != "none")
+                .collect(),
+        }),
+    }
+}
+
+/// Bind/device setup finished; browser launch happens at [`interactive_login`].
+struct StartedLogin {
+    provider_label: &'static str,
+    prompt: LoginPrompt,
+    completion: InteractiveLoginCompletion,
+}
+
+fn selects_device_grant(provider_or_auth: &str) -> bool {
+    resolve_login_profile(provider_or_auth)
+        .is_ok_and(|profile| profile.auth_kind().has_browser_and_device_grants())
+}
+
+fn authorize_prompt(url: impl Into<String>, provider_label: &str) -> LoginPrompt {
+    LoginPrompt::browser_flow(
+        url,
+        format!("Open this URL to finish {provider_label} login."),
+    )
+}
+
+fn device_prompt(
+    verification_uri: impl Into<String>,
+    user_code: impl Into<String>,
+    url_with_code: Option<String>,
+) -> LoginPrompt {
+    LoginPrompt::device_code(
+        verification_uri,
+        user_code,
+        url_with_code,
+        "Visit this URL and enter the code.",
+    )
+}
+
+async fn start_codex(mode: InteractiveLoginMode) -> Result<StartedLogin, AuthenticationError> {
+    if mode == InteractiveLoginMode::Browser {
+        let login = codex_oauth::start_codex_browser_login()
+            .await
+            .map_err(flow_error)?;
+        return Ok(StartedLogin {
+            provider_label: "Codex",
+            prompt: authorize_prompt(login.authorize_url.clone(), "Codex"),
+            completion: InteractiveLoginCompletion::Confirm(Box::pin(async move {
+                codex_oauth::complete_codex_browser_login(login)
+                    .await
+                    .map(|tokens| CompletedAuthentication {
+                        credentials: LoginCredentials::Codex(tokens),
+                    })
+                    .map_err(flow_error)
+            })),
+        });
+    }
+
+    let login = codex_oauth::start_codex_device_login()
+        .await
+        .map_err(flow_error)?;
+    Ok(StartedLogin {
+        provider_label: "Codex",
+        prompt: device_prompt(
+            login.verification_uri.clone(),
+            login.user_code.clone(),
+            None,
+        ),
+        completion: InteractiveLoginCompletion::Confirm(Box::pin(async move {
+            codex_oauth::complete_codex_device_login(login)
+                .await
+                .map(|tokens| CompletedAuthentication {
+                    credentials: LoginCredentials::Codex(tokens),
+                })
+                .map_err(flow_error)
+        })),
+    })
+}
+
+async fn start_anthropic() -> Result<StartedLogin, AuthenticationError> {
+    let login = anthropic_oauth::start_anthropic_browser_login();
+    Ok(StartedLogin {
+        provider_label: "Anthropic",
+        prompt: authorize_prompt(login.authorize_url.clone(), "Anthropic"),
+        completion: InteractiveLoginCompletion::PasteCode {
+            code_label: "authorization code",
+            exchange: Box::new(move |code| {
+                Box::pin(async move {
+                    anthropic_oauth::complete_anthropic_browser_login(login, &code)
+                        .await
+                        .map(|tokens| CompletedAuthentication {
+                            credentials: LoginCredentials::Anthropic(tokens),
+                        })
+                        .map_err(flow_error)
+                })
+            }),
+        },
+    })
+}
+
+async fn start_github_copilot() -> Result<StartedLogin, AuthenticationError> {
+    let login = github_copilot_device::start_github_copilot_device_login()
+        .await
+        .map_err(flow_error)?;
+    Ok(StartedLogin {
+        provider_label: "GitHub Copilot",
+        prompt: device_prompt(
+            login.verification_uri.clone(),
+            login.user_code.clone(),
+            login.verification_uri_complete.clone(),
+        ),
+        completion: InteractiveLoginCompletion::Confirm(Box::pin(async move {
+            github_copilot_device::complete_github_copilot_device_login(login)
+                .await
+                .map(|tokens| CompletedAuthentication {
+                    credentials: LoginCredentials::GithubCopilot(tokens),
+                })
+                .map_err(flow_error)
+        })),
+    })
+}
+
+async fn start_kimi() -> Result<StartedLogin, AuthenticationError> {
+    let login = kimi_oauth::start_kimi_device_login()
+        .await
+        .map_err(flow_error)?;
+    Ok(StartedLogin {
+        provider_label: "Kimi",
+        prompt: device_prompt(
+            login.verification_uri.clone(),
+            login.user_code.clone(),
+            login.verification_uri_complete.clone(),
+        ),
+        completion: InteractiveLoginCompletion::Confirm(Box::pin(async move {
+            kimi_oauth::complete_kimi_device_login(login)
+                .await
+                .map(|tokens| CompletedAuthentication {
+                    credentials: LoginCredentials::Kimi(tokens),
+                })
+                .map_err(flow_error)
+        })),
+    })
+}
+
+async fn start_meta() -> Result<StartedLogin, AuthenticationError> {
+    let login = meta_oauth::start_meta_device_login()
+        .await
+        .map_err(flow_error)?;
+    Ok(StartedLogin {
+        provider_label: "Meta",
+        prompt: device_prompt(
+            login.verification_uri.clone(),
+            login.user_code.clone(),
+            login.verification_uri_complete.clone(),
+        ),
+        completion: InteractiveLoginCompletion::Confirm(Box::pin(async move {
+            meta_oauth::complete_meta_device_login(login)
+                .await
+                .map(|tokens| CompletedAuthentication {
+                    credentials: LoginCredentials::Meta(tokens),
+                })
+                .map_err(flow_error)
+        })),
+    })
+}
+
+async fn start_openrouter() -> Result<StartedLogin, AuthenticationError> {
+    let login = openrouter_oauth::start_openrouter_browser_login()
+        .await
+        .map_err(flow_error)?;
+    Ok(StartedLogin {
+        provider_label: "OpenRouter",
+        prompt: authorize_prompt(login.authorize_url.clone(), "OpenRouter"),
+        completion: InteractiveLoginCompletion::Confirm(Box::pin(async move {
+            openrouter_oauth::complete_openrouter_browser_login(login)
+                .await
+                .map(|key| CompletedAuthentication {
+                    credentials: LoginCredentials::OpenRouter(key),
+                })
+                .map_err(flow_error)
+        })),
+    })
+}
+
+async fn start_xai(mode: InteractiveLoginMode) -> Result<StartedLogin, AuthenticationError> {
+    if mode == InteractiveLoginMode::Browser {
+        let login = xai_oauth::start_xai_browser_login()
+            .await
+            .map_err(flow_error)?;
+        return Ok(StartedLogin {
+            provider_label: "SpaceXAI",
+            prompt: authorize_prompt(login.authorize_url.clone(), "SpaceXAI"),
+            completion: InteractiveLoginCompletion::Confirm(Box::pin(async move {
+                xai_oauth::complete_xai_browser_login(login)
+                    .await
+                    .map(|tokens| CompletedAuthentication {
+                        credentials: LoginCredentials::Xai(tokens),
+                    })
+                    .map_err(flow_error)
+            })),
+        });
+    }
+
+    let login = xai_oauth::start_xai_device_login()
+        .await
+        .map_err(flow_error)?;
+    Ok(StartedLogin {
+        provider_label: "SpaceXAI",
+        prompt: device_prompt(
+            login.verification_uri.clone(),
+            login.user_code.clone(),
+            login.verification_uri_complete.clone(),
+        ),
+        completion: InteractiveLoginCompletion::Confirm(Box::pin(async move {
+            xai_oauth::complete_xai_device_login(login)
+                .await
+                .map(|tokens| CompletedAuthentication {
+                    credentials: LoginCredentials::Xai(tokens),
+                })
+                .map_err(flow_error)
+        })),
+    })
+}
+
+async fn start_ollama_device() -> Result<StartedLogin, AuthenticationError> {
+    let login = ollama_device::start_ollama_device_login(/* open_browser */ false)
+        .await
+        .map_err(flow_error)?;
+    Ok(StartedLogin {
+        provider_label: "Ollama Cloud",
+        prompt: LoginPrompt::browser_flow(
+            login.connect_url,
+            "Open this URL and approve the device for Ollama Cloud.",
+        ),
+        completion: InteractiveLoginCompletion::Unconfirmed {
+            instruction: "Approve the device in your browser, then use an Ollama Cloud model. Rho does not receive a completion callback.",
+        },
+    })
+}
+
+#[allow(deprecated)]
+fn interactive_login(started: StartedLogin, availability: BrowserAvailability) -> InteractiveLogin {
+    let url = started.prompt.copyable_url().to_string();
+    let prompt = started
+        .prompt
+        .with_browser(browser::try_open(&url, availability));
+    InteractiveLogin {
+        provider_label: started.provider_label,
+        user_action: InteractiveUserAction::from(&prompt),
+        prompt,
+        completion: started.completion,
+    }
+}
+
+fn flow_error(error: impl std::fmt::Display) -> AuthenticationError {
+    AuthenticationError::Flow(error.to_string())
+}

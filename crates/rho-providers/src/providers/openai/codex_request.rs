@@ -1,0 +1,392 @@
+use std::collections::BTreeSet;
+
+use serde_json::{json, Value};
+
+use crate::model::{ModelError, ModelIdentity, ModelRequest};
+use rho_sdk::model::{ServiceTier, ToolSpec};
+use rho_sdk::provider::ModelRequestOptions;
+
+use crate::protocol::openai_responses::{
+    codex_reasoning_param, to_responses_tool, ToolAsync, ToolStrictness,
+};
+
+use super::auth::Auth;
+use super::configuration_update::{
+    lower_responses_input, LoweredResponsesInput, ReasoningUpdatePolicy,
+};
+use super::reasoning::OpenAiReasoningProfile;
+
+/// Complete wire policy for one OpenAI Responses endpoint variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ResponsesWireContract {
+    OpenAiStandard,
+    CodexStandard,
+}
+
+impl ResponsesWireContract {
+    fn for_auth(auth: &Auth) -> Self {
+        match auth {
+            Auth::ApiKey(_) => Self::OpenAiStandard,
+            Auth::Codex { .. } => Self::CodexStandard,
+        }
+    }
+
+    fn provider(self) -> &'static str {
+        match self {
+            Self::OpenAiStandard => "openai",
+            Self::CodexStandard => "openai-codex",
+        }
+    }
+
+    pub(super) fn default_api_base(self) -> &'static str {
+        match self {
+            Self::OpenAiStandard => "https://api.openai.com/v1",
+            Self::CodexStandard => "https://chatgpt.com/backend-api/codex",
+        }
+    }
+
+    pub(super) fn native_compaction(self) -> NativeCompactionWire {
+        match self {
+            Self::OpenAiStandard => NativeCompactionWire::CompactEndpoint,
+            Self::CodexStandard => NativeCompactionWire::CompactionTrigger,
+        }
+    }
+
+    pub(super) fn uses_codex_websocket(self) -> bool {
+        match self {
+            Self::OpenAiStandard => false,
+            Self::CodexStandard => true,
+        }
+    }
+
+    fn parallel_tool_calls(self) -> Option<bool> {
+        match self {
+            Self::OpenAiStandard => None,
+            Self::CodexStandard => Some(true),
+        }
+    }
+
+    fn serialize_tool(
+        self,
+        tool: &ToolSpec,
+        hosted_web_search: bool,
+        async_mode: ToolAsync,
+    ) -> Value {
+        let strictness = match self {
+            Self::OpenAiStandard => ToolStrictness::Explicit(false),
+            Self::CodexStandard => ToolStrictness::Unspecified,
+        };
+        to_responses_tool(tool, strictness, hosted_web_search, async_mode)
+    }
+}
+
+/// How a Responses endpoint variant performs server-side compaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NativeCompactionWire {
+    /// Unary `POST /responses/compact` returning a JSON `output` array.
+    CompactEndpoint,
+    /// Streaming `POST /responses` whose input ends with `compaction_trigger`
+    /// (Codex "remote compaction v2"). The Codex backend returns 404 for
+    /// `/responses/compact`.
+    CompactionTrigger,
+}
+
+/// Credential-derived Responses identity and wire contract.
+/// `ModelIdentity::api` for every `OpenAiProvider`, first-party or custom host.
+pub(super) const RESPONSES_API: &str = "openai-responses";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ResponsesProfile {
+    model: String,
+    identity: ModelIdentity,
+    identity_provider: &'static str,
+    contract: ResponsesWireContract,
+}
+
+impl ResponsesProfile {
+    /// Identity provider comes from the wire contract (`openai` / `openai-codex`).
+    pub(super) fn from_auth(auth: &Auth, model: impl Into<String>) -> Self {
+        let contract = ResponsesWireContract::for_auth(auth);
+        Self::with_identity(contract, contract.provider(), model)
+    }
+
+    /// Identity for Responses credentials that may be keyless custom hosts.
+    pub(super) fn from_optional_auth(
+        auth: Option<&Auth>,
+        model: impl Into<String>,
+        identity_provider: &'static str,
+    ) -> Self {
+        let contract = match auth {
+            None => ResponsesWireContract::OpenAiStandard,
+            Some(auth) => ResponsesWireContract::for_auth(auth),
+        };
+        Self::with_identity(contract, identity_provider, model)
+    }
+
+    fn with_identity(
+        contract: ResponsesWireContract,
+        identity_provider: &'static str,
+        model: impl Into<String>,
+    ) -> Self {
+        let model = model.into();
+        Self {
+            identity: ModelIdentity::new(identity_provider, RESPONSES_API, &model),
+            identity_provider,
+            model,
+            contract,
+        }
+    }
+
+    pub(super) fn provider(&self) -> &'static str {
+        self.identity_provider
+    }
+
+    pub(super) fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub(super) fn identity(&self) -> &ModelIdentity {
+        &self.identity
+    }
+
+    pub(super) fn contract(&self) -> ResponsesWireContract {
+        self.contract
+    }
+
+    pub(super) fn default_api_base(&self) -> &'static str {
+        self.contract.default_api_base()
+    }
+}
+
+/// Shared lowered fields for Responses create and compact bodies.
+struct ResponsesLowered {
+    instructions: String,
+    input: Vec<Value>,
+    prompt_cache_key: Option<String>,
+    reasoning: Option<Value>,
+    in_force_effort: Option<String>,
+}
+
+/// Create-body plus the effort actually in force for the upcoming assistant turn.
+pub(super) struct ResponsesCreateBody {
+    pub(super) body: Value,
+    pub(super) in_force_effort: Option<String>,
+}
+
+/// Lowers request history into common Responses fields.
+fn lower_responses_request(
+    profile: &ResponsesProfile,
+    reasoning_profile: &OpenAiReasoningProfile,
+    request: ModelRequest<'_>,
+    update_policy: ReasoningUpdatePolicy,
+) -> Result<ResponsesLowered, ModelError> {
+    let reasoning =
+        reasoning_profile.config(profile.provider(), profile.model(), request.reasoning_level)?;
+    let mut instructions = Vec::new();
+    let LoweredResponsesInput {
+        input,
+        request_effort,
+        in_force_effort,
+    } = lower_responses_input(
+        request.messages,
+        &mut instructions,
+        profile.identity(),
+        reasoning.effort.as_deref(),
+        update_policy,
+    )?;
+    let reasoning = codex_reasoning_param(request_effort.as_deref(), reasoning.summary.as_deref());
+    Ok(ResponsesLowered {
+        instructions: instructions.join("\n\n"),
+        input,
+        prompt_cache_key: request.prompt_cache_key.map(str::to_owned),
+        reasoning,
+        in_force_effort,
+    })
+}
+
+fn base_responses_body(profile: &ResponsesProfile) -> Value {
+    json!({
+        "model": profile.model(),
+        "store": false,
+    })
+}
+
+fn attach_prompt_cache_and_reasoning(
+    body: &mut Value,
+    prompt_cache_key: Option<String>,
+    reasoning: Option<Value>,
+) {
+    if let Some(prompt_cache_key) = prompt_cache_key {
+        body["prompt_cache_key"] = Value::String(prompt_cache_key);
+    }
+    if let Some(reasoning) = reasoning {
+        body["reasoning"] = reasoning;
+    }
+}
+
+/// Builds a streaming Responses create body for one model turn.
+pub(super) fn build_responses_create_body(
+    profile: &ResponsesProfile,
+    reasoning_profile: &OpenAiReasoningProfile,
+    request: ModelRequest<'_>,
+    options: &ModelRequestOptions,
+    hosted_web_search: bool,
+    async_tools: &BTreeSet<String>,
+) -> Result<ResponsesCreateBody, ModelError> {
+    let contract = profile.contract();
+    let tools = request
+        .tools
+        .iter()
+        .map(|tool| {
+            let async_mode = if super::supports_async_tools(profile.provider(), profile.model())
+                && async_tools.contains(&tool.name)
+            {
+                ToolAsync::On
+            } else {
+                ToolAsync::Off
+            };
+            contract.serialize_tool(tool, hosted_web_search, async_mode)
+        })
+        .collect::<Vec<_>>();
+    let ResponsesLowered {
+        instructions,
+        input,
+        prompt_cache_key,
+        reasoning,
+        in_force_effort,
+    } = lower_responses_request(
+        profile,
+        reasoning_profile,
+        request,
+        ReasoningUpdatePolicy::PreservePrefix,
+    )?;
+
+    let mut body = base_responses_body(profile);
+    body["stream"] = json!(true);
+    if options.service_tier() == Some(ServiceTier::Priority)
+        && super::supports_fast_mode(profile.provider(), profile.model())
+    {
+        body["service_tier"] = json!("priority");
+    }
+    if let Some(tokens) = options
+        .max_output_tokens()
+        .filter(|_| !contract.uses_codex_websocket())
+    {
+        body["max_output_tokens"] = json!(tokens.get());
+    }
+    body["instructions"] = Value::String(instructions);
+    body["input"] = Value::Array(input);
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools);
+        body["tool_choice"] = json!("auto");
+    }
+    if let Some(parallel_tool_calls) = contract.parallel_tool_calls() {
+        body["parallel_tool_calls"] = json!(parallel_tool_calls);
+    }
+    attach_prompt_cache_and_reasoning(&mut body, prompt_cache_key, reasoning);
+    body["include"] = json!(["reasoning.encrypted_content"]);
+    Ok(ResponsesCreateBody {
+        body,
+        in_force_effort,
+    })
+}
+
+pub(super) fn codex_routing_hint(body: &Value) -> Result<String, ModelError> {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ModelError::InvalidResponse("Codex body missing model".into()))?;
+    Ok(match body.get("service_tier").and_then(Value::as_str) {
+        Some(tier) => format!("model={model};tier={tier}"),
+        None => format!("model={model}"),
+    })
+}
+
+/// Builds a unary `/responses/compact` body.
+///
+/// Compact never advertises tools and never streams.
+pub(super) fn build_responses_compact_body(
+    profile: &ResponsesProfile,
+    reasoning_profile: &OpenAiReasoningProfile,
+    request: ModelRequest<'_>,
+) -> Result<Value, ModelError> {
+    let ResponsesLowered {
+        instructions,
+        input,
+        prompt_cache_key,
+        reasoning,
+        in_force_effort: _,
+    } = lower_responses_request(
+        profile,
+        reasoning_profile,
+        request,
+        ReasoningUpdatePolicy::CurrentLevel,
+    )?;
+    let mut body = base_responses_body(profile);
+    body["instructions"] = Value::String(instructions);
+    body["input"] = Value::Array(input);
+    attach_prompt_cache_and_reasoning(&mut body, prompt_cache_key, reasoning);
+    Ok(body)
+}
+
+/// Builds a [`NativeCompactionWire::CompactionTrigger`] body: the compact body
+/// streamed to `/responses` with a trailing `compaction_trigger` input item.
+///
+/// The server answers with exactly one `compaction` output item.
+pub(super) fn build_compaction_trigger_body(
+    profile: &ResponsesProfile,
+    reasoning_profile: &OpenAiReasoningProfile,
+    request: ModelRequest<'_>,
+) -> Result<Value, ModelError> {
+    let mut body = build_responses_compact_body(profile, reasoning_profile, request)?;
+    body["stream"] = json!(true);
+    body["input"]
+        .as_array_mut()
+        .ok_or_else(|| ModelError::InvalidResponse("compact body input is not an array".into()))?
+        .push(json!({"type": "compaction_trigger"}));
+    Ok(body)
+}
+
+#[cfg(test)]
+pub(super) fn codex_test_auth() -> Auth {
+    Auth::codex(
+        crate::credentials::CodexTokens {
+            access_token: "test".into(),
+            refresh_token: None,
+            id_token: None,
+            account_id: None,
+        },
+        super::auth::CodexAuthSource::Env,
+        std::sync::Arc::new(crate::credentials::MemoryCredentialStore::default()),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn build_codex_responses_body(
+    model: &str,
+    request: ModelRequest<'_>,
+) -> Result<Value, ModelError> {
+    build_codex_responses_body_with_tier(model, request, None, /*hosted_web_search*/ true)
+}
+
+#[cfg(test)]
+fn build_codex_responses_body_with_tier(
+    model: &str,
+    request: ModelRequest<'_>,
+    service_tier: Option<ServiceTier>,
+    hosted_web_search: bool,
+) -> Result<Value, ModelError> {
+    let profile = ResponsesProfile::from_auth(&codex_test_auth(), model);
+    let options = service_tier.map_or_else(ModelRequestOptions::default, |tier| {
+        ModelRequestOptions::default().with_service_tier(tier)
+    });
+    Ok(build_responses_create_body(
+        &profile,
+        &OpenAiReasoningProfile::unknown(),
+        request,
+        &options,
+        hosted_web_search,
+        &BTreeSet::new(),
+    )?
+    .body)
+}

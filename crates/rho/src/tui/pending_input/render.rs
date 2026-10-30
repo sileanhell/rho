@@ -1,0 +1,228 @@
+use ratatui::{
+    style::Style,
+    text::{Line, Span},
+};
+
+use super::*;
+use crate::tui::{
+    render::{display_width, truncate_one_line},
+    theme::Theme,
+};
+
+const MAX_VISIBLE_ITEMS: usize = 3;
+
+impl App {
+    pub(in crate::tui) fn pending_input_height(&self) -> usize {
+        let held = self.held_turns.len().min(MAX_VISIBLE_ITEMS);
+        let count = self.pending_input_count();
+        let pending = if count == 0 {
+            0
+        } else {
+            1 + count.min(MAX_VISIBLE_ITEMS) + usize::from(self.pending.input_panel().focused)
+        };
+        held + pending
+    }
+
+    pub(in crate::tui) fn pending_input_lines(&mut self, width: usize) -> Vec<Line<'static>> {
+        let mut lines = self.held_input_lines(width);
+        let items = self.pending_input_refs();
+        if items.is_empty() {
+            self.pending.input_panel_mut().focused = false;
+            return lines;
+        }
+        self.clamp_pending_input_selection(items.len());
+        let selected = self.pending.input_panel().selected;
+        let start = visible_start(selected, items.len(), MAX_VISIBLE_ITEMS);
+        let steering_count =
+            self.pending.accepted_steering().len() + self.pending.steering_prompts().len();
+        let hint = if self.pending.input_panel().focused {
+            "↑↓ select · enter edit · backspace discard · esc close".to_string()
+        } else {
+            format!(
+                "{} edit · {} manage",
+                self.info.runtime.keybindings.edit_pending_input,
+                self.info.runtime.keybindings.manage_pending_input
+            )
+        };
+        lines.push(pending_header_line(
+            width,
+            steering_count,
+            self.pending.queued_prompts().len(),
+            &hint,
+        ));
+        lines.extend(
+            items
+                .iter()
+                .skip(start)
+                .take(MAX_VISIBLE_ITEMS)
+                .enumerate()
+                .map(|(visible_index, item)| {
+                    self.pending_item_line(width, *item, start + visible_index == selected)
+                }),
+        );
+        if self.pending.input_panel().focused {
+            lines.push(Line::styled(
+                truncate_one_line(
+                    "  steer affects this run · next starts after this turn",
+                    width,
+                ),
+                Theme::dim(),
+            ));
+        }
+        lines
+    }
+
+    fn held_input_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let start = self.held_turns.len().saturating_sub(MAX_VISIBLE_ITEMS);
+        self.held_turns
+            .iter()
+            .skip(start)
+            .map(|held| {
+                pending_item_line(
+                    width,
+                    "  ",
+                    "HOLD",
+                    "esc edit",
+                    &held.turn.display,
+                    Theme::warning(),
+                    /*selected*/ false,
+                )
+            })
+            .collect()
+    }
+
+    fn pending_item_line(
+        &self,
+        width: usize,
+        item: PendingInputRef,
+        selected: bool,
+    ) -> Line<'static> {
+        let marker = if selected { "▸ " } else { "  " };
+        let (label, context, prompt, label_style) = match item {
+            PendingInputRef::AcceptedSteering(index) => {
+                let entry = &self.pending.accepted_steering()[index];
+                let context = if self.pending.retracting_steering() == Some(&entry.id) {
+                    "retracting"
+                } else if entry.delivered {
+                    "delivered"
+                } else {
+                    "current run"
+                };
+                (
+                    "STEER",
+                    context,
+                    &entry.prompt.display_prompt,
+                    Theme::warning(),
+                )
+            }
+            PendingInputRef::LocalSteering(index) => (
+                "STEER",
+                "sending",
+                &self.pending.steering_prompts()[index].display_prompt,
+                Theme::warning(),
+            ),
+            PendingInputRef::FollowUp(index) => (
+                "NEXT",
+                if self.turn.is_compacting() {
+                    "after compact"
+                } else {
+                    "after turn"
+                },
+                &self.pending.queued_prompts()[index].display_prompt,
+                Theme::accent(),
+            ),
+        };
+        pending_item_line(width, marker, label, context, prompt, label_style, selected)
+    }
+}
+
+fn pending_header_line(
+    width: usize,
+    steering_count: usize,
+    follow_up_count: usize,
+    hint: &str,
+) -> Line<'static> {
+    let counts = [
+        (steering_count, "steer", "steers"),
+        (follow_up_count, "follow-up", "follow-ups"),
+    ]
+    .into_iter()
+    .filter(|(count, _, _)| *count > 0)
+    .map(|(count, singular, plural)| count_label(count, singular, plural))
+    .collect::<Vec<_>>()
+    .join(" · ");
+    let left = format!("  pending input · {counts}");
+    let left_width = display_width(&left);
+    let hint_width = display_width(hint);
+    if left_width + hint_width + 2 <= width {
+        return Line::from(vec![
+            Span::styled(left, Theme::text_strong()),
+            Span::raw(" ".repeat(width - left_width - hint_width)),
+            Span::styled(hint.to_string(), Theme::dim()),
+        ]);
+    }
+    Line::styled(
+        truncate_one_line(&format!("{left}  {hint}"), width),
+        Theme::text_strong(),
+    )
+}
+
+fn pending_item_line(
+    width: usize,
+    marker: &str,
+    label: &str,
+    context: &str,
+    prompt: &str,
+    label_style: Style,
+    selected: bool,
+) -> Line<'static> {
+    let compact = width < 34;
+    let context = if compact { "" } else { context };
+    let prefix = if context.is_empty() {
+        format!("{marker}{label:<6} ")
+    } else {
+        format!("{marker}{label:<6} · {context:<11} ")
+    };
+    let prefix_width = display_width(&prefix);
+    if prefix_width >= width {
+        return Line::styled(
+            truncate_one_line(&format!("{marker}{label} {prompt}"), width),
+            label_style,
+        );
+    }
+    let prompt = truncate_one_line(prompt, width - prefix_width);
+    let marker_style = if selected {
+        Theme::accent()
+    } else {
+        Theme::dim()
+    };
+    let context_prefix = if context.is_empty() {
+        format!("{label:<6} ")
+    } else {
+        format!("{label:<6} · {context:<11} ")
+    };
+    Line::from(vec![
+        Span::styled(marker.to_string(), marker_style),
+        Span::styled(label.to_string(), label_style),
+        Span::styled(context_prefix[label.len()..].to_string(), Theme::dim()),
+        Span::styled(
+            prompt,
+            if selected {
+                Theme::text_strong()
+            } else {
+                Theme::text()
+            },
+        ),
+    ])
+}
+
+fn count_label(count: usize, singular: &str, plural: &str) -> String {
+    let label = if count == 1 { singular } else { plural };
+    format!("{count} {label}")
+}
+
+fn visible_start(selected: usize, count: usize, visible: usize) -> usize {
+    selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(count.saturating_sub(visible))
+}

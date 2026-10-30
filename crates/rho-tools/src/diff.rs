@@ -1,0 +1,27 @@
+use similar::TextDiff;
+
+const MAX_DIFF_INPUT_BYTES: usize = 128 * 1024;
+const LARGE_DIFF_MESSAGE: &str = "Diff omitted: file is too large.";
+pub(super) const UNREADABLE_FILE_DIFF_MESSAGE: &str =
+    "Diff omitted: existing file could not be read.";
+
+pub(super) fn unified_diff(old: &str, new: &str, display_path: &str, created: bool) -> String {
+    if old == new {
+        return "No changes.".into();
+    }
+    if old.len().saturating_add(new.len()) > MAX_DIFF_INPUT_BYTES {
+        return LARGE_DIFF_MESSAGE.into();
+    }
+
+    let old_header = if created {
+        "/dev/null".to_string()
+    } else {
+        format!("a/{display_path}")
+    };
+    let new_header = format!("b/{display_path}");
+    TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(1)
+        .header(&old_header, &new_header)
+        .to_string()
+}

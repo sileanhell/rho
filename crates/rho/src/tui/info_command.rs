@@ -1,0 +1,517 @@
+use std::{path::PathBuf, time::Duration};
+
+use ratatui::text::Line;
+use rho_providers::model::{ContextUsage, ContextUsageSource, ModelMetadata, ModelUsage};
+
+use super::{
+    command_block::CommandBlock,
+    model_performance::ModelPerformanceSummary,
+    types::ExtraCosts,
+    usage_cost::{
+        cache_hit_percent, context_fill_percent, display_input_tokens, format_usd,
+        resolved_context_window, resolved_usage_cost_usd_micros, session_total_cost_usd_micros,
+        CostSource,
+    },
+    workspace::git_branch,
+    App,
+};
+use crate::agent::AgentRuntime;
+use crate::antigravity_runtime::setup::AntigravitySetup;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BillingInfo {
+    Metered,
+    Subscription,
+}
+
+impl BillingInfo {
+    fn from_provider_auth(provider: &str, auth: &str) -> Self {
+        if provider == "openai-codex"
+            || auth == "codex"
+            || auth == "xai-oauth"
+            || auth == "meta-muse"
+        {
+            Self::Subscription
+        } else {
+            Self::Metered
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Metered => "metered API",
+            Self::Subscription => "subscription",
+        }
+    }
+}
+
+#[path = "info_compaction.rs"]
+mod compaction;
+
+#[derive(Clone, Debug)]
+pub(super) struct RuntimeInfo {
+    version: String,
+    provider: String,
+    model: String,
+    reasoning: String,
+    permission_mode: String,
+    advisor: String,
+    billing: BillingInfo,
+    cost_source: CostSource,
+    cwd: PathBuf,
+    /// Directories added to the session's workspace scope.
+    added_dirs: Vec<PathBuf>,
+    branch: Option<String>,
+    usage: Option<ModelUsage>,
+    latest_usage: Option<ModelUsage>,
+    /// Session cache hit rate over durable usage only.
+    ///
+    /// Kept separate from [`Self::usage`], which folds in the display-only live
+    /// stream estimate. That estimate reports fabricated uncached input and no
+    /// cache fields, so folding it in would dilute the rate mid-turn.
+    session_cache_hit_percent: Option<f64>,
+    cache_rebilled: super::cache_stats::CacheRebilled,
+    model_performance: ModelPerformanceSummary,
+    context_usage: Option<ContextUsage>,
+    compaction: Option<crate::diagnostics::CompactionDiagnostics>,
+    model_metadata: Option<ModelMetadata>,
+    tree: Option<crate::session::tree::SessionTreeFacts>,
+    tree_error: Option<String>,
+    /// Session tree is read off the open path so a large file cannot delay the overlay.
+    tree_loading: bool,
+    /// Probed auth summaries for runtimes outside provider credentials
+    /// (Claude, Cursor).
+    external_runtimes: Vec<String>,
+    /// Antigravity install and sign-in, read from disk when the overlay opens;
+    /// no probe, so it never shows as checking.
+    antigravity: String,
+    /// Non-main spend for this conversation.
+    extra: super::types::ExtraCosts,
+}
+
+impl RuntimeInfo {
+    pub(super) fn tree_loading(&self) -> bool {
+        self.tree_loading
+    }
+
+    #[cfg(test)]
+    pub(super) fn external_runtimes(&self) -> &[String] {
+        &self.external_runtimes
+    }
+
+    pub(super) fn set_external_runtimes(&mut self, lines: Vec<String>) {
+        self.external_runtimes = lines;
+    }
+
+    pub(super) fn set_tree(
+        &mut self,
+        tree: Option<crate::session::tree::SessionTreeFacts>,
+        error: Option<String>,
+    ) {
+        self.tree = tree;
+        self.tree_error = error;
+        self.tree_loading = false;
+    }
+
+    pub(super) fn begin_tree_load(&mut self) {
+        self.tree = None;
+        self.tree_error = None;
+        self.tree_loading = true;
+    }
+}
+
+impl App {
+    /// Open `/info` from in-memory state. External probes and the session tree
+    /// fill in afterwards; this must not await either.
+    pub(super) fn execute_info_command(&mut self) -> anyhow::Result<()> {
+        let identity = self.info.services.diagnostics.identity();
+        // A live turn may still be writing the tree. Read it only when idle.
+        let (tree_error, tree_loading) = match self.info.session.session_id.as_deref() {
+            Some(_) if self.is_ui_busy() => (
+                Some("tree facts are available after the current model turn".into()),
+                false,
+            ),
+            Some(_) => (None, true),
+            None => (None, false),
+        };
+        // Loading stays false until the turn ends so the unavailable note
+        // remains. The idle poll starts the read if the overlay is still open.
+        self.info_tree_deferred = tree_error.is_some();
+        let info = RuntimeInfo {
+            version: identity.rho_version.to_string(),
+            provider: identity.provider.to_string(),
+            model: identity.model.to_string(),
+            reasoning: identity.reasoning.to_string(),
+            permission_mode: self.info.runtime.permission_mode.as_str().into(),
+            advisor: super::advisor_status::AdvisorStatus::from_runtime(&self.info.runtime)
+                .detail(),
+            billing: BillingInfo::from_provider_auth(
+                &self.info.runtime.provider,
+                &self.info.runtime.auth,
+            ),
+            cost_source: if self.usage.live_stream.is_active() {
+                CostSource::Estimated
+            } else {
+                self.usage.usage_cost_tracker.cumulative_source()
+            },
+            cwd: self.info.runtime.cwd.clone(),
+            added_dirs: self.info.runtime.added_dirs.as_slice().to_vec(),
+            branch: git_branch(&self.info.runtime.cwd),
+            usage: super::usage_cost::display_usage_with_live(
+                self.usage.cumulative_usage.as_ref(),
+                &self.usage.live_stream,
+                self.model_metadata.as_ref(),
+            ),
+            latest_usage: self.usage.latest_usage.clone(),
+            session_cache_hit_percent: self
+                .usage
+                .cumulative_usage
+                .as_ref()
+                .and_then(cache_hit_percent),
+            cache_rebilled: self.usage.cache_stats.rebilled().clone(),
+            model_performance: self
+                .usage
+                .model_performance
+                .summary(&self.info.runtime.model_call_profile()),
+            context_usage: self.usage.current_context.clone(),
+            compaction: self.info.services.diagnostics.compaction(),
+            model_metadata: self.model_metadata.clone(),
+            tree: None,
+            tree_error,
+            tree_loading,
+            external_runtimes: checking_external_runtimes(),
+            antigravity: AntigravitySetup::from_env(&crate::paths::home_dir().unwrap_or_default())
+                .description(),
+            extra: self.usage.extra,
+        };
+        self.show_info_overlay(info);
+        self.start_info_refresh();
+        Ok(())
+    }
+}
+
+/// Placeholder rows painted before the Cursor probe returns.
+pub(super) fn checking_external_runtimes() -> Vec<String> {
+    vec![format!("{}: checking…", AgentRuntime::Cursor.as_str())]
+}
+
+pub(super) async fn load_external_runtimes() -> Vec<String> {
+    let cursor = crate::cursor_runtime::auth::query().await;
+    vec![match cursor {
+        Ok(status) => status.auth_description(),
+        Err(error) => error.to_string(),
+    }]
+}
+
+pub(super) fn runtime_info_lines(info: &RuntimeInfo, width: usize) -> Vec<Line<'static>> {
+    let mut block = CommandBlock::on_surface(width);
+    block.push_header("rho", &format!("v{}", info.version));
+
+    block.push_section("Model");
+    block.push_field("Provider", &info.provider);
+    block.push_field("Model", &info.model);
+    block.push_field("Reasoning", &info.reasoning);
+    block.push_field("Permissions", &info.permission_mode);
+    block.push_field("Advisor", &info.advisor);
+    block.push_field("Billing", info.billing.description());
+
+    block.push_section("External runtimes");
+    for line in &info.external_runtimes {
+        block.push_note(line);
+    }
+    block.push_note(&info.antigravity);
+
+    block.push_section("Session");
+    if info.tree_loading {
+        block.push_note("checking…");
+    } else if let Some(tree) = &info.tree {
+        block.push_field(
+            "Active leaf",
+            tree.active_leaf_id
+                .as_ref()
+                .map_or("none", |id| id.as_str()),
+        );
+        block.push_field("Nodes", &tree.node_count.to_string());
+        block.push_field("Branches", &tree.branch_count.to_string());
+    } else if let Some(error) = &info.tree_error {
+        block.push_note(&format!("Session tree unavailable: {error}"));
+    } else {
+        block.push_note("No durable conversation state yet.");
+    }
+
+    block.push_section("Session usage");
+    push_usage_fields(&mut block, info);
+
+    if let Some(diagnostics) = &info.compaction {
+        compaction::push_fields(&mut block, diagnostics);
+    }
+
+    if let Some(metrics) = info.model_performance.latest_call {
+        block.push_section("Last model call");
+        if let Some(duration) = metrics.time_to_first_token {
+            block.push_field("First event", &format_duration(duration));
+        }
+        if let Some(duration) = metrics.generation_time {
+            block.push_field("Generation", &format_duration(duration));
+        }
+        push_optional_number(
+            &mut block,
+            "Generation tokens",
+            metrics.resolved_generation_tokens(),
+        );
+        push_optional_number(&mut block, "Output tokens", metrics.output_tokens);
+        if let Some(rate) = metrics.generation_tokens_per_second() {
+            block.push_field("Generation rate", &format!("{rate:.1} tok/s"));
+        }
+        if let Some(rate) = metrics.response_tokens_per_second() {
+            block.push_field("Response rate", &format!("{rate:.1} tok/s"));
+        }
+        block.push_field("Total latency", &format_duration(metrics.total_latency));
+    }
+
+    if let Some(rate) = info.model_performance.average_generation_tokens_per_second {
+        block.push_section("Model performance");
+        block.push_field("Average generation", &format!("{rate:.1} tok/s"));
+        block.push_field(
+            "Samples",
+            &info.model_performance.eligible_calls.to_string(),
+        );
+    }
+
+    block.push_section("Workspace");
+    block.push_field("Directory", &info.cwd.display().to_string());
+    for dir in &info.added_dirs {
+        block.push_field("Added", &dir.display().to_string());
+    }
+    block.push_field(
+        "Git branch",
+        info.branch.as_deref().unwrap_or("not in a Git worktree"),
+    );
+    block.finish()
+}
+
+/// Plain-text report for the clipboard. Wider than the panel so a pasted
+/// field stays one line instead of keeping the on-screen wrap.
+const INFO_COPY_WIDTH: usize = 200;
+
+pub(super) fn info_copy_text(info: &RuntimeInfo) -> String {
+    runtime_info_lines(info, INFO_COPY_WIDTH)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn push_usage_fields(block: &mut CommandBlock, info: &RuntimeInfo) {
+    if let Some(context) =
+        format_context_row(info.context_usage.as_ref(), info.model_metadata.as_ref())
+    {
+        block.push_field("Context", &context);
+    } else {
+        block.push_field("Context", "not reported");
+    }
+
+    let Some(usage) = info.usage.as_ref() else {
+        if info.extra.total() == 0 {
+            block.push_note("No token usage recorded yet.");
+        } else {
+            push_cost_fields(block, info, None);
+        }
+        return;
+    };
+
+    push_optional_number(block, "Input tokens", display_input_tokens(usage));
+    push_optional_number(block, "Output tokens", usage.output_tokens);
+    push_optional_number(block, "Cache read", usage.cache_read_tokens);
+    push_optional_number(block, "Cache write", usage.cache_write_tokens);
+    if let Some(hit) = format_cache_hit(info) {
+        block.push_field("Cache hit", &hit);
+    }
+    if let Some(rebilled) = format_cache_rebilled(&info.cache_rebilled, info.billing) {
+        block.push_field("Cache re-billed", &rebilled);
+    }
+
+    let main_cost_micros = resolved_usage_cost_usd_micros(usage, info.model_metadata.as_ref());
+    push_cost_fields(block, info, main_cost_micros);
+}
+
+fn push_cost_fields(block: &mut CommandBlock, info: &RuntimeInfo, main_cost_micros: Option<u64>) {
+    let extra = info.extra;
+    let Some(total_micros) = session_total_cost_usd_micros(main_cost_micros, extra.total()) else {
+        return;
+    };
+    let equivalent = cost_equivalent_suffix(info.billing);
+    let main_qualifier = if info.cost_source == CostSource::Estimated {
+        " estimated"
+    } else {
+        ""
+    };
+
+    for (label, value) in cost_field_rows(
+        main_cost_micros,
+        extra,
+        total_micros,
+        main_qualifier,
+        equivalent,
+    ) {
+        block.push_field(label, &value);
+    }
+}
+
+/// Labels for /info cost rows. One component stays a single labeled field;
+/// multiple components break out each component plus Total.
+fn cost_field_rows(
+    main_cost_micros: Option<u64>,
+    extra: ExtraCosts,
+    total_micros: u64,
+    main_qualifier: &str,
+    equivalent: &str,
+) -> Vec<(&'static str, String)> {
+    let format_amount =
+        |amount: u64, qualifier: &str| format!("{}{qualifier}{equivalent}", format_usd(amount));
+
+    let mut rows = Vec::new();
+    if let Some(main) = main_cost_micros {
+        rows.push(("Main cost", format_amount(main, main_qualifier)));
+    }
+    for (label, amount) in [
+        ("Subagent cost", extra.subagent),
+        ("Advisor cost", extra.advisor),
+        ("Cache warm cost", extra.cache_warm),
+    ] {
+        if amount > 0 {
+            rows.push((label, format_amount(amount, "")));
+        }
+    }
+
+    match rows.len() {
+        0 => rows,
+        1 => {
+            if rows[0].0 == "Main cost" {
+                rows[0].0 = "Cost";
+            }
+            rows
+        }
+        _ => {
+            rows.push(("Total cost", format_amount(total_micros, "")));
+            rows
+        }
+    }
+}
+
+fn cost_equivalent_suffix(billing: BillingInfo) -> &'static str {
+    if billing == BillingInfo::Subscription {
+        " API equivalent"
+    } else {
+        ""
+    }
+}
+
+fn push_optional_number(block: &mut CommandBlock, label: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        block.push_field(label, &format_number(value));
+    }
+}
+
+/// Single cache-hit line covering session and latest-request rates.
+fn format_cache_hit(info: &RuntimeInfo) -> Option<String> {
+    let latest = info.latest_usage.as_ref().and_then(cache_hit_percent);
+    match (info.session_cache_hit_percent, latest) {
+        (Some(session), Some(latest)) => Some(format!(
+            "{session:.1}% session · {latest:.1}% latest request"
+        )),
+        (Some(session), None) => Some(format!("{session:.1}% session")),
+        (None, Some(latest)) => Some(format!("{latest:.1}% on the latest request")),
+        (None, None) => None,
+    }
+}
+
+/// Session re-bill line for `/info`. Hidden until at least one counted miss.
+fn format_cache_rebilled(
+    rebilled: &super::cache_stats::CacheRebilled,
+    billing: BillingInfo,
+) -> Option<String> {
+    if rebilled.miss_count == 0 {
+        return None;
+    }
+    let miss_label = if rebilled.miss_count == 1 {
+        "1 miss".to_string()
+    } else {
+        format!("{} misses", rebilled.miss_count)
+    };
+    let tokens = format_number(rebilled.missed_tokens);
+    Some(if rebilled.extra_cost_usd_micros > 0 {
+        let cost = format_usd(rebilled.extra_cost_usd_micros);
+        let cost = if rebilled.unpriced_miss_count > 0 {
+            format!("{cost} partial")
+        } else {
+            cost
+        };
+        format!(
+            "{cost} ({tokens} tokens, {miss_label}){}",
+            cost_equivalent_suffix(billing)
+        )
+    } else {
+        format!("{tokens} tokens ({miss_label})")
+    })
+}
+
+/// Formats the `/info` context row; shows consumption even when no limit is
+/// reported.
+fn format_context_row(
+    context_usage: Option<&ContextUsage>,
+    model_metadata: Option<&ModelMetadata>,
+) -> Option<String> {
+    let window = resolved_context_window(context_usage, model_metadata);
+    let source = match context_usage.map(|usage| usage.source) {
+        Some(ContextUsageSource::Estimated) => "estimated",
+        Some(ContextUsageSource::ProviderReported) => "provider reported",
+        Some(ContextUsageSource::UnknownAfterCompaction) => "unknown after compaction",
+        None => "model limit",
+    };
+    let Some(tokens) = context_usage.and_then(|usage| usage.tokens) else {
+        // Nothing reported at all: let the caller render its fallback row.
+        let window = window?;
+        return Some(format!(
+            "unknown / {} tokens ({source})",
+            format_number(window)
+        ));
+    };
+    let Some(window) = window else {
+        // Without a known limit there is no fill percent; still show consumption.
+        return Some(format!("{} tokens ({source})", format_number(tokens)));
+    };
+    let percent = context_fill_percent(tokens, window);
+    Some(format!(
+        "{} / {} tokens ({percent:.1}%, {source})",
+        format_number(tokens),
+        format_number(window)
+    ))
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration < Duration::from_secs(1) {
+        format!("{} ms", duration.as_millis())
+    } else {
+        format!("{:.1} s", duration.as_secs_f64())
+    }
+}
+
+fn format_number(value: u64) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(ch);
+    }
+    formatted
+}

@@ -1,0 +1,608 @@
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use url::Url;
+
+use super::Config;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProviderConfigs {
+    /// Set only after `/login ollama` or an explicit `[providers.ollama]` table.
+    /// First-run config does not invent a default endpoint.
+    pub(crate) ollama: Option<ProviderEndpointConfig>,
+    pub(crate) custom: BTreeMap<String, ProviderEndpointConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderEndpointConfig {
+    pub(crate) base_url: Url,
+    /// models.dev provider slug whose catalog rows this host should borrow.
+    pub(crate) catalog: Option<String>,
+    /// How this host rematches models.dev rows. Default is slug-or-host.
+    pub(crate) catalog_lookup: rho_providers::provider::CatalogLookupMode,
+    /// Wire API this host speaks. Ollama is always Chat Completions.
+    pub(crate) api: rho_providers::provider::OpenAiCompatibleApi,
+    /// Edit format selected when the global preference is `auto`.
+    pub(crate) edit_tool: Option<rho_tools::EditFormat>,
+    /// Prompt cache lifetime this host applies to cache writes. `None` means
+    /// unknown; keep-warm and cache-miss attribution fall back to the provider
+    /// default. Usage on Responses-shaped hosts does not report the TTL, so
+    /// it cannot be learned from responses.
+    pub(crate) prompt_cache_ttl: Option<std::time::Duration>,
+    /// Encoding the user asserts this host decodes on large request bodies.
+    /// `None` sends plain JSON; Rho cannot probe this without a billed turn.
+    pub(crate) request_compression: Option<rho_providers::providers::RequestCompression>,
+}
+
+impl ProviderEndpointConfig {
+    fn from_custom_partial(
+        provider: &str,
+        endpoint: PartialEndpointConfig,
+    ) -> anyhow::Result<Self> {
+        rho_providers::provider::validate_custom_provider_name(provider)?;
+        let base_url_field = format!("providers.custom.{provider}.base_url");
+        let Some(base_url) = endpoint.base_url else {
+            anyhow::bail!("providers.custom.{provider} requires base_url");
+        };
+        let base_url = parse_provider_base_url(&base_url_field, &base_url)?;
+
+        let catalog_field = format!("providers.custom.{provider}.catalog");
+        let catalog = endpoint
+            .catalog
+            .map(|catalog| parse_provider_catalog(&catalog_field, &catalog))
+            .transpose()?;
+        let catalog_mode_field = format!("providers.custom.{provider}.catalog_mode");
+        let catalog_lookup = endpoint
+            .catalog_mode
+            .map(|mode| parse_provider_catalog_mode(&catalog_mode_field, &mode))
+            .transpose()?
+            .unwrap_or_default();
+        if catalog.is_some()
+            && catalog_lookup == rho_providers::provider::CatalogLookupMode::ModelId
+        {
+            anyhow::bail!("{catalog_mode_field} cannot be combined with catalog");
+        }
+
+        let api_field = format!("providers.custom.{provider}.api");
+        let api = endpoint
+            .api
+            .map(|api| parse_provider_api(&api_field, &api))
+            .transpose()?
+            .unwrap_or_default();
+
+        let ttl_field = format!("providers.custom.{provider}.prompt_cache_ttl");
+        let prompt_cache_ttl = endpoint
+            .prompt_cache_ttl
+            .map(|ttl| parse_prompt_cache_ttl(&ttl_field, &ttl))
+            .transpose()?;
+
+        let compression_field = format!("providers.custom.{provider}.request_compression");
+        let request_compression = endpoint
+            .request_compression
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|error| anyhow::anyhow!("{compression_field} {error}"))
+            })
+            .transpose()?;
+
+        Ok(Self {
+            base_url,
+            catalog,
+            catalog_lookup,
+            api,
+            edit_tool: endpoint.edit_tool,
+            prompt_cache_ttl,
+            request_compression,
+        })
+    }
+}
+
+impl ProviderConfigs {
+    /// Prompt-cache TTL assumed when neither the provider config nor the
+    /// built-in provider names one.
+    ///
+    /// Receipt: Anthropic's default prompt-cache TTL is 5 minutes. Hosts that
+    /// keep prefixes longer (cliproxy writes 1h entries) set `prompt_cache_ttl`
+    /// on their custom provider.
+    pub(crate) const DEFAULT_PROMPT_CACHE_TTL: std::time::Duration =
+        std::time::Duration::from_secs(300);
+
+    /// Prompt-cache TTL on OpenAI's own API (`openai`).
+    ///
+    /// Receipt: OpenAI's prompt-caching guide keeps GPT-5.6+ prefixes at least
+    /// 30 minutes after the latest write or reuse (`prompt_cache_options.ttl`
+    /// defaults to `30m`), and earlier models default to `24h` retention
+    /// outside Zero Data Retention orgs, typically about 30 minutes. A ZDR org's
+    /// `in_memory` entries (5-10 minutes) make the first ping miss, which halts
+    /// warming.
+    pub(crate) const OPENAI_PROMPT_CACHE_TTL: std::time::Duration =
+        std::time::Duration::from_secs(30 * 60);
+
+    fn endpoint(&self, provider: &str) -> Option<&Url> {
+        match provider {
+            "ollama" => self.ollama.as_ref().map(|endpoint| &endpoint.base_url),
+            name => self.custom.get(name).map(|endpoint| &endpoint.base_url),
+        }
+    }
+
+    /// Validates and stores a provider base URL. Updating a custom provider
+    /// leaves all of its other options untouched.
+    pub(crate) fn set_endpoint(&mut self, provider: &str, base_url: &str) -> anyhow::Result<()> {
+        if provider == "ollama" {
+            let parsed = parse_provider_base_url("providers.ollama.base_url", base_url)?;
+            self.ollama = Some(ProviderEndpointConfig {
+                base_url: parsed,
+                catalog: None,
+                catalog_lookup: rho_providers::provider::CatalogLookupMode::Slug,
+                api: rho_providers::provider::OpenAiCompatibleApi::ChatCompletions,
+                edit_tool: None,
+                prompt_cache_ttl: None,
+                request_compression: None,
+            });
+            return Ok(());
+        }
+        let api = self
+            .custom
+            .get(provider)
+            .map(|endpoint| endpoint.api)
+            .unwrap_or_default();
+        self.set_custom_endpoint(provider, base_url, api)
+    }
+
+    /// Validates and stores the complete endpoint selection made by custom
+    /// provider onboarding. Existing metadata and edit preferences survive.
+    pub(crate) fn set_custom_endpoint(
+        &mut self,
+        provider: &str,
+        base_url: &str,
+        api: rho_providers::provider::OpenAiCompatibleApi,
+    ) -> anyhow::Result<()> {
+        let field = format!("providers.custom.{provider}.base_url");
+        let base_url = parse_provider_base_url(&field, base_url)?;
+        rho_providers::provider::validate_custom_provider_name(provider)?;
+        match self.custom.entry(provider.to_string()) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let endpoint = entry.get_mut();
+                endpoint.base_url = base_url;
+                endpoint.api = api;
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(ProviderEndpointConfig {
+                    base_url,
+                    catalog: None,
+                    catalog_lookup: rho_providers::provider::CatalogLookupMode::default(),
+                    api,
+                    edit_tool: None,
+                    prompt_cache_ttl: None,
+                    request_compression: None,
+                });
+            }
+        };
+        Ok(())
+    }
+
+    pub(super) fn apply(
+        &mut self,
+        partial: PartialProviderConfigs,
+        warnings: &mut Vec<crate::config::ConfigWarning>,
+    ) -> anyhow::Result<()> {
+        if let Some(endpoint) = partial.ollama {
+            if endpoint.catalog.is_some() {
+                anyhow::bail!("providers.ollama does not accept catalog");
+            }
+            if endpoint.catalog_mode.is_some() {
+                anyhow::bail!("providers.ollama does not accept catalog_mode");
+            }
+            if endpoint.api.is_some() {
+                anyhow::bail!("providers.ollama does not accept api");
+            }
+            if endpoint.edit_tool.is_some() {
+                anyhow::bail!("providers.ollama does not accept edit_tool");
+            }
+            if endpoint.prompt_cache_ttl.is_some() {
+                anyhow::bail!("providers.ollama does not accept prompt_cache_ttl");
+            }
+            if endpoint.request_compression.is_some() {
+                anyhow::bail!("providers.ollama does not accept request_compression");
+            }
+            if let Some(base_url) = endpoint.base_url {
+                self.set_endpoint("ollama", &base_url)?;
+            }
+        }
+        if let Some(custom) = partial.custom {
+            let mut hosts = BTreeMap::new();
+            for (name, endpoint) in custom {
+                if custom_table_shadowed_by_builtin(&name, &endpoint)? {
+                    warnings.push(crate::config::ConfigWarning::ShadowedCustomProvider { name });
+                    continue;
+                }
+                let endpoint = ProviderEndpointConfig::from_custom_partial(&name, endpoint)?;
+                hosts.insert(name, endpoint);
+            }
+            self.custom = hosts;
+        }
+        Ok(())
+    }
+
+    /// Each config-defined host as an intern spec.
+    fn specs(&self) -> impl Iterator<Item = rho_providers::provider::CustomProviderSpec<'_>> {
+        self.custom.iter().map(|(name, endpoint)| {
+            rho_providers::provider::CustomProviderSpec::new(name, endpoint.catalog.as_deref())
+                .with_catalog_lookup(endpoint.catalog_lookup)
+                .with_api(endpoint.api)
+        })
+    }
+
+    /// Interns config-defined hosts without changing the process-wide picker set.
+    pub(crate) fn intern_names(&self) -> anyhow::Result<std::sync::Arc<[String]>> {
+        rho_providers::provider::intern_custom_openai_compatible_providers(self.specs())
+    }
+
+    /// Publishes config-defined hosts as the process-wide named provider set.
+    pub(crate) fn activate(&self) -> anyhow::Result<()> {
+        rho_providers::provider::install_custom_openai_compatible_providers(self.specs())
+    }
+
+    /// Interns this config's hosts and overlays them on the current thread.
+    pub(crate) fn thread_scope(
+        &self,
+    ) -> anyhow::Result<rho_providers::provider::CustomProviderThreadScope> {
+        Ok(rho_providers::provider::CustomProviderThreadScope::enter(
+            self.intern_names()?,
+        ))
+    }
+
+    pub(crate) fn auto_edit_format(&self, provider: &str) -> Option<rho_tools::EditFormat> {
+        self.custom
+            .get(provider)
+            .and_then(|endpoint| endpoint.edit_tool)
+    }
+
+    /// Request encoding a custom host was configured to decode, if any.
+    pub(crate) fn request_compression(
+        &self,
+        provider: &str,
+    ) -> Option<rho_providers::providers::RequestCompression> {
+        self.custom
+            .get(provider)
+            .and_then(|endpoint| endpoint.request_compression)
+    }
+
+    /// Configured prompt cache TTL for a custom host, if any.
+    pub(crate) fn prompt_cache_ttl(&self, provider: &str) -> Option<std::time::Duration> {
+        self.custom
+            .get(provider)
+            .and_then(|endpoint| endpoint.prompt_cache_ttl)
+    }
+
+    /// Prompt-cache TTL for `provider`: a custom host's configured value, else
+    /// the built-in provider's documented lifetime.
+    pub(crate) fn resolved_prompt_cache_ttl(&self, provider: &str) -> std::time::Duration {
+        self.prompt_cache_ttl(provider).unwrap_or(match provider {
+            "openai" => Self::OPENAI_PROMPT_CACHE_TTL,
+            _ => Self::DEFAULT_PROMPT_CACHE_TTL,
+        })
+    }
+}
+
+/// Parses a humantime duration such as `"5m"` or `"1h"`. Zero is rejected:
+/// a host that does not cache should leave the key unset.
+fn parse_prompt_cache_ttl(field: &str, ttl: &str) -> anyhow::Result<std::time::Duration> {
+    let parsed = humantime::parse_duration(ttl).map_err(|error| {
+        anyhow::anyhow!("{field} must be a duration like \"5m\" or \"1h\": {error}")
+    })?;
+    if parsed.is_zero() {
+        anyhow::bail!("{field} must be greater than zero");
+    }
+    Ok(parsed)
+}
+
+fn parse_provider_catalog(field: &str, catalog: &str) -> anyhow::Result<String> {
+    let catalog = catalog.trim();
+    if catalog.is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    if catalog.contains('/') {
+        anyhow::bail!(
+            "{field} must be a models.dev provider slug; set a per-model catalog in models.toml"
+        );
+    }
+    if catalog.contains(',') {
+        anyhow::bail!("{field} must not contain ','");
+    }
+    if catalog.chars().any(char::is_whitespace) {
+        anyhow::bail!("{field} must not contain whitespace");
+    }
+    Ok(catalog.to_string())
+}
+
+fn parse_provider_catalog_mode(
+    field: &str,
+    catalog_mode: &str,
+) -> anyhow::Result<rho_providers::provider::CatalogLookupMode> {
+    catalog_mode
+        .parse()
+        .map_err(|error| anyhow::anyhow!("{field} {error}"))
+}
+
+fn parse_provider_api(
+    field: &str,
+    api: &str,
+) -> anyhow::Result<rho_providers::provider::OpenAiCompatibleApi> {
+    api.parse()
+        .map_err(|error| anyhow::anyhow!("{field} {error}"))
+}
+
+/// Whether a `[providers.custom.<name>]` table names a provider Rho later
+/// shipped as a built-in (OpenCode Zen as `opencode`). Such a table already
+/// shares the built-in's credential account, so it is skipped only when it
+/// points at the built-in's own API base. A table for any other base fails to
+/// load instead: a private gateway's key must not reach the built-in's host,
+/// and another route on the same host (OpenCode Go) must not switch billing.
+fn custom_table_shadowed_by_builtin(
+    name: &str,
+    endpoint: &PartialEndpointConfig,
+) -> anyhow::Result<bool> {
+    let Some(builtin) = rho_providers::provider::builtin_providers()
+        .iter()
+        .find(|descriptor| descriptor.name == name)
+    else {
+        return Ok(false);
+    };
+    let builtin_base = match builtin.runtime {
+        rho_providers::provider::ProviderRuntime::OpenAiCompatible {
+            default_api_base, ..
+        } => Some(default_api_base),
+        _ => None,
+    };
+    if let (Some(builtin_base), Some(table_base)) = (builtin_base, endpoint.base_url.as_deref()) {
+        if builtin_base.trim_end_matches('/') == table_base.trim_end_matches('/') {
+            return Ok(true);
+        }
+    }
+    anyhow::bail!(
+        "providers.custom.{name} conflicts with the built-in {name} provider; rename the table and log in to it again"
+    )
+}
+
+fn parse_provider_base_url(field: &str, base_url: &str) -> anyhow::Result<Url> {
+    let parsed =
+        Url::parse(base_url).map_err(|error| anyhow::anyhow!("invalid {field}: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("{field} must use http or https");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("{field} must not contain credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("{field} must not contain a query or fragment");
+    }
+    Ok(parsed)
+}
+
+impl Config {
+    pub(crate) fn normalize_provider_profiles(&mut self) -> anyhow::Result<()> {
+        // Auth ids such as `{name}-api-key` exist only after intern.
+        let _ = self.providers.intern_names()?;
+        normalize_selection(
+            &self.providers,
+            &mut self.provider,
+            &mut self.auth,
+            &mut self.model,
+            None,
+        )?;
+        ensure_serves_chat(&self.provider)?;
+        for (id, selection) in &mut self.internal_agents {
+            let crate::config::InternalAgentTarget::Rho(rho) = &mut selection.target;
+            normalize_selection(
+                &self.providers,
+                &mut rho.provider,
+                &mut rho.auth,
+                &mut rho.model,
+                Some(id.as_str()),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Promotes a custom host from `none` to `{name}-api-key` when a key is stored.
+    ///
+    /// Login can store the secret without rewriting `auth`. Keyless is the
+    /// default, so restart would keep sending no `Authorization` header unless
+    /// this runs. One-directional: a keyed profile is never written back to
+    /// `none`, including when the credential store errors or is empty.
+    pub(crate) fn promote_stored_custom_auth(
+        &mut self,
+        store: &dyn rho_providers::credentials::CredentialStore,
+    ) -> bool {
+        if self.auth != rho_providers::provider::KEYLESS_AUTH {
+            return false;
+        }
+        let Some(descriptor) = rho_providers::provider::interned_custom_provider(&self.provider)
+        else {
+            return false;
+        };
+        let selected = descriptor.discovery_auth(store).id;
+        if selected == rho_providers::provider::KEYLESS_AUTH {
+            return false;
+        }
+        self.auth = selected.to_string();
+        true
+    }
+
+    /// User-configured API base, if any. Unlike [`Self::resolved_provider_endpoint`],
+    /// this does not fall back to a built-in default.
+    pub(crate) fn configured_provider_endpoint(&self, provider: &str) -> Option<&Url> {
+        self.providers.endpoint(provider)
+    }
+
+    /// Resolves the one API base shared by runtime requests, model discovery, and diagnostics.
+    pub(crate) fn resolved_provider_endpoint(&self, provider: &str) -> Option<Url> {
+        self.configured_provider_endpoint(provider)
+            .cloned()
+            .or_else(
+                || match rho_providers::model::registry::provider_runtime(provider) {
+                    Some(
+                        rho_providers::model::registry::ProviderRuntime::OpenAiCompatible {
+                            default_api_base,
+                            ..
+                        }
+                        | rho_providers::model::registry::ProviderRuntime::SystemOne {
+                            default_api_base,
+                        },
+                    ) => Some(
+                        Url::parse(default_api_base)
+                            .expect("built-in provider API bases must be valid URLs"),
+                    ),
+                    _ => None,
+                },
+            )
+    }
+}
+
+/// Fails when `provider` is a decision-model host, which cannot hold a
+/// conversation. Decision-model entries such as the permission screen name
+/// those hosts in `[internal_agents]` and are not checked here.
+pub(crate) fn ensure_serves_chat(provider: &str) -> anyhow::Result<()> {
+    if rho_providers::provider::provider_descriptor(provider)
+        .is_some_and(|descriptor| !descriptor.serves_chat())
+    {
+        return Err(
+            rho_providers::model::catalog::ModelSelectionError::DecisionOnly {
+                provider: provider.into(),
+            }
+            .into(),
+        );
+    }
+    Ok(())
+}
+
+fn normalize_selection(
+    providers: &ProviderConfigs,
+    provider: &mut String,
+    auth: &mut String,
+    model: &mut String,
+    internal_agent: Option<&str>,
+) -> anyhow::Result<()> {
+    if providers.custom.contains_key(provider.as_str()) {
+        let accepted = rho_providers::provider::interned_custom_provider(provider)
+            .is_some_and(|descriptor| descriptor.auth_mode(auth).is_some());
+        if !accepted {
+            *auth = "none".into();
+        }
+        return Ok(());
+    }
+    let profile = rho_providers::provider::resolve_profile(provider, auth).map_err(|error| {
+        match internal_agent {
+            Some(id) => anyhow::anyhow!("internal agent '{id}': {error}"),
+            None => anyhow::anyhow!("{error}"),
+        }
+    })?;
+    *provider = profile.provider_name().into();
+    *auth = profile.auth_id().into();
+    // Collapse legacy wire ids (for example poolside/laguna-m.1) to the
+    // internal model id used by cache, config, and display joins.
+    *model = profile.provider.canonicalize_model_id(model);
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub(super) struct PersistedProviderConfigs<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ollama: Option<PersistedEndpointConfig<'a>>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    custom: BTreeMap<&'a str, PersistedEndpointConfig<'a>>,
+}
+
+impl PersistedProviderConfigs<'_> {
+    pub(super) fn is_empty(&self) -> bool {
+        self.ollama.is_none() && self.custom.is_empty()
+    }
+}
+
+#[derive(Serialize)]
+struct PersistedEndpointConfig<'a> {
+    base_url: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catalog: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catalog_mode: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edit_tool: Option<rho_tools::EditFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_ttl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_compression: Option<&'static str>,
+}
+
+impl<'a> From<&'a ProviderConfigs> for PersistedProviderConfigs<'a> {
+    fn from(config: &'a ProviderConfigs) -> Self {
+        Self {
+            ollama: config
+                .ollama
+                .as_ref()
+                .map(|endpoint| PersistedEndpointConfig {
+                    base_url: endpoint.base_url.as_str(),
+                    catalog: None,
+                    catalog_mode: None,
+                    api: None,
+                    edit_tool: None,
+                    prompt_cache_ttl: None,
+                    request_compression: None,
+                }),
+            custom: config
+                .custom
+                .iter()
+                .map(|(name, endpoint)| {
+                    (
+                        name.as_str(),
+                        PersistedEndpointConfig {
+                            base_url: endpoint.base_url.as_str(),
+                            catalog: endpoint.catalog.as_deref(),
+                            catalog_mode: persisted_catalog_mode(endpoint.catalog_lookup),
+                            api: endpoint.api.persisted_custom_host_value(),
+                            edit_tool: endpoint.edit_tool,
+                            prompt_cache_ttl: endpoint
+                                .prompt_cache_ttl
+                                .map(|ttl| humantime::format_duration(ttl).to_string()),
+                            request_compression: endpoint
+                                .request_compression
+                                .map(rho_providers::providers::RequestCompression::as_str),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PartialProviderConfigs {
+    pub(super) ollama: Option<PartialEndpointConfig>,
+    pub(super) custom: Option<BTreeMap<String, PartialEndpointConfig>>,
+}
+
+fn persisted_catalog_mode(
+    lookup: rho_providers::provider::CatalogLookupMode,
+) -> Option<&'static str> {
+    match lookup {
+        rho_providers::provider::CatalogLookupMode::Slug => None,
+        rho_providers::provider::CatalogLookupMode::ModelId => Some(lookup.as_str()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PartialEndpointConfig {
+    pub(super) base_url: Option<String>,
+    pub(super) catalog: Option<String>,
+    pub(super) catalog_mode: Option<String>,
+    pub(super) api: Option<String>,
+    pub(super) edit_tool: Option<rho_tools::EditFormat>,
+    pub(super) prompt_cache_ttl: Option<String>,
+    pub(super) request_compression: Option<String>,
+}

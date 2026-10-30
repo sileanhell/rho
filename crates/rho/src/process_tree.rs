@@ -1,0 +1,92 @@
+//! Per-platform supervision of a child and everything it starts.
+//!
+//! Unix gets a new session (and so a process group) without a controlling
+//! terminal, Windows a kill-on-close job. Windows starts the
+//! child suspended, assigns it to the job, and only then resumes its primary
+//! thread. Dropping the owner terminates descendants, including on cancellation.
+
+use tokio::process::Command;
+
+/// Terminates a supervised process tree.
+///
+/// `kill` must be idempotent and safe to call repeatedly: the run loop calls it
+/// on every exit path and `Drop` calls it again.
+pub(crate) trait ProcessTree: Sized + Send {
+    /// Configures the command before spawn.
+    fn prepare(command: &mut Command);
+
+    fn attach(child: &tokio::process::Child) -> std::io::Result<Self>;
+
+    fn kill(&mut self);
+}
+
+#[cfg(unix)]
+pub(crate) struct SupervisedTree {
+    pid: Option<u32>,
+}
+
+#[cfg(unix)]
+impl ProcessTree for SupervisedTree {
+    fn prepare(command: &mut Command) {
+        rho_tools::process_session::start_new_session(command.as_std_mut());
+    }
+
+    fn attach(child: &tokio::process::Child) -> std::io::Result<Self> {
+        Ok(Self { pid: child.id() })
+    }
+
+    fn kill(&mut self) {
+        let Some(pid) = self.pid.take().and_then(|pid| i32::try_from(pid).ok()) else {
+            return;
+        };
+        // A negative PID targets the group created by `start_new_session`, so
+        // descendants die with the child rather than surviving it.
+        let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct SupervisedTree(rho_tools::process_supervision::WindowsJob);
+
+#[cfg(windows)]
+impl ProcessTree for SupervisedTree {
+    fn prepare(command: &mut Command) {
+        rho_tools::process_supervision::WindowsJob::prepare(command);
+    }
+
+    fn attach(child: &tokio::process::Child) -> std::io::Result<Self> {
+        rho_tools::process_supervision::WindowsJob::attach(child).map(Self)
+    }
+
+    fn kill(&mut self) {
+        self.0.kill();
+    }
+}
+
+impl Drop for SupervisedTree {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Test probe for whether a killed tree's member is still running.
+#[cfg(all(test, unix))]
+pub(crate) fn process_is_running(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == -1 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // A container's PID 1 may not reap orphaned grandchildren. Zombies are
+        // terminated even though kill(pid, 0) continues to find their PID.
+        let Some((_, fields)) = stat.rsplit_once(") ") else {
+            return true;
+        };
+        !fields.starts_with("Z ")
+    }
+    #[cfg(not(target_os = "linux"))]
+    true
+}

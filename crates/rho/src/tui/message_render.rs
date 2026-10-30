@@ -1,0 +1,24 @@
+use super::{
+    markdown::{render_markdown, CodeFenceState},
+    render::padded_content_width,
+    rendered_entry::RenderedEntry,
+    theme::Theme,
+};
+
+pub(super) fn render_assistant_content(text: &str, width: usize) -> RenderedEntry {
+    let mut state = CodeFenceState::default();
+    let rendered = render_markdown(text, padded_content_width(width), &mut state);
+    RenderedEntry {
+        lines: rendered.lines,
+        code_blocks: rendered.code_blocks,
+        image_placement: None,
+        image_sources: rendered.image_sources,
+        image_rows: rendered.image_rows,
+    }
+}
+
+pub(super) fn render_reasoning_content(text: &str, width: usize) -> RenderedEntry {
+    let mut rendered = render_assistant_content(text, width);
+    Theme::reasoning_output(&mut rendered.lines);
+    rendered
+}

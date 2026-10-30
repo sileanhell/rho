@@ -1,0 +1,564 @@
+use {
+    crate::cli::Cli,
+    crate::config::Config,
+    crate::model_aliases::ResolvedModelReference,
+    rho_providers::credentials::{self, CredentialStore},
+    rho_providers::model::{
+        catalog,
+        models_dev::{cached_reasoning_capabilities, current_reasoning_capabilities},
+        provider_models::{
+            provider_model_capabilities_need_refresh, refresh_provider_models_with_store,
+            ProviderModelEndpoint,
+        },
+    },
+    rho_providers::provider::{self, ProviderAuthKind, ProviderModelSource},
+};
+
+pub(super) enum ProviderRefreshStatus {
+    NotAttempted,
+    Attempted { provider: String },
+}
+
+impl ProviderRefreshStatus {
+    fn was_attempted_for(&self, provider: &str) -> bool {
+        matches!(self, Self::Attempted { provider: attempted } if attempted == provider)
+    }
+}
+
+pub(super) fn validate(cli: &Cli) -> anyhow::Result<()> {
+    if cli.no_save && cli.command.is_some() {
+        anyhow::bail!("--no-save is only supported for interactive sessions");
+    }
+    if cli.resume.is_some() && cli.command.is_some() {
+        anyhow::bail!("--resume is only supported for interactive sessions");
+    }
+    if cli.continue_latest && cli.command.is_some() {
+        anyhow::bail!("--continue is only supported for interactive sessions");
+    }
+    if let Some(prompt) = &cli.prompt {
+        if cli.command.is_some() {
+            anyhow::bail!("--prompt is only supported for interactive sessions");
+        }
+        if prompt.trim().is_empty() {
+            anyhow::bail!("--prompt requires non-empty prompt text");
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn refresh_model_cache(
+    cli: &Cli,
+    config: &Config,
+    store: &dyn CredentialStore,
+) -> anyhow::Result<ProviderRefreshStatus> {
+    let auth_profile = cli_auth_profile(cli)?;
+    let model_override = cli
+        .model
+        .as_deref()
+        .map(|reference| effective_model_override(config, reference, cli.provider.as_deref()))
+        .transpose()?;
+    let provider = auth_profile
+        .map(|profile| profile.name)
+        .or_else(|| {
+            model_override
+                .as_ref()
+                .and_then(|selection| selection.provider.as_deref())
+        })
+        .or(cli.provider.as_deref())
+        .or_else(|| {
+            model_override
+                .as_ref()
+                .and_then(|selection| split_model_reference(&selection.model))
+                .map(|(provider, _)| provider)
+        })
+        .unwrap_or(&config.provider);
+    if cli.provider.is_none()
+        && cli.model.is_none()
+        && cli.auth.is_none()
+        && !provider_model_capabilities_need_refresh(provider, &config.model)
+    {
+        return Ok(ProviderRefreshStatus::NotAttempted);
+    }
+    let selected_model = model_override
+        .as_ref()
+        .map(|selection| {
+            selection
+                .model
+                .trim()
+                .strip_prefix(&format!("{provider}/"))
+                .unwrap_or(selection.model.trim())
+                .to_string()
+        })
+        .or_else(|| selected_model_for_refresh(config, provider));
+    let endpoint = config.resolved_provider_endpoint(provider);
+    let model_endpoint = endpoint.as_ref().map_or(
+        ProviderModelEndpoint::ProviderOwned,
+        ProviderModelEndpoint::OpenAiCompatible,
+    );
+    let auth = match cli.auth.as_deref() {
+        Some(auth) => auth.to_string(),
+        // Probe with the auth the overrides will select, so a keyed host is
+        // not probed anonymously.
+        None => inferred_auth(provider, &config.auth, store)
+            .map_or_else(|| config.auth.clone(), |profile| profile.auth_id().into()),
+    };
+    let attempted = refresh_model_list_for_provider(
+        provider,
+        &auth,
+        selected_model.as_deref(),
+        /*explicit_selection*/
+        cli.provider.is_some() || cli.model.is_some() || cli.auth.is_some(),
+        store,
+        model_endpoint,
+    )
+    .await?;
+    Ok(if attempted {
+        ProviderRefreshStatus::Attempted {
+            provider: provider.to_string(),
+        }
+    } else {
+        ProviderRefreshStatus::NotAttempted
+    })
+}
+
+/// Fetches `/v1/models` for every user-defined OpenAI-compatible host.
+///
+/// Hosts with a stored API key are queried with it, so a keyed host does not
+/// come back 401 with an empty picker. Failures are ignored so a down host does
+/// not block startup. The picker stays empty until the host is reachable or the
+/// user refreshes by hand. Independent hosts refresh concurrently so one
+/// timeout cannot add to another.
+pub(super) async fn refresh_custom_provider_models(
+    config: &Config,
+    store: &dyn credentials::CredentialStore,
+) {
+    futures_util::future::join_all(config.providers.custom.iter().map(
+        |(name, endpoint)| async move {
+            let auth = provider::provider_descriptor(name)
+                .map(|descriptor| descriptor.discovery_auth(store).id)
+                .unwrap_or(provider::KEYLESS_AUTH);
+            let _ = refresh_provider_models_with_store(
+                name,
+                auth,
+                store,
+                ProviderModelEndpoint::OpenAiCompatible(&endpoint.base_url),
+            )
+            .await;
+        },
+    ))
+    .await;
+}
+
+/// Whether a missing cached default model aborts override application.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CachedModelRequirement {
+    /// `rho run`: fail so the user refreshes or passes a cached model.
+    Required,
+    /// `rho doctor`: keep the named selection so the report can diagnose it.
+    Optional,
+}
+
+/// Apply CLI provider/model/auth/reasoning overrides in memory.
+///
+/// Returns whether those overrides changed the effective selection after
+/// normalization. Flag presence alone is not enough: identical overrides do not
+/// count as a change. Persistence is decided by the caller (only when `--save`
+/// is set).
+///
+/// Without `--auth`, a switched provider takes a mode whose credentials are in
+/// `store` (or its `RHO_*` env override), the same way the TUI model picker
+/// does, and falls back to the provider default only when none has any.
+pub(super) fn apply_overrides(
+    config: &mut Config,
+    cli: &Cli,
+    store: &dyn CredentialStore,
+) -> anyhow::Result<bool> {
+    apply_cli_overrides(config, cli, store, CachedModelRequirement::Required)
+}
+
+/// Same resolution as [`apply_overrides`], including `@alias` checks, but keep
+/// going when the target host has no cached models so `rho doctor` can report
+/// that host instead of aborting.
+pub(super) fn apply_overrides_allowing_empty_cache(
+    config: &mut Config,
+    cli: &Cli,
+    store: &dyn CredentialStore,
+) -> anyhow::Result<bool> {
+    apply_cli_overrides(config, cli, store, CachedModelRequirement::Optional)
+}
+
+fn apply_cli_overrides(
+    config: &mut Config,
+    cli: &Cli,
+    store: &dyn CredentialStore,
+    cached_models: CachedModelRequirement,
+) -> anyhow::Result<bool> {
+    let before = CliSelection::capture(config);
+    let mut flags_present = false;
+    if let Some(provider) = &cli.provider {
+        apply_provider_override(config, provider, cli.model.is_some(), store, cached_models)?;
+        flags_present = true;
+    }
+    if let Some(model) = &cli.model {
+        apply_model_override(config, model, cli.provider.as_deref(), store)?;
+        flags_present = true;
+    }
+    if let Some(profile) = cli_auth_profile(cli)? {
+        let auth = cli
+            .auth
+            .as_deref()
+            .expect("cli_auth_profile is only Some when --auth is set");
+        let current = provider::provider_descriptor(&config.provider);
+        if cli.model.is_none()
+            && current.is_some_and(|descriptor| descriptor.shares_auth_family(*profile))
+        {
+            config.provider = profile.name.into();
+            config.auth = auth.into();
+        } else {
+            apply_provider_override(
+                config,
+                profile.name,
+                cli.model.is_some(),
+                store,
+                cached_models,
+            )?;
+            config.auth = auth.into();
+        }
+        flags_present = true;
+    }
+    if let Some(reasoning) = cli.reasoning {
+        config.reasoning = reasoning;
+        flags_present = true;
+    }
+    if let Some(permission_mode) = cli.permission_mode {
+        config.permission_mode = permission_mode;
+        flags_present = true;
+    }
+    config.normalize_provider_profiles()?;
+    Ok(flags_present && CliSelection::capture(config) != before)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CliSelection {
+    provider: String,
+    model: String,
+    auth: String,
+    reasoning: rho_providers::reasoning::ReasoningLevel,
+    model_alias: Option<String>,
+}
+
+impl CliSelection {
+    fn capture(config: &Config) -> Self {
+        Self {
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            auth: config.auth.clone(),
+            reasoning: config.reasoning,
+            model_alias: config.model_alias.clone(),
+        }
+    }
+}
+
+fn cli_auth_profile(cli: &Cli) -> anyhow::Result<Option<&'static provider::ProviderDescriptor>> {
+    cli.auth
+        .as_deref()
+        .map(|auth| {
+            provider::provider_descriptor_for_auth(auth)
+                .ok_or_else(|| anyhow::anyhow!("unknown auth profile '{auth}'"))
+        })
+        .transpose()
+}
+
+pub(super) fn normalize_reasoning_for_cli(
+    config: &mut Config,
+    source: rho_providers::model::ReasoningRequestSource,
+) -> anyhow::Result<bool> {
+    let capabilities = if source == rho_providers::model::ReasoningRequestSource::Explicit {
+        current_reasoning_capabilities(&config.provider, &config.model)
+    } else {
+        cached_reasoning_capabilities(&config.provider, &config.model)
+    };
+    let resolution = capabilities.resolve(config.reasoning, source);
+    if let rho_providers::model::ReasoningResolution::UnsupportedExplicit(requested) = resolution {
+        let supported = capabilities
+            .levels()
+            .map(|levels| {
+                levels
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|| "none".to_string());
+        anyhow::bail!(
+            "provider '{}' model '{}' does not support reasoning level '{}'; supported levels: {}",
+            config.provider,
+            config.model,
+            requested,
+            supported
+        );
+    }
+    if source == rho_providers::model::ReasoningRequestSource::Explicit
+        && resolution == rho_providers::model::ReasoningResolution::NotConfigurable
+    {
+        anyhow::bail!(
+            "provider '{}' model '{}' does not expose configurable reasoning",
+            config.provider,
+            config.model
+        );
+    }
+    Ok(apply_reasoning_resolution(config, resolution))
+}
+
+pub(super) async fn prepare_model_metadata(
+    config: &Config,
+    store: &dyn CredentialStore,
+    provider_refresh: &ProviderRefreshStatus,
+) {
+    if needs_startup_capability_refresh(config, provider_refresh) {
+        let endpoint = config.resolved_provider_endpoint(&config.provider);
+        let model_endpoint = endpoint.as_ref().map_or(
+            ProviderModelEndpoint::ProviderOwned,
+            ProviderModelEndpoint::OpenAiCompatible,
+        );
+        let _ = refresh_provider_models_with_store(
+            &config.provider,
+            &config.auth,
+            store,
+            model_endpoint,
+        )
+        .await;
+    }
+    // models.dev metadata is optional and fetched asynchronously by the TUI.
+    // Blocking automation and background-agent startup on the full catalog makes
+    // cold or offline launches depend on an unrelated network request. Provider-
+    // native discovery remains synchronous above because Kimi and Anthropic use
+    // it as the authoritative capability source.
+}
+
+fn needs_startup_capability_refresh(
+    config: &Config,
+    provider_refresh: &ProviderRefreshStatus,
+) -> bool {
+    !provider_refresh.was_attempted_for(&config.provider)
+        && provider_model_capabilities_need_refresh(&config.provider, &config.model)
+}
+
+pub(super) fn normalize_reasoning(config: &mut Config) -> bool {
+    normalize_reasoning_from(
+        config,
+        rho_providers::model::ReasoningRequestSource::PersistedOrDefault,
+    )
+}
+
+fn normalize_reasoning_from(
+    config: &mut Config,
+    source: rho_providers::model::ReasoningRequestSource,
+) -> bool {
+    let capabilities = cached_reasoning_capabilities(&config.provider, &config.model);
+    let resolution = capabilities.resolve(config.reasoning, source);
+    apply_reasoning_resolution(config, resolution)
+}
+
+fn apply_reasoning_resolution(
+    config: &mut Config,
+    resolution: rho_providers::model::ReasoningResolution,
+) -> bool {
+    let Some(reasoning) = resolution.effective() else {
+        return false;
+    };
+    if reasoning == config.reasoning {
+        return false;
+    }
+    config.reasoning = reasoning;
+    true
+}
+
+fn apply_provider_override(
+    config: &mut Config,
+    provider: &str,
+    has_model_override: bool,
+    store: &dyn CredentialStore,
+    cached_models: CachedModelRequirement,
+) -> anyhow::Result<()> {
+    let profile = inferred_auth(provider, &config.auth, store)
+        .ok_or_else(|| anyhow::anyhow!("unknown provider '{provider}' for --provider"))?;
+    let provider = profile.provider_name();
+    crate::config::ensure_serves_chat(provider)?;
+    let model = if has_model_override {
+        None
+    } else if let Some(model) = catalog::default_model_for_provider(provider) {
+        Some(model)
+    } else {
+        match cached_models {
+            CachedModelRequirement::Optional => None,
+            CachedModelRequirement::Required => anyhow::bail!(
+                "no cached models for provider '{provider}'. Open /config and choose Refresh model lists, or pass a cached provider/model with --model"
+            ),
+        }
+    };
+    config.provider = provider.to_string();
+    config.auth = profile.auth_id().to_string();
+    if let Some(model) = model {
+        config.model = model;
+    }
+    Ok(())
+}
+
+fn apply_model_override(
+    config: &mut Config,
+    reference: &str,
+    cli_provider: Option<&str>,
+    store: &dyn CredentialStore,
+) -> anyhow::Result<()> {
+    let model_override = effective_model_override(config, reference, cli_provider)?;
+    let qualified = match model_override.provider.as_deref() {
+        Some(provider) => Some((provider, model_override.model.as_str())),
+        None => split_model_reference(&model_override.model),
+    };
+    let selection = match qualified {
+        Some((provider, model)) => {
+            // The catalog still checks the inferred auth against the model's
+            // own auth modes. An explicit `--auth` is applied afterward and
+            // still takes precedence.
+            let auth = inferred_auth(provider, &config.auth, store)
+                .map(|profile| profile.auth_id().to_string());
+            catalog::resolve_model_selection_for_provider(
+                provider,
+                model,
+                catalog::SelectionAuthContext {
+                    current: auth.as_deref(),
+                    available: auth.as_slice(),
+                },
+            )?
+        }
+        None => catalog::resolve_model_selection_for_auths(
+            &model_override.model,
+            &config.provider,
+            &config.auth,
+            std::slice::from_ref(&config.auth),
+        )?,
+    };
+    config.provider = selection.provider;
+    config.model = selection.model;
+    config.auth = selection.auth;
+    config.model_alias = model_override.alias;
+    Ok(())
+}
+
+/// Auth the CLI selects for `provider` when `--auth` is omitted, shared by
+/// `--provider`, `--model provider/model`, and the startup model refresh.
+///
+/// A legacy alias such as `xai-oauth` keeps its pinned auth. Otherwise, in
+/// order: the configured auth when the provider offers it and it has
+/// credentials; a keyed mode with stored credentials (or an `RHO_*` override),
+/// as the `/model` picker prefers; the configured keyed auth, so a keyed host
+/// never drops to keyless (which `--save` would persist); the provider
+/// default. `None` for an unknown provider. Only this provider's modes are
+/// checked, so the store is not queried for every provider.
+fn inferred_auth(
+    provider: &str,
+    configured: &str,
+    store: &dyn CredentialStore,
+) -> Option<provider::ResolvedProviderProfile> {
+    let profile = provider::resolve_provider_reference(provider).ok()?;
+    if provider::legacy_provider_alias(provider).is_some() {
+        return Some(profile);
+    }
+    let descriptor = profile.provider;
+    let keyed = |mode: &provider::AuthMode| !matches!(mode.auth_kind, ProviderAuthKind::None);
+    let has_credentials = |mode: &provider::AuthMode| {
+        credentials::auth_has_credentials(store, mode.id).unwrap_or(false)
+    };
+    let configured = descriptor.auth_mode(configured).filter(keyed);
+    let auth = configured
+        .filter(has_credentials)
+        .or_else(|| {
+            descriptor
+                .auth_modes()
+                .find(|mode| keyed(mode) && has_credentials(mode))
+        })
+        .or(configured)
+        .unwrap_or_else(|| descriptor.default_auth());
+    Some(provider::ResolvedProviderProfile {
+        provider: descriptor,
+        auth,
+    })
+}
+
+fn effective_model_override(
+    config: &Config,
+    reference: &str,
+    cli_provider: Option<&str>,
+) -> anyhow::Result<ResolvedModelReference> {
+    // Resolve once before refresh or catalog validation so both paths act on
+    // the same concrete target.
+    let mut resolved = config
+        .model_aliases
+        .resolve(reference)
+        .map_err(|error| anyhow::anyhow!("--model: {error}"))?;
+    match (cli_provider, resolved.provider.as_deref(), &resolved.alias) {
+        (Some(pinned), Some(alias_provider), Some(_)) if pinned != alias_provider => {
+            anyhow::bail!(
+                "model alias '{reference}' resolves to provider '{alias_provider}', which conflicts with --provider {pinned}"
+            );
+        }
+        _ => {}
+    }
+    resolved.provider = resolved
+        .provider
+        .or_else(|| cli_provider.map(str::to_string));
+    Ok(resolved)
+}
+
+async fn refresh_model_list_for_provider(
+    provider: &str,
+    auth: &str,
+    selected_model: Option<&str>,
+    explicit_selection: bool,
+    store: &dyn credentials::CredentialStore,
+    endpoint: ProviderModelEndpoint<'_>,
+) -> anyhow::Result<bool> {
+    let Some(descriptor) = provider::provider_descriptor(provider) else {
+        return Ok(false);
+    };
+    let needs_model_discovery = catalog::default_model_for_provider(provider).is_none()
+        && (selected_model.is_none() || provider_requires_cached_models(provider));
+    let needs_capabilities = selected_model
+        .is_some_and(|model| provider_model_capabilities_need_refresh(provider, model));
+    if !descriptor.supports_model_refresh() || (!needs_model_discovery && !needs_capabilities) {
+        return Ok(false);
+    }
+    match refresh_provider_models_with_store(provider, auth, store, endpoint).await {
+        Ok(_) => Ok(true),
+        Err(error)
+            if explicit_selection
+                && needs_model_discovery
+                && provider_requires_cached_models(provider) =>
+        {
+            Err(error.into())
+        }
+        Err(_) => Ok(true),
+    }
+}
+
+fn selected_model_for_refresh(config: &Config, provider: &str) -> Option<String> {
+    if provider == config.provider {
+        return Some(config.model.clone());
+    }
+    catalog::default_model_for_provider(provider)
+}
+
+fn provider_requires_cached_models(provider: &str) -> bool {
+    provider::provider_descriptor(provider)
+        .map(|descriptor| descriptor.model_source == ProviderModelSource::CachedProviderModels)
+        .unwrap_or(false)
+}
+
+/// Splits a `provider/model` reference at its first `/`, the way the catalog
+/// resolver does. `None` for a bare model id or an empty side.
+fn split_model_reference(reference: &str) -> Option<(&str, &str)> {
+    let (provider, model) = reference.trim().split_once('/')?;
+    let (provider, model) = (provider.trim(), model.trim());
+    (!provider.is_empty() && !model.is_empty()).then_some((provider, model))
+}

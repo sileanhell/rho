@@ -1,0 +1,391 @@
+use std::{sync::Arc, time::Duration};
+
+mod advisor;
+mod agent_config;
+mod agent_message;
+mod agent_prompt;
+mod attach;
+mod boundary_notifications;
+mod calibrated_context;
+mod codemode_stream;
+mod compact;
+mod docs_demo;
+mod edit;
+mod goal;
+mod init;
+mod plan_exit;
+mod quiet_subagent;
+mod release;
+mod remember;
+mod response_scenarios;
+mod send_confirm;
+mod sessions;
+mod stream_scenarios;
+mod streaming_controls;
+mod todo;
+mod workflow;
+mod write_stream;
+
+use rho_sdk::{
+    model::{
+        ContentBlock, Message, ModelEvent, ModelIdentity, ModelRequest, ModelResponse,
+        SemanticMessage, ToolCall,
+    },
+    provider::{
+        ModelProvider, ModelRequestOptions, NativeCompactionFuture, ProviderEventSender,
+        ProviderFuture, ProviderSteeringReceiver,
+    },
+    CancellationToken, ProviderError,
+};
+
+const MODE_ENV: &str = "RHO_TUI_TEST_MODE";
+const MATRIX_MODE: &str = "matrix";
+const TOOL_CALL_ID: &str = "tui-fixture-tool";
+const HOVER_TOOL_CALL_ID: &str = "tui-fixture-hover-tool";
+const LONG_APPROVAL_CALL_ID: &str = "tui-fixture-long-approval";
+const QUESTIONNAIRE_CALL_ID: &str = "tui-fixture-questionnaire";
+const PROGRESS_CALL_ID: &str = "tui-fixture-progress";
+const CODEMODE_CALL_ID: &str = "tui-fixture-codemode";
+const CONCURRENT_SLOW_CALL_ID: &str = "tui-fixture-concurrent-slow";
+const CONCURRENT_FAST_CALL_ID: &str = "tui-fixture-concurrent-fast";
+const BACKGROUND_AGENT_CALL_ID: &str = "tui-fixture-background-agent";
+const SUBAGENT_RAIL_AGENT_CALL_ID: &str = "tui-fixture-subagent-rail-agent";
+const PROCESS_RAIL_CALL_ID: &str = "tui-fixture-process-rail";
+const COMPUTER_CALL_ID: &str = "tui-fixture-computer";
+const BACKGROUND_QUESTIONNAIRE_AGENT_CALL_ID: &str = "tui-fixture-background-questionnaire-agent";
+const CLAUDE_AGENT_CALL_ID: &str = "tui-fixture-claude-agent";
+const CLAUDE_AGENT_ERROR_CALL_ID: &str = "tui-fixture-claude-agent-error";
+const BACKGROUND_CLAUDE_AGENT_CALL_ID: &str = "tui-fixture-background-claude-agent";
+const CURSOR_AGENT_CALL_ID: &str = "tui-fixture-cursor-agent";
+const ANTIGRAVITY_AGENT_CALL_ID: &str = "tui-fixture-antigravity-agent";
+const GOAL_RETRY_AGENT_CALL_ID: &str = "tui-fixture-goal-retry-agent";
+const AGENTS_LIST_CALL_ID: &str = "tui-fixture-agents-list";
+const BACKGROUND_QUESTIONNAIRE_COMPLETION: &str =
+    "background agent questionnaire completed with color blue";
+
+pub(super) fn from_env(
+    provider: &str,
+    model: &str,
+) -> Result<Option<Arc<dyn ModelProvider>>, String> {
+    let Some(mode) = std::env::var_os(MODE_ENV) else {
+        return Ok(None);
+    };
+    let mode = mode
+        .into_string()
+        .map_err(|_| format!("{MODE_ENV} must be valid UTF-8"))?;
+    if mode != MATRIX_MODE {
+        return Err(format!("unknown {MODE_ENV} value '{mode}'"));
+    }
+    Ok(Some(Arc::new(TuiFixtureProvider {
+        identity: ModelIdentity::new(provider, "tui-test-fixture", model),
+    })))
+}
+
+struct TuiFixtureProvider {
+    identity: ModelIdentity,
+}
+
+impl ModelProvider for TuiFixtureProvider {
+    fn identity(&self) -> ModelIdentity {
+        self.identity.clone()
+    }
+
+    fn send_turn<'a>(&'a self, request: ModelRequest<'a>) -> ProviderFuture<'a> {
+        Box::pin(async move { fixture_response(&request) })
+    }
+
+    fn send_turn_stream<'a>(
+        &'a self,
+        request: ModelRequest<'a>,
+        events: ProviderEventSender,
+    ) -> ProviderFuture<'a> {
+        Box::pin(async move { fixture_stream(request, events).await })
+    }
+
+    fn send_turn_stream_steerable<'a>(
+        &'a self,
+        request: ModelRequest<'a>,
+        _options: ModelRequestOptions,
+        events: ProviderEventSender,
+        mut steering: ProviderSteeringReceiver,
+    ) -> ProviderFuture<'a> {
+        Box::pin(async move {
+            let prompt = last_user_text(&request).unwrap_or_default();
+            if prompt == "fixture mid-turn steer" {
+                return stream_mid_turn_steer(request, events, &mut steering).await;
+            }
+            drop(steering);
+            fixture_stream(request, events).await
+        })
+    }
+
+    fn native_compact<'a>(
+        &'a self,
+        request: ModelRequest<'a>,
+    ) -> Option<NativeCompactionFuture<'a>> {
+        compact::native_compact(request)
+    }
+}
+
+async fn fixture_stream(
+    request: ModelRequest<'_>,
+    events: ProviderEventSender,
+) -> Result<ModelResponse, ProviderError> {
+    let prompt = last_user_text(&request).unwrap_or_default();
+    if let Some(response) = agent_config::intercept(&prompt, &request) {
+        return response;
+    }
+    if let Some(response) = remember::intercept(&prompt, &request) {
+        return response;
+    }
+    if let Some(response) = sessions::intercept(&prompt, &request) {
+        return response;
+    }
+    if let Some(response) = boundary_notifications::intercept(&request) {
+        return response;
+    }
+    if let Some(response) = title_response(&request) {
+        return response;
+    }
+    if let Some(phase) = prompt.strip_prefix("fixture system prompt probe ") {
+        let present = matches!(
+            request.messages.first(),
+            Some(Message::System(text))
+                if !text.is_empty()
+        );
+        let status = if present { "present" } else { "missing" };
+        return completed(format!("system prompt {status}: {phase}"));
+    }
+    if let Some(response) = agent_message::intercept(&prompt, &request).await {
+        return response;
+    }
+    if let Some(response) = agent_prompt::intercept(&prompt, &request, &events).await {
+        return response;
+    }
+    if let Some(response) = quiet_subagent::intercept(&prompt, &request, &events).await {
+        return response;
+    }
+    if let Some(response) = docs_demo::intercept(&prompt, &request, &events).await {
+        return response;
+    }
+    if let Some(response) = attach::intercept(&prompt, &request, &events).await {
+        return response;
+    }
+    if let Some(response) = plan_exit::intercept_child(&prompt, &request).await {
+        return response;
+    }
+    if let Some(response) = plan_exit::intercept_held(&prompt, &request).await {
+        return response;
+    }
+    if let Some(response) = goal::intercept(&prompt, &request, &events).await {
+        return response;
+    }
+    if prompt == "fixture streaming controls" {
+        return streaming_controls::stream(&request, &events).await;
+    }
+    if let Some(response) = calibrated_context::intercept(&prompt, &events).await {
+        return response;
+    }
+    if let Some(response) = codemode_stream::intercept(&prompt, &request, &events).await {
+        return response;
+    }
+    if let Some(response) = stream_scenarios::intercept(&prompt, &request, &events).await {
+        return response;
+    }
+    if let Some(response) = edit::intercept(&prompt, &request, &events).await {
+        return response;
+    }
+    if let Some(response) = todo::intercept(&prompt, &request, &events).await {
+        return response;
+    }
+    if let Some(response) = write_stream::intercept(&prompt, &request, &events).await {
+        return response;
+    }
+    if let Some(response) = advisor::intercept(&prompt, &request, &events).await {
+        return response;
+    }
+    if prompt == "fixture background questionnaire" {
+        // The PTY releases this only after observing the child's open form.
+        // Child startup can outlast any fixed delay on a loaded CI worker.
+        release::wait_for_release_or_cancel(
+            ".rho-fixture-release-questionnaire-parent",
+            &request.cancellation,
+        )
+        .await?;
+    }
+    let response = fixture_response(&request)?;
+    let ModelResponse::Assistant(blocks) = &response;
+    for block in blocks {
+        if let ContentBlock::Text(text) = block {
+            events.send(ModelEvent::OutputDelta(text.clone())).await?;
+        }
+    }
+    Ok(response)
+}
+
+fn fixture_response(request: &ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
+    if let Some(response) = title_response(request) {
+        return response;
+    }
+    if let Some(review) = advisor::review(request) {
+        return review;
+    }
+    if let Some(response) = response_scenarios::compaction(request) {
+        return response;
+    }
+    if let Some(response) = goal::intercept_response(request) {
+        return response;
+    }
+    if let Some(response) = init::intercept(request) {
+        return response;
+    }
+    let prompt = last_user_text(request).unwrap_or_default();
+    if let Some(response) = workflow::intercept(&prompt, request) {
+        return response;
+    }
+    if let Some(response) = plan_exit::intercept(&prompt, request) {
+        return response;
+    }
+    if let Some(response) = response_scenarios::intercept(request) {
+        return response;
+    }
+    completed(format!("fixture response: {prompt}"))
+}
+
+// Decode the title request envelope rather than matching its system instructions.
+fn title_response(request: &ModelRequest<'_>) -> Option<Result<ModelResponse, ProviderError>> {
+    let prompt = last_user_text(request)?;
+    let source =
+        prompt.strip_prefix("Name the work described in this JSON-quoted source material:\n")?;
+    let source: String = serde_json::from_str(source).ok()?;
+    let title = if let Some(title) = docs_demo::session_title(&source) {
+        title
+    } else if source.starts_with("First turn:") {
+        "Fixture session title"
+    } else if agent_message::is_untitled_task(&source) {
+        ""
+    } else {
+        "Fixture run title"
+    };
+    Some(completed(title))
+}
+
+fn last_user_text(request: &ModelRequest<'_>) -> Option<String> {
+    request.messages.iter().rev().find_map(|message| {
+        if message.as_model_context().is_some() {
+            return None;
+        }
+        let SemanticMessage::User(content) = message.semantic() else {
+            return None;
+        };
+        let text = content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.as_str()),
+                ContentBlock::Image(_) | ContentBlock::ToolCall(_) => None,
+            })
+            .collect::<String>();
+        (!text.is_empty()).then_some(text)
+    })
+}
+
+fn tool_result_for_name<'a>(
+    request: &'a ModelRequest<'_>,
+    name: &str,
+) -> Option<&'a rho_sdk::model::ToolResult> {
+    let current_turn = request
+        .messages
+        .iter()
+        .rev()
+        .take_while(|message| {
+            message.as_model_context().is_some()
+                || !matches!(message.semantic(), SemanticMessage::User(_))
+        })
+        .collect::<Vec<_>>();
+    let call_id = current_turn.iter().find_map(|message| {
+        message
+            .completed_assistant_content()?
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolCall(call) if call.name == name => Some(call.id.as_str()),
+                ContentBlock::Text(_) | ContentBlock::Image(_) | ContentBlock::ToolCall(_) => None,
+            })
+    })?;
+    current_turn.iter().find_map(|message| match message {
+        Message::ToolResult(result) if result.id == call_id => Some(result),
+        _ => None,
+    })
+}
+
+fn current_turn_tool_results<'a>(
+    request: &'a ModelRequest<'_>,
+) -> impl Iterator<Item = &'a rho_sdk::model::ToolResult> + 'a {
+    request
+        .messages
+        .iter()
+        .rev()
+        .take_while(|message| {
+            message.as_model_context().is_some()
+                || !matches!(message.semantic(), SemanticMessage::User(_))
+        })
+        .filter_map(|message| match message {
+            Message::ToolResult(result) => Some(result),
+            _ => None,
+        })
+}
+
+fn tool_result<'a>(
+    request: &'a ModelRequest<'_>,
+    id: &str,
+) -> Option<&'a rho_sdk::model::ToolResult> {
+    current_turn_tool_results(request).find(|result| result.id == id)
+}
+
+fn completed(text: impl Into<String>) -> Result<ModelResponse, ProviderError> {
+    Ok(ModelResponse::Assistant(vec![ContentBlock::Text(
+        text.into(),
+    )]))
+}
+
+fn completed_tool_call(
+    id: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> Result<ModelResponse, ProviderError> {
+    Ok(ModelResponse::Assistant(vec![ContentBlock::ToolCall(
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+        },
+    )]))
+}
+
+async fn stream_mid_turn_steer(
+    request: ModelRequest<'_>,
+    events: ProviderEventSender,
+    steering: &mut ProviderSteeringReceiver,
+) -> Result<ModelResponse, ProviderError> {
+    events
+        .send(ModelEvent::OutputDelta("waiting for mid-turn steer".into()))
+        .await?;
+    if let Some(request) = steering.recv().await {
+        if request.claim() {
+            request.accept();
+        }
+    }
+    fixture_sleep(&request.cancellation, Duration::from_secs(2)).await?;
+    completed("waiting for mid-turn steer")
+}
+
+async fn fixture_sleep(
+    cancellation: &CancellationToken,
+    duration: Duration,
+) -> Result<(), ProviderError> {
+    tokio::select! {
+        () = tokio::time::sleep(duration) => Ok(()),
+        () = cancellation.cancelled() => {
+            Err(ProviderError::interrupted("fixture provider cancelled"))
+        }
+    }
+}
