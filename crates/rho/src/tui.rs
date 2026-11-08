@@ -639,6 +639,9 @@ struct App {
     /// Latest native checklist, mirrored for commands while a turn is running.
     todo_list: Option<crate::tools::todo::TodoList>,
     clipboard: Box<dyn Clipboard + Send>,
+    /// `TERM_PROGRAM` is set, so the host terminal owns right-click and Rho
+    /// skips its own right-click paste to avoid inserting twice.
+    host_handles_right_click: bool,
     media_attach_tasks: Vec<media_attach::MediaAttachTask>,
     /// Shared composer attachment layout for the current frame/width.
     composer_attachment_layout_cache: Option<composer_attachments::ComposerAttachmentLayoutCache>,

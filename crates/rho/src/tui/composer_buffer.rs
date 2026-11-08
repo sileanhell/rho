@@ -390,6 +390,13 @@ impl ComposerBuffer {
         self.selection = ComposerSelectionState::None;
     }
 
+    /// Selected text with collapsed paste markers expanded, for copying.
+    pub(super) fn selected_text(&self) -> Option<String> {
+        let fragment = self.fragment(self.selection_range()?);
+        let text = super::paste_burst::expand_paste_segments(&fragment.text, &fragment.segments);
+        (!text.is_empty()).then_some(text)
+    }
+
     /// Take a non-empty selection range and clear selection state.
     pub(super) fn take_selection_range(&mut self) -> Option<std::ops::Range<usize>> {
         let range = self.selection_range();

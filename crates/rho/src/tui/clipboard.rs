@@ -39,7 +39,27 @@ impl Clipboard for SystemClipboard {
     }
 }
 
+/// Whether the host terminal acts on right-click itself even while Rho has
+/// mouse reporting on.
+///
+/// Any terminal that names itself in `TERM_PROGRAM` (VS Code and its forks,
+/// iTerm2, WezTerm, mintty, tmux, ...) is trusted to own right-click; VS Code,
+/// for one, pastes per `terminal.integrated.rightClickBehavior` and still
+/// forwards the click, so a Rho paste would insert the clipboard twice. Plain
+/// console hosts such as conhost (`cmd.exe`) and Windows Terminal do not set
+/// it, so Rho keeps its own right-click paste there.
+pub(super) fn host_handles_right_click(get_var: impl Fn(&str) -> Option<String>) -> bool {
+    get_var("TERM_PROGRAM").is_some_and(|value| !value.trim().is_empty())
+}
+
 impl App {
+    /// Right-click paste, unless the host terminal already pastes on right-click.
+    pub(super) fn paste_clipboard_on_right_click(&mut self) {
+        if !self.host_handles_right_click {
+            self.paste_clipboard_text();
+        }
+    }
+
     /// Pastes host clipboard text through the same composer path as bracketed paste.
     pub(super) fn paste_clipboard_text(&mut self) {
         match self.clipboard.paste() {
@@ -184,5 +204,32 @@ fn classify_pasted_image(path: PathBuf) -> PastedImageOutcome {
             kind: "file paste",
             message: error.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_handles_right_click;
+
+    fn detect(vars: &[(&str, &str)]) -> bool {
+        host_handles_right_click(|key| {
+            vars.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_owned())
+        })
+    }
+
+    #[test]
+    fn any_named_terminal_owns_right_click() {
+        assert!(detect(&[("TERM_PROGRAM", "vscode")]));
+        assert!(detect(&[("TERM_PROGRAM", "WezTerm")]));
+        assert!(detect(&[("TERM_PROGRAM", "mintty")]));
+    }
+
+    #[test]
+    fn console_hosts_keep_rho_right_click_paste() {
+        assert!(!detect(&[]));
+        assert!(!detect(&[("TERM_PROGRAM", "  ")]));
+        assert!(!detect(&[("WT_SESSION", "abc")]));
     }
 }

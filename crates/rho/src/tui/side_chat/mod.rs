@@ -394,7 +394,7 @@ impl App {
         self.clear_rail_pointer_state();
         self.history.set_scrollbar_drag(None);
         if kind == MouseEventKind::Down(MouseButton::Right) {
-            self.paste_clipboard_text();
+            self.paste_clipboard_on_right_click();
             return;
         }
         // Building the frame renders the whole transcript; skip it for motion.
@@ -433,6 +433,10 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) if composer.buffer.selection_dragging() => {
                 let index = prepared.composer_index_at(composer, column, row, true);
                 composer.pointer_release(index);
+                // Copy on select, like a transcript selection.
+                if let Some(text) = composer.buffer.selected_text() {
+                    self.copy_text(&text, now);
+                }
                 return;
             }
             _ => {}

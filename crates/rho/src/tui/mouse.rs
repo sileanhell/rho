@@ -453,6 +453,10 @@ impl App {
                     let index =
                         self.composer_text_char_index_at(&layout, column, row, /*clamp*/ true);
                     self.input_ui.buffer_mut().pointer_release(index);
+                    // Copy on select, like a transcript selection.
+                    if let Some(text) = self.input_ui.buffer().selected_text() {
+                        self.copy_text(&text, now);
+                    }
                 } else if let Some(mut selection) = self.history.text_selection_mut().take() {
                     let release_position =
                         selection_position_clamped(history, history_start, column, row);
@@ -540,7 +544,7 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Right) => {
                 self.input_ui.cancel_pointer_click_sequence();
-                self.paste_clipboard_text();
+                self.paste_clipboard_on_right_click();
             }
             MouseEventKind::Down(MouseButton::Middle)
             | MouseEventKind::Up(MouseButton::Right)

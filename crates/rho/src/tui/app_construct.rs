@@ -147,6 +147,9 @@ impl App {
             session_title_locked: false,
             todo_list: None,
             clipboard: Box::new(SystemClipboard::default()),
+            host_handles_right_click: super::clipboard::host_handles_right_click(|key| {
+                std::env::var(key).ok()
+            }),
             media_attach_tasks: Vec::new(),
             composer_attachment_layout_cache: None,
 
