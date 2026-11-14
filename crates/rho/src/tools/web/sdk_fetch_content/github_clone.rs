@@ -175,6 +175,8 @@ async fn run_process(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    rho_tools::process_console::hide_console_window(command.as_std_mut());
     rho_tools::apply_process_environment(&mut command, execution.environment())
         .map_err(|error| ToolError::new(ToolErrorKind::Execution, error))?;
     for (name, value) in credentials {

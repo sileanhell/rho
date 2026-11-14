@@ -50,6 +50,11 @@ const OAUTH_PRODUCT_REPLACEMENTS: &[(&str, &str)] = &[("Rho", "Claude Code")];
 /// `speed: "fast"` beta, accepted by Opus 4.8 / 5 / 5.5 on the first-party
 /// host. The `-fast` catalog rows map onto their base id plus this speed.
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
+/// Overrides the wire `cache_control.ttl` on the native route
+/// (`"5m"`/`"1h"`). Mirrors Claude Code's `CLAUDE_CODE_PROMPT_CACHE_TTL`.
+const CACHE_TTL_ENV: &str = "RHO_ANTHROPIC_CACHE_TTL";
+/// `cache_control.scope` value for account-shared prefixes.
+const GLOBAL_CACHE_SCOPE: &str = "global";
 pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// First-party output ceiling while neither catalog knows the model. Thinking
 /// counts against `max_tokens` even when its text is omitted, so a
@@ -62,6 +67,7 @@ pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 const ANTHROPIC_COLD_CATALOG_MAX_TOKENS: u32 = 32_000;
 pub(crate) const ANTHROPIC_ANSWER_RESERVE_TOKENS: u32 = 1_024;
 
+mod latches;
 mod per_message_effort;
 mod thinking;
 
@@ -129,6 +135,12 @@ pub struct AnthropicProvider {
     /// Per-conversation prefix effort and later shifts, keyed by prompt cache
     /// key, so a mid-session change does not rewrite top-level effort.
     per_message_effort: Mutex<per_message_effort::PerMessageEffortState>,
+    /// Sticky per-conversation downgrades latched after classified 400s.
+    latches: Mutex<latches::ConversationLatches>,
+    /// Explicit `cache_control.ttl` override (`"5m"`/`"1h"`): the env var on
+    /// the native route, `providers.custom.*.prompt_cache_ttl` on hosted
+    /// adapters. `None` resolves per request from the auth shape.
+    configured_cache_ttl: Option<&'static str>,
     session_headers: super::opencode::SessionHeaders,
     compression: super::request_body::EndpointCompression,
 }
@@ -153,6 +165,8 @@ impl AnthropicProvider {
             compression: super::request_body::EndpointCompression::Verified,
             thinking_budget_ceiling: OnceLock::new(),
             per_message_effort: Mutex::new(per_message_effort::PerMessageEffortState::default()),
+            latches: Mutex::new(latches::ConversationLatches::default()),
+            configured_cache_ttl: None,
         }
     }
 
@@ -182,6 +196,7 @@ impl AnthropicProvider {
             "anthropic",
             ANTHROPIC_COLD_CATALOG_MAX_TOKENS,
         )
+        .with_cache_ttl(env_cache_ttl())
     }
 
     /// Hosted Anthropic Messages adapter registered under `identity_provider`.
@@ -211,6 +226,21 @@ impl AnthropicProvider {
         self
     }
 
+    /// Overrides the `cache_control.ttl` sent on breakpoints. Anthropic only
+    /// documents `"5m"` and `"1h"`, so other durations snap to the nearest
+    /// tier; `None` keeps the current setting so overrides can layer over
+    /// the env fallback.
+    pub(crate) fn with_cache_ttl(mut self, ttl: Option<std::time::Duration>) -> Self {
+        if let Some(ttl) = ttl {
+            self.configured_cache_ttl = Some(if ttl <= std::time::Duration::from_secs(300) {
+                "5m"
+            } else {
+                "1h"
+            });
+        }
+        self
+    }
+
     fn with_cold_max_tokens(
         model: String,
         auth: AnthropicAuth,
@@ -232,6 +262,8 @@ impl AnthropicProvider {
             compression: super::request_body::EndpointCompression::Verified,
             thinking_budget_ceiling: OnceLock::new(),
             per_message_effort: Mutex::new(per_message_effort::PerMessageEffortState::default()),
+            latches: Mutex::new(latches::ConversationLatches::default()),
+            configured_cache_ttl: None,
         }
     }
 
@@ -266,14 +298,54 @@ impl AnthropicProvider {
         (*self.thinking_budget_ceiling.get_or_init(|| live_max_tokens)).min(live_max_tokens)
     }
 
+    /// Breakpoint TTL for this request. Mirrors Claude Code's policy: the
+    /// subscription (OAuth) route defaults to `"1h"` because plan-priced cache
+    /// writes make the longer TTL strictly better; API-key requests keep the
+    /// explicit `"5m"` default since an hour write costs 2x input. Hosted
+    /// adapters send a TTL only when one was configured — a proxy that does
+    /// not know the field latches `ttl_refused` and retries plain. A latched
+    /// refusal drops the leaf everywhere.
+    fn wire_ttl(&self, oauth: bool, latches: &latches::Latches) -> Option<&'static str> {
+        if latches.ttl_refused {
+            return None;
+        }
+        if let Some(ttl) = self.configured_cache_ttl {
+            return Some(ttl);
+        }
+        if !self.native_route() {
+            return None;
+        }
+        Some(if oauth { "1h" } else { "5m" })
+    }
+
+    /// Whether breakpoints may be sent at all. Requests without a prompt
+    /// cache key have no stable conversation identity, so they opt out like
+    /// Claude Code's aux queries (`enablePromptCaching: false`) and do not
+    /// pay write premiums on throwaway prefixes.
+    fn breakpoints_allowed(&self, request: &ModelRequest<'_>, latches: &latches::Latches) -> bool {
+        request.prompt_cache_key.is_some() && !latches.cache_control_refused
+    }
+
+    fn request_latches(&self, cache_key: Option<&str>) -> latches::Latches {
+        self.latches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .latches(cache_key)
+            .clone()
+    }
+
     fn request_body(
         &self,
         request: ModelRequest<'_>,
         stream: bool,
         oauth: bool,
+        options: &rho_sdk::provider::ModelRequestOptions,
     ) -> Result<AnthropicRequest, ModelError> {
+        let latches = self.request_latches(request.prompt_cache_key);
         let target = self.model_identity();
-        let max_tokens = self.max_tokens();
+        let max_tokens = options
+            .max_output_tokens()
+            .map_or_else(|| self.max_tokens(), |cap| self.max_tokens().min(cap.get()));
         let (thinking, output_config) = thinking::thinking_config_for(
             &self.thinking_source(),
             request.reasoning_level,
@@ -295,9 +367,14 @@ impl AnthropicProvider {
                 request.prompt_cache_key,
                 output_config,
                 &mut messages,
+                !latches.mid_conv_system_refused,
             )
         };
-        mark_cache_control_points(&mut messages);
+        let cacheable = self.breakpoints_allowed(&request, &latches);
+        let ttl = self.wire_ttl(oauth, &latches);
+        if cacheable {
+            mark_cache_control_points(&mut messages, ttl);
+        }
         let mut tools = request
             .tools
             .iter()
@@ -310,13 +387,15 @@ impl AnthropicProvider {
                 tool.description = sanitize_oauth_prose(&tool.description);
             }
         }
-        if let Some(tool) = tools.last_mut() {
-            tool.cache_control = Some(AnthropicCacheControl::ephemeral());
+        if cacheable {
+            if let Some(tool) = tools.last_mut() {
+                tool.cache_control = Some(AnthropicCacheControl::ephemeral().with_ttl(ttl));
+            }
         }
         let mut system_blocks = system.map(|text| {
             vec![AnthropicSystemBlock::text(
                 text,
-                Some(AnthropicCacheControl::ephemeral()),
+                cacheable.then(|| AnthropicCacheControl::ephemeral().with_ttl(ttl)),
             )]
         });
         if oauth {
@@ -325,12 +404,29 @@ impl AnthropicProvider {
             }
             // Anthropic's OAuth classifier expects the Claude Code identity
             // line first; the app's own system text keeps the second (cached)
-            // breakpoint.
+            // breakpoint. The identity line is byte-identical for every Rho
+            // session on the account, so it carries `scope: "global"` — a new
+            // or resumed conversation can read the shared prefix instead of
+            // rewriting it, matching Claude Code's classifier block.
+            let identity_control = if cacheable {
+                Some(
+                    AnthropicCacheControl::ephemeral()
+                        .with_ttl(ttl)
+                        .with_scope((!latches.scope_refused).then_some(GLOBAL_CACHE_SCOPE)),
+                )
+            } else {
+                None
+            };
+            let scope = (!latches.scope_refused).then_some(GLOBAL_CACHE_SCOPE);
             let claude_code = AnthropicSystemBlock::text(
                 CLAUDE_CODE_SYSTEM_PREFIX.to_string(),
                 match system_blocks.as_mut().and_then(|blocks| blocks.first_mut()) {
-                    Some(first) => first.cache_control.take(),
-                    None => Some(AnthropicCacheControl::ephemeral()),
+                    Some(first) => first
+                        .cache_control
+                        .take()
+                        .map(|control| control.with_scope(scope))
+                        .or(identity_control),
+                    None => identity_control,
                 },
             );
             system_blocks
@@ -338,11 +434,19 @@ impl AnthropicProvider {
                 .insert(0, claude_code);
         }
         // `-fast` catalog rows are a speed tier of the base model on the
-        // native host, not a model id: strip the suffix and send `speed`.
-        let (model, speed) = match fast_mode_base(&self.model).filter(|_| self.native_route()) {
+        // native host, not a model id: strip the suffix and send `speed`. A
+        // requested Priority service tier maps onto the same wire flag.
+        let (model, mut speed) = match fast_mode_base(&self.model).filter(|_| self.native_route()) {
             Some(base) => (base.to_string(), Some("fast")),
             None => (self.model.clone(), None),
         };
+        if speed.is_none()
+            && self.native_route()
+            && options.service_tier() == Some(rho_sdk::model::ServiceTier::Priority)
+            && fast_mode_base(&format!("{}-fast", self.model)).is_some()
+        {
+            speed = Some("fast");
+        }
         Ok(AnthropicRequest {
             model,
             max_tokens,
@@ -374,15 +478,44 @@ impl AnthropicProvider {
         &self,
         request: ModelRequest<'_>,
         on_event: &mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send),
+        on_request_event: &mut (dyn FnMut(rho_sdk::provider::ProviderRequestEvent) -> Result<(), ModelError>
+                  + Send),
+    ) -> Result<ModelResponse, ModelError> {
+        self.stream_turn_with_options(
+            request,
+            rho_sdk::provider::ModelRequestOptions::default(),
+            on_event,
+            on_request_event,
+        )
+        .await
+    }
+
+    /// `max_tokens` is always sent, so every route honors an output cap —
+    /// a keep-warm ping caps at one token. The TUI still verifies the cap
+    /// from reported usage before repeating a capped request.
+    pub(crate) fn applies_max_output_tokens(&self) -> bool {
+        true
+    }
+
+    pub(crate) async fn stream_turn_with_options(
+        &self,
+        request: ModelRequest<'_>,
+        options: rho_sdk::provider::ModelRequestOptions,
+        on_event: &mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send),
         _on_request_event: &mut (dyn FnMut(rho_sdk::provider::ProviderRequestEvent) -> Result<(), ModelError>
                   + Send),
     ) -> Result<ModelResponse, ModelError> {
-        self.send_messages_stream(request, on_event).await
+        self.send_messages_stream(request, &options, on_event).await
     }
 
     async fn send_messages(&self, request: ModelRequest<'_>) -> Result<ModelResponse, ModelError> {
         let response = self
-            .send_with_refresh(request, false, &mut |_| Ok(()))
+            .send_with_refresh(
+                request,
+                false,
+                &rho_sdk::provider::ModelRequestOptions::default(),
+                &mut |_| Ok(()),
+            )
             .await?;
         Ok(strip_oauth_tool_names(response, self.oauth_route()))
     }
@@ -390,11 +523,12 @@ impl AnthropicProvider {
     async fn send_messages_stream(
         &self,
         request: ModelRequest<'_>,
+        options: &rho_sdk::provider::ModelRequestOptions,
         on_event: &mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send),
     ) -> Result<ModelResponse, ModelError> {
         let oauth = self.oauth_route();
         let response = self
-            .send_with_refresh(request, true, &mut |event| {
+            .send_with_refresh(request, true, options, &mut |event| {
                 on_event(strip_oauth_event_tool_name(event, oauth))
             })
             .await?;
@@ -402,34 +536,104 @@ impl AnthropicProvider {
     }
 
     /// Sends one request, retrying once after a 401 with a force-refreshed
-    /// OAuth token (an expired grant is the common cause).
+    /// OAuth token (an expired grant is the common cause) and replaying it
+    /// degraded after each newly classified 400 — cache fields, mid-
+    /// conversation system markers, or refused betas a hosted adapter
+    /// rejects. Latches stick for the conversation, so a refused field is
+    /// never sent twice.
     async fn send_with_refresh(
         &self,
         request: ModelRequest<'_>,
         stream: bool,
+        options: &rho_sdk::provider::ModelRequestOptions,
         on_event: &mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send),
     ) -> Result<ModelResponse, ModelError> {
-        let auth = self.request_auth().await?;
-        match self
-            .send_once(request.clone(), stream, &auth, &mut *on_event)
-            .await
-        {
-            Err(error) if is_unauthorized(&error) => {
-                let AnthropicAuth::OAuth(manager) = &self.auth else {
-                    return Err(error);
-                };
-                let Some(material) = manager.force_refresh(&auth.access_token).await? else {
-                    return Err(error);
-                };
-                let auth = RequestAuth {
-                    access_token: material.access_token,
-                    oauth: auth.oauth,
-                };
-                self.send_once(request.clone(), stream, &auth, on_event)
-                    .await
+        let mut auth = self.request_auth().await?;
+        let mut refreshed = false;
+        // One auth retry plus up to two degradation replays bound the loop.
+        for _ in 0..4 {
+            match self
+                .send_once(request.clone(), stream, &auth, options, &mut *on_event)
+                .await
+            {
+                Err(error) if is_unauthorized(&error) && !refreshed => {
+                    refreshed = true;
+                    let AnthropicAuth::OAuth(manager) = &self.auth else {
+                        return Err(error);
+                    };
+                    let Some(material) = manager.force_refresh(&auth.access_token).await? else {
+                        return Err(error);
+                    };
+                    auth = RequestAuth {
+                        access_token: material.access_token,
+                        oauth: auth.oauth,
+                    };
+                }
+                Err(error) => {
+                    let Some(degrade) = self.classify_failure(&error, request.prompt_cache_key)
+                    else {
+                        return Err(error);
+                    };
+                    let newly = {
+                        self.latches
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .latch(request.prompt_cache_key, degrade)
+                    };
+                    if !newly {
+                        return Err(error);
+                    }
+                }
+                result => return result,
             }
-            result => result,
         }
+        Err(ModelError::InvalidResponse(
+            "provider rejected the request after every downgrade".into(),
+        ))
+    }
+
+    /// Maps a failed attempt to the downgrade it asks for, or `None` when the
+    /// error is not a classified field refusal.
+    fn classify_failure(
+        &self,
+        error: &ModelError,
+        cache_key: Option<&str>,
+    ) -> Option<latches::Degrade> {
+        let ModelError::HttpStatus { status, body, .. } = error else {
+            return None;
+        };
+        if !matches!(
+            *status,
+            http::StatusCode::BAD_REQUEST | http::StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            return None;
+        }
+        let latches = self.request_latches(cache_key);
+        let sent_betas = self.sent_betas(latches.mid_conv_system_refused, &latches.refused_betas);
+        latches::classify_bad_request(body, &sent_betas)
+    }
+
+    /// The `anthropic-beta` values an attempt would send under `latches`.
+    fn sent_betas(
+        &self,
+        mid_conv_system_refused: bool,
+        refused: &std::collections::BTreeSet<&'static str>,
+    ) -> Vec<&'static str> {
+        let mut betas = Vec::new();
+        if self.native_route() {
+            betas.extend(COMMON_BETAS.split(','));
+        }
+        if fast_mode_base(&self.model).is_some() && self.native_route() {
+            betas.push(FAST_MODE_BETA);
+        }
+        if !mid_conv_system_refused {
+            betas.push(per_message_effort::BETA);
+        }
+        if matches!(self.auth, AnthropicAuth::OAuth(_)) && self.native_route() {
+            betas.extend(OAUTH_BETAS.split(','));
+        }
+        betas.retain(|beta| !refused.contains(beta));
+        betas
     }
 
     async fn send_once(
@@ -437,13 +641,15 @@ impl AnthropicProvider {
         request: ModelRequest<'_>,
         stream: bool,
         auth: &RequestAuth,
+        options: &rho_sdk::provider::ModelRequestOptions,
         on_event: &mut (dyn FnMut(ModelEvent) -> Result<(), ModelError> + Send),
     ) -> Result<ModelResponse, ModelError> {
         let cache_key = request.prompt_cache_key;
-        let body = self.request_body(request, stream, auth.oauth)?;
+        let body = self.request_body(request, stream, auth.oauth, options)?;
+        let latches = self.request_latches(cache_key);
         let headers = self.session_headers.headers(cache_key);
         let response = super::request_body::send(
-            self.messages_request(&body, auth)
+            self.messages_request(&body, auth, &latches)
                 .headers(headers)
                 .json(&body),
             self.compression,
@@ -509,16 +715,19 @@ impl AnthropicProvider {
         &self,
         body: &AnthropicRequest,
         auth: &RequestAuth,
+        latches: &latches::Latches,
     ) -> reqwest::RequestBuilder {
         let mut betas = Vec::new();
         if self.native_route() {
             betas.push(COMMON_BETAS);
         }
-        if body.speed.is_some() {
+        if body.speed.is_some() && !latches.refused_betas.contains(FAST_MODE_BETA) {
             betas.push(FAST_MODE_BETA);
         }
         if let Some(beta) = per_message_effort::beta_header(&body.messages) {
-            betas.push(beta);
+            if !latches.refused_betas.contains(beta) {
+                betas.push(beta);
+            }
         }
         if auth.oauth {
             betas.push(OAUTH_BETAS);
@@ -552,6 +761,16 @@ fn is_unauthorized(error: &ModelError) -> bool {
         error,
         ModelError::HttpStatus { status, .. } if *status == http::StatusCode::UNAUTHORIZED
     )
+}
+
+/// `RHO_ANTHROPIC_CACHE_TTL` override on the native route: `"5m"` or `"1h"`.
+/// Anything else is ignored so a typo cannot kill request construction.
+fn env_cache_ttl() -> Option<std::time::Duration> {
+    match std::env::var(CACHE_TTL_ENV).ok()?.as_str() {
+        "5m" => Some(std::time::Duration::from_secs(5 * 60)),
+        "1h" => Some(std::time::Duration::from_secs(60 * 60)),
+        _ => None,
+    }
 }
 
 /// OAuth wire name for one tool: `mcp__<name>`, with the classifier-aliased
@@ -744,7 +963,7 @@ fn provider_context_replay(thinking: Option<&AnthropicThinkingConfig>) -> Provid
     }
 }
 
-fn mark_cache_control_points(messages: &mut [AnthropicMessage]) {
+fn mark_cache_control_points(messages: &mut [AnthropicMessage], ttl: Option<&'static str>) {
     // Writes occur only at marked breakpoints. Anthropic looks 20 content
     // blocks upstream of each one, so a fat tool-result user turn can miss the
     // previous write if only the tail is marked. Mark the last shared block of
@@ -774,13 +993,13 @@ fn mark_cache_control_points(messages: &mut [AnthropicMessage]) {
         }
     }
     if let Some(&(tail_message, tail_block)) = points.last() {
-        set_user_breakpoint(&mut messages[tail_message].content[tail_block]);
+        set_user_breakpoint(&mut messages[tail_message].content[tail_block], ttl);
         if let Some(&(prefix_message, prefix_block)) = points
             .iter()
             .rev()
             .find(|(message_index, _)| *message_index < tail_message)
         {
-            set_user_breakpoint(&mut messages[prefix_message].content[prefix_block]);
+            set_user_breakpoint(&mut messages[prefix_message].content[prefix_block], ttl);
         }
         return;
     }
@@ -795,17 +1014,17 @@ fn mark_cache_control_points(messages: &mut [AnthropicMessage]) {
             .rev()
             .find(|block| matches!(block, AnthropicContentBlock::Text { .. }))
         {
-            *cache_control = Some(AnthropicCacheControl::ephemeral());
+            *cache_control = Some(AnthropicCacheControl::ephemeral().with_ttl(ttl));
             return;
         }
     }
 }
 
-fn set_user_breakpoint(block: &mut AnthropicContentBlock) {
+fn set_user_breakpoint(block: &mut AnthropicContentBlock, ttl: Option<&'static str>) {
     match block {
         AnthropicContentBlock::Text { cache_control, .. }
         | AnthropicContentBlock::ToolResult { cache_control, .. } => {
-            *cache_control = Some(AnthropicCacheControl::ephemeral());
+            *cache_control = Some(AnthropicCacheControl::ephemeral().with_ttl(ttl));
         }
         AnthropicContentBlock::Thinking { .. }
         | AnthropicContentBlock::RedactedThinking { .. }
@@ -825,4 +1044,233 @@ fn is_user_text_block(block: &AnthropicContentBlock) -> bool {
     matches!(block, AnthropicContentBlock::Text { .. })
 }
 
-crate::impl_sdk_model_provider!(AnthropicProvider);
+crate::impl_sdk_model_provider!(
+    AnthropicProvider,
+    request_options(max_output_tokens = Self::applies_max_output_tokens)
+);
+
+#[cfg(test)]
+mod tests {
+    use rho_sdk::{
+        model::{Message, ToolSpec},
+        provider::ModelRequestOptions,
+        CancellationToken, ReasoningLevel,
+    };
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    fn test_request<'a>(
+        messages: &'a [Message],
+        tools: &'a [ToolSpec],
+        prompt_cache_key: Option<&'a str>,
+    ) -> ModelRequest<'a> {
+        ModelRequest {
+            messages,
+            tools,
+            cancellation: CancellationToken::new(),
+            reasoning_level: ReasoningLevel::Off,
+            prompt_cache_key,
+        }
+    }
+
+    fn tool() -> ToolSpec {
+        ToolSpec {
+            name: "read".into(),
+            description: "read a file".into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn body(provider: &AnthropicProvider, request: ModelRequest<'_>, oauth: bool) -> Value {
+        serde_json::to_value(
+            provider
+                .request_body(request, false, oauth, &ModelRequestOptions::default())
+                .expect("request body"),
+        )
+        .expect("serializes")
+    }
+
+    /// Every `cache_control` leaf in the serialized body, for assertions
+    /// that count breakpoints or inspect `ttl`/`scope`.
+    fn cache_controls(body: &Value) -> Vec<&Value> {
+        let mut found = Vec::new();
+        let mut stack = vec![body];
+        while let Some(value) = stack.pop() {
+            match value {
+                Value::Object(map) => {
+                    if let Some(control) = map.get("cache_control") {
+                        found.push(control);
+                    }
+                    stack.extend(map.values());
+                }
+                Value::Array(items) => stack.extend(items),
+                _ => {}
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn api_key_route_sends_5m_ttl() {
+        let provider = AnthropicProvider::new("claude-sonnet-4-5".into(), "key".into());
+        let messages = vec![Message::user_text("hello")];
+        let tools = vec![tool()];
+        let body = body(
+            &provider,
+            test_request(&messages, &tools, Some("conv")),
+            false,
+        );
+        let controls = cache_controls(&body);
+        assert!(!controls.is_empty());
+        assert!(
+            controls.iter().all(|control| control["ttl"] == "5m"),
+            "every breakpoint carries the 5m ttl: {body}"
+        );
+    }
+
+    #[test]
+    fn oauth_route_sends_1h_ttl_and_global_scope_identity() {
+        let provider = AnthropicProvider::new("claude-sonnet-4-5".into(), "key".into());
+        let messages = vec![
+            Message::System("you are helpful".into()),
+            Message::user_text("hello"),
+        ];
+        let tools = vec![tool()];
+        let body = body(
+            &provider,
+            test_request(&messages, &tools, Some("conv")),
+            true,
+        );
+        let system = body["system"].as_array().expect("system blocks");
+        let identity = &system[0];
+        assert_eq!(identity["text"], CLAUDE_CODE_SYSTEM_PREFIX);
+        assert_eq!(identity["cache_control"]["scope"], "global");
+        assert_eq!(identity["cache_control"]["ttl"], "1h");
+        // The single system breakpoint moves onto the identity block — the
+        // byte-identical line Anthropic can share account-wide — so the
+        // app's own system text is covered by the tool/message breakpoints
+        // and the four-breakpoint cap is not exceeded.
+        assert!(system[1].get("cache_control").is_none(), "{system:?}");
+    }
+
+    #[test]
+    fn keyless_request_sends_no_cache_control() {
+        let provider = AnthropicProvider::new("claude-sonnet-4-5".into(), "key".into());
+        let messages = vec![Message::user_text("hello")];
+        let tools = vec![tool()];
+        let body = body(&provider, test_request(&messages, &tools, None), false);
+        assert!(cache_controls(&body).is_empty(), "{body}");
+    }
+
+    #[test]
+    fn latched_cache_control_strips_breakpoints() {
+        let provider = AnthropicProvider::new("claude-sonnet-4-5".into(), "key".into());
+        provider
+            .latches
+            .lock()
+            .unwrap()
+            .latch(Some("conv"), latches::Degrade::StripCacheControl);
+        let messages = vec![Message::user_text("hello")];
+        let tools = vec![tool()];
+        let body = body(
+            &provider,
+            test_request(&messages, &tools, Some("conv")),
+            false,
+        );
+        assert!(cache_controls(&body).is_empty(), "{body}");
+    }
+
+    #[test]
+    fn latched_ttl_drops_leaf_only() {
+        let provider = AnthropicProvider::new("claude-sonnet-4-5".into(), "key".into());
+        provider
+            .latches
+            .lock()
+            .unwrap()
+            .latch(Some("conv"), latches::Degrade::DropTtl);
+        let messages = vec![Message::user_text("hello")];
+        let tools = vec![tool()];
+        let body = body(
+            &provider,
+            test_request(&messages, &tools, Some("conv")),
+            false,
+        );
+        let controls = cache_controls(&body);
+        assert!(!controls.is_empty());
+        assert!(controls.iter().all(|control| control.get("ttl").is_none()));
+    }
+
+    #[test]
+    fn latched_scope_drops_leaf_only() {
+        let provider = AnthropicProvider::new("claude-sonnet-4-5".into(), "key".into());
+        provider
+            .latches
+            .lock()
+            .unwrap()
+            .latch(Some("conv"), latches::Degrade::DropScope);
+        let messages = vec![Message::user_text("hello")];
+        let tools = vec![tool()];
+        let body = body(
+            &provider,
+            test_request(&messages, &tools, Some("conv")),
+            true,
+        );
+        let system = body["system"].as_array().expect("system blocks");
+        let control = &system[0]["cache_control"];
+        assert_eq!(control["ttl"], "1h");
+        assert!(control.get("scope").is_none(), "{control}");
+    }
+
+    #[test]
+    fn latches_are_scoped_per_conversation() {
+        let provider = AnthropicProvider::new("claude-sonnet-4-5".into(), "key".into());
+        provider
+            .latches
+            .lock()
+            .unwrap()
+            .latch(Some("other"), latches::Degrade::StripCacheControl);
+        let messages = vec![Message::user_text("hello")];
+        let tools = vec![tool()];
+        let body = body(
+            &provider,
+            test_request(&messages, &tools, Some("conv")),
+            false,
+        );
+        assert!(!cache_controls(&body).is_empty());
+    }
+
+    #[test]
+    fn configured_ttl_override_wins() {
+        let provider = AnthropicProvider::new("claude-sonnet-4-5".into(), "key".into())
+            .with_cache_ttl(Some(std::time::Duration::from_secs(301)));
+        let messages = vec![Message::user_text("hello")];
+        let tools = vec![tool()];
+        let body = body(
+            &provider,
+            test_request(&messages, &tools, Some("conv")),
+            false,
+        );
+        assert!(cache_controls(&body)
+            .iter()
+            .all(|control| control["ttl"] == "1h"));
+    }
+
+    #[test]
+    fn max_output_tokens_caps_max_tokens() {
+        let provider = AnthropicProvider::new("claude-sonnet-4-5".into(), "key".into());
+        let messages = vec![Message::user_text("hello")];
+        let tools = vec![tool()];
+        let options =
+            ModelRequestOptions::default().with_max_output_tokens(std::num::NonZeroU32::MIN);
+        let request = provider
+            .request_body(
+                test_request(&messages, &tools, Some("conv")),
+                false,
+                false,
+                &options,
+            )
+            .expect("request body");
+        assert_eq!(request.max_tokens, 1);
+    }
+}

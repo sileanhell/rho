@@ -11,8 +11,8 @@ use {
     },
     rho_providers::credentials::{
         load_anthropic_tokens, load_codex_tokens, load_kimi_tokens, load_provider_api_key,
-        load_xai_tokens, save_anthropic_tokens, save_kimi_tokens, save_xai_tokens,
-        AnthropicTokens, CodexTokens, CredentialStore, KimiTokens, XaiTokens,
+        load_xai_tokens, save_anthropic_tokens, save_kimi_tokens, save_xai_tokens, AnthropicTokens,
+        CodexTokens, CredentialStore, KimiTokens, XaiTokens,
     },
     rho_providers::providers::openai::auth::{refresh_codex_token, CodexAuthSource},
 };
@@ -1242,10 +1242,7 @@ mod tests {
         );
         assert_eq!(windows[0].remaining_percent, Some(58.0));
         assert!(windows[0].resets_at_unix.is_some());
-        assert_eq!(
-            windows[3].note.as_deref(),
-            Some("$271.40 / $500.00 spent")
-        );
+        assert_eq!(windows[3].note.as_deref(), Some("$271.40 / $500.00 spent"));
         assert!(windows[3].resets_at_unix.is_some());
     }
 

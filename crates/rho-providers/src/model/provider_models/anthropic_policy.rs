@@ -406,7 +406,13 @@ fn model_has_prefix(model: &str, prefixes: &[&str]) -> bool {
 pub(crate) fn supports_per_message_effort(model: &str) -> bool {
     model_has_prefix(
         model,
-        &["claude-fable-5-1", "claude-mythos-5-1", "claude-opus-5"],
+        &[
+            "claude-fable-5-1",
+            "claude-fable-5-2",
+            "claude-mythos-5-1",
+            "claude-mythos-5-2",
+            "claude-opus-5",
+        ],
     )
 }
 

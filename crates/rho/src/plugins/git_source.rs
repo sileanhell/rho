@@ -392,6 +392,8 @@ impl Git<'_> {
         for name in GIT_LOCATION_ENV {
             command.env_remove(name);
         }
+        #[cfg(windows)]
+        rho_tools::process_console::hide_console_window(&mut command);
         let output = command
             .arg("-C")
             .arg(self.repo)

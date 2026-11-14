@@ -383,6 +383,8 @@ async fn establish_session(
             // Servers and anything they launch must not take over the TUI's terminal.
             #[cfg(unix)]
             rho_tools::process_session::start_new_session(command.as_std_mut());
+            #[cfg(windows)]
+            rho_tools::process_console::hide_console_window(command.as_std_mut());
             // Child diagnostics must never write over the interactive terminal.
             // MCP protocol logging and connection errors use host-owned reporting.
             let (transport, _) = TokioChildProcess::builder(command)

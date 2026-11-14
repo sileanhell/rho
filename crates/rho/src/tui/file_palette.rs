@@ -7,9 +7,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{
-    App,
     file_picker::{self, FileMention, FilePaletteEntry, FilePaletteMatches},
     palette::ActivePalette,
+    App,
 };
 
 impl App {

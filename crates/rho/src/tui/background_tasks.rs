@@ -27,7 +27,7 @@ use crate::doctor::{DoctorProbeId, DoctorProbeOutcome};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum TaskId {
     ModelMetadata,
-    CustomModels,
+    ProviderModels,
     CursorModels,
     SyntaxWarmup,
     InteractiveLogin,
@@ -65,6 +65,8 @@ pub(super) enum UiOutput {
         generation: u64,
         sent_at: std::time::Instant,
         result: Result<crate::app::interactive_runtime::CacheWarmOutcome, JoinError>,
+        /// Resume warm applies its outcome without touching the idle warmer.
+        resume_warm: bool,
     },
 }
 
@@ -76,7 +78,7 @@ pub(super) enum SessionOutput {
         reasoning_at_start: (ReasoningLevel, ReasoningRequestSource),
         metadata: Result<Option<ModelMetadata>, JoinError>,
     },
-    CustomModels,
+    ProviderModels,
     CursorModels(Result<crate::cursor_runtime::models::RefreshResult, JoinError>),
     SyntaxWarmup,
     InteractiveLogin(super::login_pending::FinishedInteractiveLogin),
@@ -130,12 +132,12 @@ impl BackgroundTasks {
     pub(super) fn from_startup(services: &mut super::ApplicationServices) -> Self {
         let mut tasks = Self::default();
 
-        if let Some(handle) = services.pending_custom_models.take() {
+        if let Some(handle) = services.pending_provider_models.take() {
             tasks.track(
-                TaskId::CustomModels,
+                TaskId::ProviderModels,
                 handle,
                 OnCancel::RunToCompletion,
-                |_| SessionOutput::CustomModels.into(),
+                |_| SessionOutput::ProviderModels.into(),
             );
         }
         if let Some(handle) = services.pending_syntax_warmup.take() {
@@ -337,7 +339,8 @@ impl App {
                 generation,
                 sent_at,
                 result,
-            } => self.apply_cache_warm(generation, sent_at, result),
+                resume_warm,
+            } => self.apply_cache_warm(generation, sent_at, result, resume_warm),
         }
     }
 
@@ -357,7 +360,7 @@ impl App {
                     .await;
                 Ok(false)
             }
-            SessionOutput::CustomModels => Ok(false),
+            SessionOutput::ProviderModels => Ok(false),
             SessionOutput::CursorModels(result) => {
                 self.apply_cursor_model_refresh(result);
                 Ok(false)

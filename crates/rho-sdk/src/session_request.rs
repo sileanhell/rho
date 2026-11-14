@@ -36,6 +36,13 @@ impl SessionRequestPrefix {
             prompt_cache_key: self.prompt_cache_key.as_deref(),
         }
     }
+
+    /// Rough token count of the prefix as it would be sent (history plus
+    /// advertised tools), using the shared chars-per-token heuristic. Lets a
+    /// host skip warming a context too small to be worth a cache write.
+    pub fn estimated_input_tokens(&self) -> u64 {
+        crate::model::context::estimate_context_tokens(&self.messages, &self.tools)
+    }
 }
 
 impl Session {

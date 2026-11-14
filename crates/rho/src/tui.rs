@@ -159,6 +159,7 @@ mod panel_text;
 mod paste_burst;
 mod paste_mode;
 mod pending_input;
+mod perf_log;
 mod permission_mode;
 mod picker;
 mod picker_actions;
@@ -359,6 +360,9 @@ pub struct RuntimeModelView {
     /// Live mirror of `behavior.keep_cache_warm`. Turning it off stops any
     /// active warming at once; the `keep_warm` tool parameter follows on restart.
     pub keep_cache_warm: bool,
+    /// `behavior.resume_cache_warm`: send one capped prefix replay shortly
+    /// after a session resume so the first real turn reads a warm cache.
+    pub resume_cache_warm: bool,
     /// Resolved cache lifetime for the active provider, shared by scheduling and notices.
     pub prompt_cache_ttl: Duration,
     /// Show the keyboard hint block in the session header.
@@ -478,7 +482,9 @@ pub struct ApplicationServices {
     pub(crate) first_run: Option<first_run::SetupEntry>,
     pub auth_unavailable: Option<String>,
 
-    pub pending_custom_models: Option<tokio::task::JoinHandle<()>>,
+    /// Startup model-list refresh for every configured provider, applied to
+    /// the on-disk cache the pickers read.
+    pub pending_provider_models: Option<tokio::task::JoinHandle<()>>,
     /// Bat grammar dump loading off the UI thread. First paint stays plain if
     /// this is still running; completion rebuilds history so roles appear.
     pub pending_syntax_warmup: Option<tokio::task::JoinHandle<()>>,
@@ -497,7 +503,10 @@ pub(crate) async fn run(
     info: TuiBootstrap,
 ) -> anyhow::Result<Option<ExitReceipt>> {
     let mut terminal = synced_backend::init();
+    let perf = perf_log::PerfLog::from_env();
+    let mut boot = perf.begin_iter();
     let probe = terminal_probe::probe_terminal();
+    boot.mark("probe");
     Theme::initialize_palette(probe.palette);
     Theme::apply_committed(&info.services.theme);
     let herdr = info.services.herdr.clone();
@@ -515,8 +524,10 @@ pub(crate) async fn run(
                         .program_status
                         .with_override(std::env::var("RHO_PROGRAM_STATUS").ok().as_deref()),
                 );
+                boot.mark("app_new");
                 app.spawn_initial_herdr_report();
                 app.terminal_session = Some(TerminalSession::acquire());
+                boot.mark("acquire");
                 if let Some(manager) = agent.subagents() {
                     app.subagent_inbox.bind(manager);
                     let pool = manager.concurrency();
@@ -526,6 +537,7 @@ pub(crate) async fn run(
                         .update_agent_concurrency(pool.total_limit());
                     app.agent_concurrency = Some(pool);
                 }
+                perf.finish_named("boot", boot);
                 let (result, mut program_status) = app.run(&mut terminal, agent).await;
                 // Teardown must clear the terminal record even when the loop
                 // exits through an error rather than its clean-return path.

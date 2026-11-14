@@ -115,7 +115,10 @@ fn run_with_io(
     if let Some(custom_data) = &paths.custom_data {
         writeln!(output, "RHO_HOME is set to {custom_data:?}; only {data:?} is eligible for purge, no additional custom data path is removed")?;
     }
-    writeln!(output, "log out of providers before uninstalling; credentials are not revoked remotely")?;
+    writeln!(
+        output,
+        "log out of providers before uninstalling; credentials are not revoked remotely"
+    )?;
     writeln!(output, "paths to remove:")?;
     for target in &plan.removals {
         let kind = match target.kind {

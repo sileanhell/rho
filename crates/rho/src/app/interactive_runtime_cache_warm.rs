@@ -39,6 +39,14 @@ pub(crate) struct CacheWarmPing {
     recording: ProviderRequestUsageRecording,
 }
 
+impl CacheWarmPing {
+    /// Rough token count of the replayed prefix. A resume warm skips
+    /// prefixes too small to be worth a cache write.
+    pub(crate) fn estimated_input_tokens(&self) -> u64 {
+        self.prefix.estimated_input_tokens()
+    }
+}
+
 /// What one ping cost and whether the provider failed it.
 ///
 /// A capped ping normally ends as an `incomplete` response error after

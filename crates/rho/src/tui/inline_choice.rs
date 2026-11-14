@@ -43,7 +43,6 @@ impl InlineChoiceOption {
         self.requires_full_visibility = true;
         self
     }
-
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -590,15 +590,17 @@ fn git_status_check(path: &Path, args: &[&str]) -> bool {
     let Some(file_name) = path.file_name() else {
         return false;
     };
-    Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .arg(file_name)
         .current_dir(parent)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    rho_tools::process_console::hide_console_window(&mut command);
+    command.status().is_ok_and(|status| status.success())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

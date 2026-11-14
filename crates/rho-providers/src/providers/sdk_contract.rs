@@ -444,6 +444,9 @@ macro_rules! impl_sdk_model_provider {
     ($provider:ty, request_options) => {
         $crate::impl_sdk_model_provider!(@impl $provider, [], [@request_options], []);
     };
+    ($provider:ty, request_options(max_output_tokens = $cap:path)) => {
+        $crate::impl_sdk_model_provider!(@impl $provider, [], [@request_options @max_output_tokens($cap)], []);
+    };
     ($provider:ty, native_compact, request_options) => {
         $crate::impl_sdk_model_provider!(@impl $provider, [@native_compact], [@request_options], []);
     };

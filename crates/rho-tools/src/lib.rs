@@ -23,6 +23,9 @@ pub mod image_format;
 mod image_preview;
 mod path_glob;
 mod paths;
+#[cfg(windows)]
+#[doc(hidden)]
+pub mod process_console;
 mod process_env;
 #[cfg(unix)]
 #[doc(hidden)]

@@ -135,9 +135,11 @@ pub(crate) fn cargo_root_from_bin_path(path: &Path) -> Option<PathBuf> {
 }
 
 pub(crate) fn cargo_install_root_contains_crate(root: &Path) -> bool {
-    std::process::Command::new("cargo")
-        .args(["install", "--list", "--root"])
-        .arg(root)
+    let mut command = std::process::Command::new("cargo");
+    command.args(["install", "--list", "--root"]).arg(root);
+    #[cfg(windows)]
+    rho_tools::process_console::hide_console_window(&mut command);
+    command
         .output()
         .ok()
         .filter(|output| output.status.success())

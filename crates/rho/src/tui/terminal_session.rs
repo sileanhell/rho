@@ -44,6 +44,19 @@ impl TerminalSession {
             .await
     }
 
+    /// Events decoded but not yet consumed by the event loop.
+    pub(super) fn queued_events(&self) -> usize {
+        self.events.as_ref().map_or(0, TerminalEvents::queued)
+    }
+
+    /// An already-decoded event without waiting, if one is buffered.
+    pub(super) fn try_next_event(&mut self) -> Option<std::io::Result<Event>> {
+        self.events
+            .as_mut()
+            .expect("terminal events active")
+            .try_next()
+    }
+
     /// Run work with exclusive ownership of the user's terminal.
     ///
     /// `handoff_status` is printed on the main screen after leaving the

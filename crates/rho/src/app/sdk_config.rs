@@ -114,6 +114,9 @@ fn provider_options_with_transport(
     if let Some(request_timeout) = request_timeout {
         provider = provider.request_timeout(request_timeout)?;
     }
+    if let Some(ttl) = config.providers.prompt_cache_ttl(&config.provider) {
+        provider = provider.prompt_cache_ttl(ttl);
+    }
     Ok(provider)
 }
 

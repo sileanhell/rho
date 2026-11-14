@@ -121,6 +121,8 @@ async fn probe(cwd: &Path) -> GithubPrProbe {
     // Runs in the background of the TUI; credential helpers must not grab the terminal.
     #[cfg(unix)]
     rho_tools::process_session::start_new_session(command.as_std_mut());
+    #[cfg(windows)]
+    rho_tools::process_console::hide_console_window(command.as_std_mut());
     let child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return GithubPrProbe::Unavailable,

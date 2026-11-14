@@ -99,14 +99,19 @@ struct EffortShift {
 }
 
 /// Rewrites `messages` and returns the top-level output_config to send.
+///
+/// `markers_allowed` is the sticky per-conversation downgrade: `false` once a
+/// host rejects mid-conversation `role: system` messages, so the shift markers
+/// stop being injected and the change rides the top-level config instead.
 pub(super) fn apply(
     model: &str,
     state: &mut PerMessageEffortState,
     conversation: Option<&str>,
     current: Option<AnthropicOutputConfig>,
     messages: &mut Vec<AnthropicMessage>,
+    markers_allowed: bool,
 ) -> Option<AnthropicOutputConfig> {
-    if !provider_models::supports_per_message_effort(model) {
+    if !markers_allowed || !provider_models::supports_per_message_effort(model) {
         return current;
     }
     let Some(conversation) = conversation else {

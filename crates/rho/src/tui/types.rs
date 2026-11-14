@@ -171,6 +171,8 @@ pub(super) struct UsageUi {
     pub(in crate::tui) extra: ExtraCosts,
     /// Keep-warm ping scheduler, independent of billing and the prefix clock.
     pub(in crate::tui) cache_warm: super::cache_warm::CacheWarmer,
+    /// When the deferred resume-warm ping fires; `None` once sent or skipped.
+    pub(in crate::tui) resume_warm_due: Option<std::time::Instant>,
 }
 
 impl UsageUi {

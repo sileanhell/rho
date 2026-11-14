@@ -186,6 +186,12 @@ pub struct Config {
     /// Offer `keep_warm` on `process start`, letting the model keep the
     /// provider prompt cache warm while it waits on a long background command.
     pub keep_cache_warm: bool,
+    /// Replay the session prefix as a capped request shortly after resume so
+    /// the first real turn reads a warm prompt cache. Only fires on routes
+    /// that can cap output, above a minimum context size, and while the user
+    /// has not started a turn. Costs one cache write when the cache is cold —
+    /// the write the first turn would have paid anyway.
+    pub resume_cache_warm: bool,
     pub permission_mode: PermissionMode,
     pub(crate) legacy_web_search_credentials: LegacyWebSearchCredentials,
     pub rtk: bool,
@@ -246,6 +252,7 @@ impl Default for Config {
             advisor_mode: false,
             workspace_rewind: true,
             keep_cache_warm: true,
+            resume_cache_warm: true,
             permission_mode: PermissionMode::Bypass,
             legacy_web_search_credentials: LegacyWebSearchCredentials::default(),
             rtk: true,

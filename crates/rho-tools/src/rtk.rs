@@ -13,7 +13,11 @@ static DISCOVER_LOG_NAME: LazyLock<String> =
     LazyLock::new(|| format!("rho-{}-{}.jsonl", std::process::id(), uuid::Uuid::new_v4()));
 
 pub fn is_available() -> bool {
-    let Ok(output) = std::process::Command::new("rtk").arg("--version").output() else {
+    let mut probe = std::process::Command::new("rtk");
+    probe.arg("--version");
+    #[cfg(windows)]
+    crate::process_console::hide_console_window(&mut probe);
+    let Ok(output) = probe.output() else {
         return false;
     };
     output.status.success() && supports_rewrite(&String::from_utf8_lossy(&output.stdout))
@@ -48,13 +52,14 @@ pub async fn rewrite(command: &str) -> Option<String> {
         return None;
     }
 
-    let output = tokio::time::timeout(
-        REWRITE_TIMEOUT,
-        Command::new("rtk").arg("rewrite").arg(command).output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let mut probe = Command::new("rtk");
+    probe.arg("rewrite").arg(command);
+    #[cfg(windows)]
+    crate::process_console::hide_console_window(probe.as_std_mut());
+    let output = tokio::time::timeout(REWRITE_TIMEOUT, probe.output())
+        .await
+        .ok()?
+        .ok()?;
 
     let code = output.status.code()?;
     if code != 0 && code != 3 {

@@ -18,11 +18,17 @@ unsafe impl Sync for WindowsJob {}
 
 impl WindowsJob {
     /// Suspend the primary thread at creation until `attach` assigns its job.
+    ///
+    /// `CREATE_NO_WINDOW` comes along so a supervised child never shares the
+    /// host console: without it a console child inherits our console and can
+    /// reconfigure it (font, modes) while it runs. See
+    /// `crate::process_console`.
     pub fn prepare(command: &mut Command) {
         use std::os::windows::process::CommandExt;
-        command
-            .as_std_mut()
-            .creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+        command.as_std_mut().creation_flags(
+            windows_sys::Win32::System::Threading::CREATE_SUSPENDED
+                | windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+        );
     }
 
     /// Assign a prepared child to its job, then resume its primary thread.

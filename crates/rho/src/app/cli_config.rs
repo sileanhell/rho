@@ -5,6 +5,7 @@ use {
     rho_providers::credentials::{self, CredentialStore},
     rho_providers::model::{
         catalog,
+        decision_models::{lists_decision_models, refresh_decision_models_with_store},
         models_dev::{cached_reasoning_capabilities, current_reasoning_capabilities},
         provider_models::{
             provider_model_capabilities_need_refresh, refresh_provider_models_with_store,
@@ -121,31 +122,77 @@ pub(super) async fn refresh_model_cache(
     })
 }
 
-/// Fetches `/v1/models` for every user-defined OpenAI-compatible host.
+/// Fetches the model list for every provider the store can satisfy, so pickers
+/// open on data from this launch rather than a snapshot up to 24 hours old.
 ///
-/// Hosts with a stored API key are queried with it, so a keyed host does not
-/// come back 401 with an empty picker. Failures are ignored so a down host does
-/// not block startup. The picker stays empty until the host is reachable or the
-/// user refreshes by hand. Independent hosts refresh concurrently so one
-/// timeout cannot add to another.
-pub(super) async fn refresh_custom_provider_models(
+/// The set matches Config > Providers > Refresh model lists > All: providers
+/// with model discovery (or decision-model listing) that have a usable auth
+/// mode — a stored credential, an env override, or keyless access like Ollama
+/// and custom OpenAI-compatible hosts. `discovery_auth` probes a keyed host
+/// with its key instead of anonymously. Decision models refresh alongside chat
+/// models, the way the manual refresh does. Failures are ignored so an
+/// unreachable host does not block startup; its stale cache keeps serving the
+/// picker until a later launch or a manual refresh succeeds. Independent hosts
+/// refresh concurrently so one timeout cannot add to another.
+pub(super) async fn refresh_provider_model_lists(
     config: &Config,
     store: &dyn credentials::CredentialStore,
 ) {
-    futures_util::future::join_all(config.providers.custom.iter().map(
-        |(name, endpoint)| async move {
-            let auth = provider::provider_descriptor(name)
-                .map(|descriptor| descriptor.discovery_auth(store).id)
-                .unwrap_or(provider::KEYLESS_AUTH);
-            let _ = refresh_provider_models_with_store(
-                name,
-                auth,
-                store,
-                ProviderModelEndpoint::OpenAiCompatible(&endpoint.base_url),
-            )
-            .await;
-        },
-    ))
+    let available_auths = credentials::available_auth_modes(store);
+    futures_util::future::join_all(
+        provider::providers()
+            .into_iter()
+            .filter(|descriptor| {
+                descriptor.supports_model_refresh() || lists_decision_models(descriptor.name)
+            })
+            .filter(|descriptor| {
+                descriptor
+                    .auth_modes()
+                    .any(|mode| available_auths.iter().any(|auth| auth == mode.id))
+            })
+            .map(|descriptor| async move {
+                let auth = descriptor.discovery_auth(store).id;
+                let endpoint = config.resolved_provider_endpoint(descriptor.name);
+                if descriptor.supports_model_refresh() {
+                    let model_endpoint = endpoint.as_ref().map_or(
+                        ProviderModelEndpoint::ProviderOwned,
+                        ProviderModelEndpoint::OpenAiCompatible,
+                    );
+                    if let Err(error) = refresh_provider_models_with_store(
+                        descriptor.name,
+                        auth,
+                        store,
+                        model_endpoint,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            provider = descriptor.name,
+                            %error,
+                            "startup model list refresh failed"
+                        );
+                    }
+                }
+                if lists_decision_models(descriptor.name) {
+                    if let Some(api_base) = endpoint {
+                        if let Err(error) = refresh_decision_models_with_store(
+                            descriptor.name,
+                            auth,
+                            store,
+                            &api_base,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                provider = descriptor.name,
+                                %error,
+                                "startup decision model refresh failed"
+                            );
+                        }
+                    }
+                }
+            }),
+    )
     .await;
 }
 

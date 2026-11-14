@@ -173,6 +173,13 @@ struct StaticModel {
 fn static_subscription_models() -> Vec<StaticModel> {
     vec![
         StaticModel {
+            id: "claude-fable-5-2",
+            display_name: "Claude Fable 5.2",
+            max_input_tokens: 1_000_000,
+            max_tokens: 128_000,
+            capabilities: adaptive_capabilities(Some(false)),
+        },
+        StaticModel {
             id: "claude-fable-5-1",
             display_name: "Claude Fable 5.1",
             max_input_tokens: 1_000_000,
@@ -222,6 +229,20 @@ fn static_subscription_models() -> Vec<StaticModel> {
             capabilities: adaptive_capabilities(Some(true)),
         },
         StaticModel {
+            id: "claude-opus-4-7",
+            display_name: "Claude Opus 4.7",
+            max_input_tokens: 1_000_000,
+            max_tokens: 128_000,
+            capabilities: adaptive_capabilities(Some(true)),
+        },
+        StaticModel {
+            id: "claude-opus-4-6",
+            display_name: "Claude Opus 4.6",
+            max_input_tokens: 1_000_000,
+            max_tokens: 128_000,
+            capabilities: adaptive_capabilities(Some(true)),
+        },
+        StaticModel {
             id: "claude-sonnet-5-5",
             display_name: "Claude Sonnet 5.5",
             max_input_tokens: 1_000_000,
@@ -238,6 +259,13 @@ fn static_subscription_models() -> Vec<StaticModel> {
             capabilities: adaptive_capabilities(Some(true)),
         },
         StaticModel {
+            id: "claude-mythos-5-2",
+            display_name: "Claude Mythos 5.2",
+            max_input_tokens: 1_000_000,
+            max_tokens: 128_000,
+            capabilities: adaptive_capabilities(Some(false)),
+        },
+        StaticModel {
             id: "claude-mythos-5-1",
             display_name: "Claude Mythos 5.1",
             max_input_tokens: 1_000_000,
@@ -247,6 +275,13 @@ fn static_subscription_models() -> Vec<StaticModel> {
         StaticModel {
             id: "claude-haiku-5-5",
             display_name: "Claude Haiku 5.5",
+            max_input_tokens: 1_000_000,
+            max_tokens: 128_000,
+            capabilities: adaptive_capabilities(Some(true)),
+        },
+        StaticModel {
+            id: "claude-sonnet-4-6",
+            display_name: "Claude Sonnet 4.6",
             max_input_tokens: 1_000_000,
             max_tokens: 128_000,
             capabilities: adaptive_capabilities(Some(true)),
@@ -356,10 +391,7 @@ struct BootstrapModelAccess {
     entitled: Option<bool>,
 }
 
-async fn fetch_bootstrap(
-    provider: &str,
-    token: &str,
-) -> Option<Vec<super::ProviderModelRecord>> {
+async fn fetch_bootstrap(provider: &str, token: &str) -> Option<Vec<super::ProviderModelRecord>> {
     let response: BootstrapResponse = provider_models_client()
         .ok()?
         .get("https://api.anthropic.com/api/claude_cli/bootstrap")

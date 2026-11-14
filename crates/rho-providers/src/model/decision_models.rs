@@ -78,45 +78,46 @@ pub async fn refresh_decision_models_with_store(
             Some((url, "/models"))
         }
     };
-    let models = if let Some((url, path)) = endpoint {
-        let client = provider_models_client()?;
-        let response = authorized_models_get(&client, url, auth_mode, store)
-            .await?
-            .send()
-            .await?;
-        let display_name = descriptor.display_name;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(ModelError::InvalidResponse(format!(
-                "{display_name} {path} returned {status}"
-            )));
-        }
-        // Decoder errors can quote invalid values, including proxy-echoed secrets.
-        let response: ModelsResponse = response.json().await.map_err(|_| {
-            ModelError::InvalidResponse(format!("invalid {display_name} {path} response"))
-        })?;
-        response
-            .models
-            .into_iter()
-            .filter(|model| match host {
-                // Unlike chat discovery, no `/api/show` fallback for tags
-                // without capabilities: servers that serve decision models
-                // postdate capabilities in tags (Ollama 0.35.1 lists
-                // `["decision"]` for clef and clef-flash).
-                DiscoveryHost::Ollama => {
-                    model.capabilities.as_deref().is_some_and(|capabilities| {
-                        capabilities
-                            .iter()
-                            .any(|capability| capability == "decision")
-                    })
-                }
-                DiscoveryHost::TypeSafe => true,
-            })
-            .map(|model| model.name)
-            .collect()
-    } else {
-        Vec::new()
+    let Some((url, path)) = endpoint else {
+        // No listable endpoint for this base (for example an Ollama URL
+        // without a `/v1` root): keep the existing cache untouched.
+        return Ok(Vec::new());
     };
+    let client = provider_models_client()?;
+    let response = authorized_models_get(&client, url, auth_mode, store)
+        .await?
+        .send()
+        .await?;
+    let display_name = descriptor.display_name;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(ModelError::InvalidResponse(format!(
+            "{display_name} {path} returned {status}"
+        )));
+    }
+    // Decoder errors can quote invalid values, including proxy-echoed secrets.
+    let response: ModelsResponse = response.json().await.map_err(|_| {
+        ModelError::InvalidResponse(format!("invalid {display_name} {path} response"))
+    })?;
+    let models: Vec<String> = response
+        .models
+        .into_iter()
+        .filter(|model| match host {
+            // Unlike chat discovery, no `/api/show` fallback for tags
+            // without capabilities: servers that serve decision models
+            // postdate capabilities in tags (Ollama 0.35.1 lists
+            // `["decision"]` for clef and clef-flash).
+            DiscoveryHost::Ollama => {
+                model.capabilities.as_deref().is_some_and(|capabilities| {
+                    capabilities
+                        .iter()
+                        .any(|capability| capability == "decision")
+                })
+            }
+            DiscoveryHost::TypeSafe => true,
+        })
+        .map(|model| model.name)
+        .collect();
     let models = normalized_models(models);
     replace_cache(descriptor.name, &models).map_err(cache_error)?;
     Ok(models)

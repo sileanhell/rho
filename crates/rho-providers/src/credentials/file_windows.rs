@@ -7,7 +7,7 @@ use windows_sys::Win32::{
             BuildTrusteeWithSidW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
             SET_ACCESS, SE_FILE_OBJECT,
         },
-        DACL_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation, NO_INHERITANCE, TokenUser,
+        GetLengthSid, GetTokenInformation, TokenUser, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
         PROTECTED_DACL_SECURITY_INFORMATION, SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY,
         TOKEN_USER,
     },
@@ -70,15 +70,8 @@ unsafe fn read_token_user_sid(token: HANDLE) -> CredentialResult<Vec<u8>> {
         )));
     }
     let mut buffer = vec![0u8; len as usize];
-    if unsafe {
-        GetTokenInformation(
-            token,
-            TokenUser,
-            buffer.as_mut_ptr().cast(),
-            len,
-            &mut len,
-        )
-    } == 0
+    if unsafe { GetTokenInformation(token, TokenUser, buffer.as_mut_ptr().cast(), len, &mut len) }
+        == 0
     {
         return Err(CredentialError::StoreUnavailable(format!(
             "could not query process token user: {}",

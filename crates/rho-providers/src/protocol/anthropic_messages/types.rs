@@ -49,13 +49,35 @@ pub(crate) struct AnthropicOutputConfig {
 pub(crate) struct AnthropicCacheControl {
     #[serde(rename = "type")]
     pub(crate) kind: String,
+    /// Optional entry lifetime: `"5m"` (the service default) or `"1h"`. Sent
+    /// only when a route opts in; a plain `ephemeral` keeps the 5m default.
+    /// Request-only: replayed history re-marks breakpoints instead.
+    #[serde(default, skip_serializing_if = "Option::is_none", skip_deserializing)]
+    pub(crate) ttl: Option<&'static str>,
+    /// `"global"` shares the entry across conversations on the account for a
+    /// byte-identical prefix (the OAuth identity line). `None` scopes entries
+    /// to this conversation's prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none", skip_deserializing)]
+    pub(crate) scope: Option<&'static str>,
 }
 
 impl AnthropicCacheControl {
     pub(crate) fn ephemeral() -> Self {
         Self {
             kind: "ephemeral".into(),
+            ttl: None,
+            scope: None,
         }
+    }
+
+    pub(crate) fn with_ttl(mut self, ttl: Option<&'static str>) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    pub(crate) fn with_scope(mut self, scope: Option<&'static str>) -> Self {
+        self.scope = scope;
+        self
     }
 }
 

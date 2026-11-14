@@ -353,9 +353,9 @@ fn load_anthropic_auth(
                         .filter(|value| !value.is_empty())
                 });
             if let Some(token) = env_token {
-                return Ok(AnthropicAuth::oauth(AnthropicAuthManager::from_static_token(
-                    token,
-                )));
+                return Ok(AnthropicAuth::oauth(
+                    AnthropicAuthManager::from_static_token(token),
+                ));
             }
             if let Some(tokens) = load_anthropic_tokens(store.as_ref())? {
                 return Ok(AnthropicAuth::oauth(AnthropicAuthManager::from_store(

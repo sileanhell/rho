@@ -155,6 +155,8 @@ fn git(dir: &Path) -> Command {
         .current_dir(dir)
         .env("GIT_LITERAL_PATHSPECS", "1")
         .args(["--no-optional-locks", "-c", "core.quotePath=false"]);
+    #[cfg(windows)]
+    rho_tools::process_console::hide_console_window(&mut command);
     command
 }
 

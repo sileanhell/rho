@@ -14,21 +14,27 @@ pub(super) fn command_available(command: &str) -> bool {
 }
 
 pub(super) fn command_output(command: &str, args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new(command)
+    let mut process = Command::new(command);
+    process
         .args(args)
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    rho_tools::process_console::hide_console_window(&mut process);
+    let output = process.output().ok()?;
     output.status.success().then_some(output.stdout)
 }
 
 pub(super) fn write_command_stdin(program: &str, args: &[&str], bytes: &[u8]) -> io::Result<()> {
-    let mut child = Command::new(program)
+    let mut process = Command::new(program);
+    process
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    rho_tools::process_console::hide_console_window(&mut process);
+    let mut child = process
         .spawn()
         .map_err(|error| io::Error::new(error.kind(), format!("spawn {program}: {error}")))?;
 

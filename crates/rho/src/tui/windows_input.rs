@@ -76,6 +76,22 @@ impl Input {
     pub(super) async fn next(&mut self) -> io::Result<Event> {
         super::event_result(self.events.recv().await)
     }
+
+    /// Events decoded by the reader thread but not yet consumed.
+    pub(super) fn queued(&self) -> usize {
+        self.events.len()
+    }
+
+    /// An already-decoded event without waiting, if one is buffered.
+    pub(super) fn try_next(&mut self) -> Option<io::Result<Event>> {
+        match self.events.try_recv() {
+            Ok(event) => Some(event),
+            Err(mpsc::error::TryRecvError::Empty) => None,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                Some(Err(super::stream_ended_error()))
+            }
+        }
+    }
 }
 
 impl Drop for Input {

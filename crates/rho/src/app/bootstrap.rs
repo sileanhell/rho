@@ -305,11 +305,12 @@ async fn prepare_startup(cli: Cli) -> anyhow::Result<PreparedStartup> {
     };
 
     let store = AppCredentialStore;
-    // Interactive sessions refresh custom-provider models after the first frame
-    // so a slow host cannot hold up paint. Automation and ACP resolve the model
-    // list up front, because they get one shot to pick a model.
+    // Provider model lists refresh on every launch. Interactive sessions do it
+    // after the first frame so a slow host cannot hold up paint; automation
+    // and ACP resolve the lists up front, because they get one shot to pick a
+    // model.
     if matches!(role, AgentRole::AutomationRoot) {
-        cli_config::refresh_custom_provider_models(&config, &store).await;
+        cli_config::refresh_provider_model_lists(&config, &store).await;
     }
     let provider_refresh = cli_config::refresh_model_cache(&cli, &config, &store).await?;
     let permission_mode_before_override = config.permission_mode;
@@ -494,15 +495,18 @@ struct InteractiveStartup<'a> {
 async fn run_interactive_startup(startup: InteractiveStartup<'_>) -> anyhow::Result<()> {
     let diagnostics = bind_agent_diagnostics(&startup.config, &startup.bound_agent);
 
-    let pending_custom_models = (!startup.config.providers.custom.is_empty()).then(|| {
+    // Model lists refresh in the background on every launch so pickers open on
+    // data fetched this session. The task computes the provider set itself:
+    // keyless hosts such as Ollama are always reachable enough to probe.
+    let pending_provider_models = {
         let config = startup.config.clone();
-        tokio::spawn(
+        Some(tokio::spawn(
             async move {
-                cli_config::refresh_custom_provider_models(&config, &AppCredentialStore).await;
+                cli_config::refresh_provider_model_lists(&config, &AppCredentialStore).await;
             }
-            .instrument(tracing::info_span!("startup.custom_models")),
-        )
-    });
+            .instrument(tracing::info_span!("startup.provider_models")),
+        ))
+    };
     let prompt_history_limit = startup.config.prompt_history_limit;
     let pending_prompt_history = (prompt_history_limit > 0 && !startup.cli.no_save).then(|| {
         tokio::spawn(
@@ -560,7 +564,7 @@ async fn run_interactive_startup(startup: InteractiveStartup<'_>) -> anyhow::Res
         first_run: startup.first_run,
         missing_auth_error,
         missing_auth_model_error,
-        pending_custom_models,
+        pending_provider_models,
         pending_prompt_history,
         diagnostics,
         herdr: startup.herdr,

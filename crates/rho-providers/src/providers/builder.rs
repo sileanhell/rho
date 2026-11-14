@@ -47,6 +47,8 @@ pub struct ProviderBuildOptions {
     async_tools: BTreeSet<String>,
     /// Prefer xAI hosted image generation when the transport supports it.
     hosted_image_generation: bool,
+    /// `cache_control.ttl` override for Anthropic Messages adapters.
+    prompt_cache_ttl: Option<Duration>,
 }
 
 impl ProviderBuildOptions {
@@ -80,6 +82,7 @@ impl ProviderBuildOptions {
             hosted_web_search: true,
             async_tools: BTreeSet::new(),
             hosted_image_generation: true,
+            prompt_cache_ttl: None,
         })
     }
 
@@ -147,6 +150,14 @@ impl ProviderBuildOptions {
     /// Prefer xAI's hosted image generation tool when supported.
     pub fn hosted_image_generation(mut self, enabled: bool) -> Self {
         self.hosted_image_generation = enabled;
+        self
+    }
+
+    /// `cache_control.ttl` a Claude wire adapter requests on its breakpoints
+    /// (`"5m"`/`"1h"` after snapping to Anthropic's tiers). Ignored by
+    /// providers without per-request cache TTLs.
+    pub fn prompt_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.prompt_cache_ttl = Some(ttl);
         self
     }
 
@@ -265,7 +276,8 @@ impl ProviderBuilder {
                     auth,
                     client,
                     endpoint.unwrap_or_else(|| ANTHROPIC_API_BASE.into()),
-                );
+                )
+                .with_cache_ttl(self.options.prompt_cache_ttl);
                 Ok(Arc::new(provider))
             }
             (ProviderRuntime::Google, ProviderCredential::GoogleApiKey(api_key)) => {
@@ -315,6 +327,7 @@ impl ProviderBuilder {
                         hosted_web_search: self.options.hosted_web_search,
                         async_tools: self.options.async_tools,
                         compression: self.options.request_compression,
+                        prompt_cache_ttl: self.options.prompt_cache_ttl,
                     },
                 )
             }
@@ -387,6 +400,8 @@ struct OpenAiCompatibleBuild {
     /// Configured only for custom hosts, which construct the Responses, Chat
     /// Completions, or (SDK-declared) Anthropic Messages adapters below.
     compression: EndpointCompression,
+    /// Breakpoint TTL for the Anthropic Messages adapter.
+    prompt_cache_ttl: Option<Duration>,
 }
 
 fn build_openai_compatible_provider(
@@ -451,7 +466,8 @@ fn build_openai_compatible_provider(
                 build.api_base,
                 provider_name,
             )
-            .with_request_compression(build.compression),
+            .with_request_compression(build.compression)
+            .with_cache_ttl(build.prompt_cache_ttl),
         )),
         (CatalogSdkAdapter::AnthropicMessages, _) => Err(ModelError::InvalidResponse(format!(
             "provider '{provider_name}' Anthropic Messages requires an API key"

@@ -121,6 +121,8 @@ const RTK_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 async fn probe_rtk() -> bool {
     let mut command = tokio::process::Command::new("rtk");
     command.arg("--version");
+    #[cfg(windows)]
+    rho_tools::process_console::hide_console_window(command.as_std_mut());
     probe_rtk_command(command, RTK_PROBE_TIMEOUT).await
 }
 

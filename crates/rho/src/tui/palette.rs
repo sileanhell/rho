@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 use ratatui::text::Line;
 
 use super::{
-    App, ComposerMode,
     composer_pointer::ComposerHit,
     file_picker::{FilePaletteMatches, WorkspacePathCache},
     types::CommandChoice,
+    App, ComposerMode,
 };
 
 /// How long a palette discovery pass stays valid for keystroke and render reuse.

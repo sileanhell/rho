@@ -567,6 +567,7 @@ impl App {
         self.set_status(format!("resumed session {short_id}"));
         self.sync_herdr_session().await;
         self.reconcile_auto_classifier_gate(agent).await?;
+        self.schedule_resume_warm();
         Ok(())
     }
 

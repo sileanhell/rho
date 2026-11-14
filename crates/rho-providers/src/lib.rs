@@ -51,9 +51,7 @@ pub mod reasoning;
 pub mod system_one;
 mod tls;
 
-pub use credentials::{
-    CredentialError, CredentialResult, CredentialStore, FileCredentialStore,
-};
+pub use credentials::{CredentialError, CredentialResult, CredentialStore, FileCredentialStore};
 pub use http;
 pub use model::{ModelError, TransportError, TransportFailureKind};
 pub use provider::{auth_profiles, credential_env_vars};

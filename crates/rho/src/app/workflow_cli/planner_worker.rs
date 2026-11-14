@@ -64,6 +64,8 @@ pub(super) async fn run_supervised_planner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    rho_tools::process_console::hide_console_window(command.as_std_mut());
     let mut child = command.spawn()?;
     let mut stdin = child.stdin.take().expect("planner worker stdin is piped");
     write_frame_async(&mut stdin, &bytes).await?;

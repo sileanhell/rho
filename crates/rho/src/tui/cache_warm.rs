@@ -28,6 +28,16 @@ use crate::app::interactive_runtime::{CacheWarmOutcome, PING_OUTPUT_TOKENS};
 /// slowest round trip plus idle-loop wake latency.
 pub(super) const PING_MARGIN: Duration = Duration::from_secs(30);
 
+/// Delay before the resume-warm ping fires after a session is restored.
+/// Short enough to land before a user prompt typed right after resume, long
+/// enough for the startup frame to settle; if a turn does win the race the
+/// poll drops the ping instead of double-billing the prefix.
+const RESUME_WARM_DELAY: Duration = Duration::from_secs(2);
+
+/// Contexts below this estimate are not worth a resume-warm cache write.
+/// Roughly Claude Code's `minContextTokens` gate.
+const RESUME_WARM_MIN_TOKENS: u64 = 10_000;
+
 /// Pings per idle stretch when the model's cache prices are unknown.
 ///
 /// Receipt: [`ping_budget`] at Anthropic's Opus/Sonnet list prices (cache read
@@ -343,15 +353,18 @@ impl App {
             WarmStep::Rest | WarmStep::Waiting => false,
             WarmStep::Ping => {
                 let ping = agent.cache_warm_ping();
-                self.spawn_cache_warm_ping(async move {
-                    match ping {
-                        Ok(ping) => ping.send().await,
-                        Err(error) => CacheWarmOutcome {
-                            usage: ModelUsage::default(),
-                            error: Some(error.to_string()),
-                        },
-                    }
-                });
+                self.spawn_cache_warm_ping(
+                    async move {
+                        match ping {
+                            Ok(ping) => ping.send().await,
+                            Err(error) => CacheWarmOutcome {
+                                usage: ModelUsage::default(),
+                                error: Some(error.to_string()),
+                            },
+                        }
+                    },
+                    false,
+                );
                 false
             }
             WarmStep::Halted(halt) => {
@@ -362,12 +375,54 @@ impl App {
         self.sync_cache_warm_status() || changed
     }
 
+    /// Fires the deferred resume-warm ping once. Replays the restored
+    /// session prefix through the provider's capped cache-warm path so the
+    /// first real turn after resume reads a warm cache.
+    ///
+    /// Guards, in order: already fired or disabled, a turn or dialog owns
+    /// the session (Claude Code's `message_won_race`), the route cannot cap
+    /// output, the prefix failed to capture, or the estimate is below
+    /// [`RESUME_WARM_MIN_TOKENS`]. A cold miss is expected — the ping paid
+    /// the cache write the first turn would have — so `apply_cache_warm`
+    /// charges and counts it without surfacing a notice.
+    pub(super) fn poll_resume_warm(&mut self, agent: &InteractiveRuntime) -> bool {
+        let Some(due) = self.usage.resume_warm_due else {
+            return false;
+        };
+        if Instant::now() < due {
+            return false;
+        }
+        self.usage.resume_warm_due = None;
+        if !self.info.runtime.resume_cache_warm
+            || agent.is_session_busy()
+            || self.is_ui_busy()
+            || !agent.supports_cache_warm()
+        {
+            return false;
+        }
+        let Ok(ping) = agent.cache_warm_ping() else {
+            return false;
+        };
+        if ping.estimated_input_tokens() < RESUME_WARM_MIN_TOKENS {
+            return false;
+        }
+        self.spawn_cache_warm_ping(async move { ping.send().await }, true);
+        false
+    }
+
+    /// Schedules the one-shot resume warm after [`RESUME_WARM_DELAY`].
+    /// Rescheduling on top of a pending ping just moves the deadline.
+    pub(super) fn schedule_resume_warm(&mut self) {
+        self.usage.resume_warm_due = Some(Instant::now() + RESUME_WARM_DELAY);
+    }
+
     /// Tracks a ping as run-to-completion. The provider bills the prefix read
     /// once it accepts the request, so a reset never cancels the send; it
     /// still records that usage in the ledger.
     fn spawn_cache_warm_ping(
         &mut self,
         ping: impl std::future::Future<Output = CacheWarmOutcome> + Send + 'static,
+        resume_warm: bool,
     ) {
         let sent_at = Instant::now();
         let generation = self.usage.cache_warm.generation();
@@ -380,6 +435,7 @@ impl App {
                     generation,
                     sent_at,
                     result,
+                    resume_warm,
                 }
                 .into()
             },
@@ -394,6 +450,7 @@ impl App {
         generation: u64,
         sent_at: Instant,
         result: Result<CacheWarmOutcome, JoinError>,
+        resume_warm: bool,
     ) -> bool {
         let outcome = result.unwrap_or_else(|error| CacheWarmOutcome {
             usage: ModelUsage::default(),
@@ -408,6 +465,14 @@ impl App {
             return false;
         }
         let result = PingResult::classify(&outcome);
+        if resume_warm {
+            // A resume warm owns no idle-stretch state: a read still restarts
+            // the prefix clock, a miss or failure stays silent.
+            if result == PingResult::Read {
+                self.usage.cache_stats.record_prefix_read(sent_at);
+            }
+            return false;
+        }
         if result == PingResult::Read {
             self.usage.cache_stats.record_prefix_read(sent_at);
         }
@@ -432,6 +497,7 @@ impl App {
     /// conversation, whose totals `reset_usage` just cleared.
     pub(super) fn reset_cache_warm(&mut self) {
         self.usage.cache_warm.reset();
+        self.usage.resume_warm_due = None;
         self.tasks.abort(|id| matches!(id, TaskId::CacheWarm));
         self.sync_cache_warm_status();
     }

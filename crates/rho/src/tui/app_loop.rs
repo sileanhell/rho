@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::tui::DefaultTerminal;
-use crossterm::event::{Event, KeyEventKind};
+use crossterm::event::{Event, KeyEventKind, MouseEventKind};
 
 use crate::herdr::{HerdrDelivery, HerdrSession};
 
@@ -107,6 +107,11 @@ impl App {
         self.start_github_pr_fetch();
         let had_recovered_messages = self.insert_recovered_history()?;
         self.maybe_offer_loaded_session_context_handoff(agent, had_recovered_messages)?;
+        if had_recovered_messages {
+            // A continued session replays its prefix on the next turn; warm
+            // it first unless the user races ahead or a handoff takes over.
+            self.schedule_resume_warm();
+        }
         let open_resume_after_draw = self.info.session.open_resume_picker;
         self.info.session.open_resume_picker = false;
         // A first launch opens the full-screen setup instead of a session.
@@ -122,7 +127,9 @@ impl App {
         }
         let mut needs_redraw = true;
         let mut first_frame = true;
+        let perf = super::perf_log::PerfLog::from_env();
         while !self.should_quit {
+            let mut iter = perf.begin_iter();
             if let Some(run_id) = self
                 .workflow_panel
                 .take_watch_request()
@@ -142,21 +149,30 @@ impl App {
                 }
                 needs_redraw = true;
             }
+            iter.mark("watch");
             let background_ready = self.tasks.has_finished()
                 || self.prompt_history.load_finished()
                 || agent.startup_hydrate_ready();
-            needs_redraw |= self.poll_background(terminal, agent, first_frame).await?;
+            needs_redraw |= self
+                .poll_background(terminal, agent, first_frame, &mut iter)
+                .await?;
+            iter.mark("poll_bg");
             self.sync_herdr_session().await;
+            iter.mark("herdr");
             needs_redraw |= background_ready;
             needs_redraw |= self.update_activity_panels(agent)?;
+            iter.mark("panels");
             needs_redraw |= self
                 .poll_subagent_questionnaires(agent.session_id())
                 .await?;
+            iter.mark("questionnaires");
             // Subscribe before draining so an exit between drain and wait is not lost.
             let process_exit = agent
                 .processes()
                 .map(crate::tools::process::ProcessManager::notified_owned);
             needs_redraw |= self.poll_subagent_completions(terminal, agent).await?;
+            iter.mark("completions");
+            iter.field("redraw", needs_redraw);
             if needs_redraw {
                 terminal.draw(|frame| self.draw(frame))?;
                 needs_redraw = false;
@@ -170,10 +186,13 @@ impl App {
                     // timing on ordinary launches.
                     if open_resume_after_draw || self.info.session.startup_prompt.is_some() {
                         needs_redraw = true;
+                        iter.mark("draw");
+                        perf.finish_iter(iter);
                         continue;
                     }
                 }
             }
+            iter.mark("draw");
             let subagents_active = agent.subagents().is_some_and(|manager| {
                 manager.has_active_or_pending_notification(agent.session_id().as_str())
             }) || agent
@@ -225,15 +244,33 @@ impl App {
             self.report_program_status(resting);
             let redraw_on_timeout = self.animation_active(Instant::now());
             let timeout = self.event_poll_timeout(idle_timeout);
+            iter.field("idle_ms", idle_timeout.as_millis());
+            iter.field("poll_ms", timeout.as_millis());
+            iter.field("anim", redraw_on_timeout);
             let media_attach_pending = !self.media_attach_tasks.is_empty();
+            let wait = Instant::now();
             tokio::select! {
                 biased;
                 event = self.terminal_session.as_mut().expect("terminal session initialized").next_event() => {
+                    iter.field("arm", "event");
+                    iter.field("wait", wait.elapsed().as_millis());
+                    iter.field(
+                        "queued",
+                        self.terminal_session.as_ref().map_or(0, |s| s.queued_events()),
+                    );
+                    iter.field("ev", event.as_ref().map(event_name).unwrap_or("err"));
                     self.handle_terminal_event(event?, terminal, agent).await?;
+                    iter.field(
+                        "drained",
+                        self.drain_terminal_events(terminal, agent).await?,
+                    );
+                    iter.mark("handle");
                     needs_redraw = true;
                     needs_redraw |= self.flush_due_paste_burst();
                 }
                 () = self.subagent_inbox.recv() => {
+                    iter.field("arm", "inbox");
+                    iter.field("wait", wait.elapsed().as_millis());
                     needs_redraw = true;
                 }
                 () = async {
@@ -242,23 +279,32 @@ impl App {
                         None => std::future::pending().await,
                     }
                 } => {
+                    iter.field("arm", "proc_exit");
+                    iter.field("wait", wait.elapsed().as_millis());
                     needs_redraw = true;
                 }
                 outcome = media_attach::next_media_attach_completion(&mut self.media_attach_tasks), if media_attach_pending => {
+                    iter.field("arm", "media");
+                    iter.field("wait", wait.elapsed().as_millis());
                     self.finish_media_attach(outcome);
                     needs_redraw = true;
                 }
                 output = super::sessions_hub_tasks::next_sessions_task(&mut self.pending_sessions_task) => {
+                    iter.field("arm", "sessions");
+                    iter.field("wait", wait.elapsed().as_millis());
                     self.finish_sessions_task(output)?;
                     needs_redraw = true;
                 }
                 _ = tokio::time::sleep(timeout) => {
+                    iter.field("arm", "tick");
+                    iter.field("wait", wait.elapsed().as_millis());
                     needs_redraw |= self.questionnaire_timeout_running();
                     needs_redraw |= self.tick_questionnaire_timeout();
                     needs_redraw |= self.flush_due_paste_burst();
                     needs_redraw |= redraw_on_timeout;
                 }
             }
+            perf.finish_iter(iter);
         }
         self.prompt_history.flush();
         self.abort_compact(agent).await;
@@ -277,34 +323,103 @@ impl App {
         terminal: &'a mut DefaultTerminal,
         agent: &'a mut InteractiveRuntime,
         first_frame: bool,
+        iter: &'a mut super::perf_log::IterTiming,
     ) -> impl std::future::Future<Output = anyhow::Result<bool>> + 'a {
         // Background work and input dispatch are separate phases. Do not keep
         // background future temporaries on the stack while handling input.
         Box::pin(async move {
             let mut needs_redraw = self.apply_finished_tasks(terminal, agent).await?;
+            iter.mark("fin_tasks");
             needs_redraw |= self.apply_pending_compaction_config(agent)?;
             self.apply_pending_classifier_config(agent);
             needs_redraw |= self.poll_startup_hydrates(agent).await?;
+            iter.mark("hydrates");
             needs_redraw |= self.poll_computer_connection(agent).await;
+            iter.mark("computer");
             needs_redraw |= self.poll_compact(agent).await?;
+            iter.mark("compact");
             needs_redraw |= self.apply_pending_permission_mode(agent).await?;
+            iter.mark("perm_mode");
             needs_redraw |= self.release_pending_held_turn(terminal, agent).await?;
+            iter.mark("held_turn");
             needs_redraw |= self.start_next_follow_up(terminal, agent).await?;
+            iter.mark("follow_up");
             needs_redraw |= self.poll_cache_warm(agent);
+            iter.mark("cache_warm");
+            needs_redraw |= self.poll_resume_warm(agent);
+            iter.mark("resume_warm");
             if !first_frame {
                 needs_redraw |= self.start_startup_prompt(terminal, agent).await?;
+                iter.mark("start_prompt");
             }
             needs_redraw |= self.poll_prompt_history();
+            iter.mark("prompt_hist");
             needs_redraw |= self.poll_pending_session_title()?;
+            iter.mark("sess_title");
             needs_redraw |= self.reconcile_overlays().await?;
+            iter.mark("overlays");
             // The composer decides what to ask about and changes on key events.
             needs_redraw |= self.poll_mcp_argument_completion().await;
+            iter.mark("mcp_args");
             needs_redraw |= self.poll_markdown_images();
+            iter.mark("md_images");
             if !self.is_ui_busy() {
                 needs_redraw |= self.start_deferred_info_tree();
+                iter.mark("info_tree");
             }
             Ok(needs_redraw)
         })
+    }
+
+    /// Handles terminal events already buffered after one arrives.
+    ///
+    /// The console reader decodes bursts (paste, any-motion mouse tracking)
+    /// faster than the loop's per-event poll/draw cadence; without a drain
+    /// each record pays a full frame and the queue backs up ahead of key
+    /// presses. Consecutive pointer moves collapse into the newest position.
+    /// Bounded so a continuously producing source still reaches draw/wait.
+    pub(super) async fn drain_terminal_events(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        agent: &mut InteractiveRuntime,
+    ) -> anyhow::Result<usize> {
+        const MAX_EVENT_DRAIN: usize = 256;
+        let mut drained = 0usize;
+        let mut pending: Option<std::io::Result<Event>> = None;
+        while drained < MAX_EVENT_DRAIN {
+            let Some(mut event) = pending.take().or_else(|| {
+                self.terminal_session
+                    .as_mut()
+                    .expect("terminal session initialized")
+                    .try_next_event()
+            }) else {
+                break;
+            };
+            while drained < MAX_EVENT_DRAIN {
+                let Some(next) = self
+                    .terminal_session
+                    .as_mut()
+                    .expect("terminal session initialized")
+                    .try_next_event()
+                else {
+                    break;
+                };
+                if !coalescible_pair(&event, &next) {
+                    pending = Some(next);
+                    break;
+                }
+                event = next;
+                drained += 1;
+            }
+            self.handle_terminal_event(event?, terminal, agent).await?;
+            drained += 1;
+        }
+        // The lookahead slot may hold one event when the cap stopped the
+        // loop; it must be handled, not dropped.
+        if let Some(event) = pending.take() {
+            self.handle_terminal_event(event?, terminal, agent).await?;
+        }
+        Ok(drained)
     }
 
     pub(super) async fn handle_terminal_event(
@@ -739,5 +854,43 @@ impl App {
                 self.usage.extra_cost_usd_micros(),
             )
         })
+    }
+}
+
+/// Whether `next` supersedes `event` outright during a drain: consecutive
+/// pointer moves are only the latest cell, consecutive resizes only the
+/// latest size.
+fn coalescible_pair(event: &std::io::Result<Event>, next: &std::io::Result<Event>) -> bool {
+    let (Ok(event), Ok(next)) = (event, next) else {
+        return false;
+    };
+    match (event, next) {
+        (Event::Mouse(current), Event::Mouse(incoming)) => {
+            current.kind == MouseEventKind::Moved && incoming.kind == MouseEventKind::Moved
+        }
+        (Event::Resize(..), Event::Resize(..)) => true,
+        _ => false,
+    }
+}
+
+/// One-word event kind for `RHO_PERF` iteration logs.
+fn event_name(event: &Event) -> &'static str {
+    use crossterm::event::MouseEventKind;
+    match event {
+        Event::Key(_) => "key",
+        Event::Paste(_) => "paste",
+        Event::Resize(_, _) => "resize",
+        Event::FocusGained => "focus_in",
+        Event::FocusLost => "focus_out",
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::Moved => "mouse_move",
+            MouseEventKind::Down(_) => "mouse_down",
+            MouseEventKind::Up(_) => "mouse_up",
+            MouseEventKind::Drag(_) => "mouse_drag",
+            MouseEventKind::ScrollDown => "scroll_down",
+            MouseEventKind::ScrollUp => "scroll_up",
+            MouseEventKind::ScrollLeft => "scroll_left",
+            MouseEventKind::ScrollRight => "scroll_right",
+        },
     }
 }

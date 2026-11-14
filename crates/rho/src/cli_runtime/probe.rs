@@ -94,6 +94,8 @@ pub(crate) async fn run_bounded_command_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    rho_tools::process_console::hide_console_window(command.as_std_mut());
 
     let mut child = command
         .spawn()

@@ -91,8 +91,11 @@ fn tool_version_dir(rest: &Path) -> Option<PathBuf> {
 /// lives at `install_path`, as `mise ls --installed --json` names it. Errors
 /// say why the lookup failed: mise missing, mise failing, or no match.
 pub(crate) fn mise_tool(install_path: &Path) -> Result<String> {
-    let output = std::process::Command::new("mise")
-        .args(["ls", "--installed", "--json"])
+    let mut command = std::process::Command::new("mise");
+    command.args(["ls", "--installed", "--json"]);
+    #[cfg(windows)]
+    rho_tools::process_console::hide_console_window(&mut command);
+    let output = command
         .output()
         .context("could not run `mise ls --installed --json`")?;
     if !output.status.success() {

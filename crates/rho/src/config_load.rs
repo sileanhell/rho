@@ -236,6 +236,9 @@ pub(super) fn parse_settings(text: &str) -> anyhow::Result<(Config, Vec<ConfigWa
         if let Some(value) = group.keep_cache_warm {
             cfg.keep_cache_warm = value;
         }
+        if let Some(value) = group.resume_cache_warm {
+            cfg.resume_cache_warm = value;
+        }
         if let Some(value) = group.permission_mode {
             cfg.permission_mode = value;
         }
@@ -416,6 +419,7 @@ impl PartialConfig {
                 advisor_mode: group.advisor_mode,
                 workspace_rewind: group.workspace_rewind,
                 keep_cache_warm: group.keep_cache_warm,
+                resume_cache_warm: group.resume_cache_warm,
                 _legacy_workspace_rewind: None,
                 permission_mode: group.permission_mode.or(permission_mode),
                 edit_tool: group.edit_tool,
@@ -703,6 +707,7 @@ struct PartialBehaviorConfig {
     advisor_mode: Option<bool>,
     workspace_rewind: Option<bool>,
     keep_cache_warm: Option<bool>,
+    resume_cache_warm: Option<bool>,
     // Rho saved every key, including the old false default. Accept but ignore it;
     // only the new workspace_rewind key can opt out. Saving drops this legacy key.
     #[serde(rename = "experimental_workspace_rewind")]

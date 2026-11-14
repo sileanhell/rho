@@ -255,6 +255,8 @@ async fn run_driver(
         .envs(super::policy::telemetry_environment())
         .stdin(Stdio::null())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    rho_tools::process_console::hide_console_window(command.as_std_mut());
     let invocation = format!("cua-driver {}", args.join(" "));
     Ok(tokio::time::timeout(timeout, command.output())
         .await

@@ -39,6 +39,42 @@ impl TerminalEvents {
         }
     }
 
+    /// Events decoded but not yet consumed by the event loop. Used by
+    /// `RHO_PERF` diagnostics to spot input backlogs.
+    pub(super) fn queued(&self) -> usize {
+        #[cfg(not(windows))]
+        {
+            0
+        }
+        #[cfg(windows)]
+        {
+            match self.stream.as_ref() {
+                Some(WindowsStream::Vt(input)) => input.queued(),
+                _ => 0,
+            }
+        }
+    }
+
+    /// An already-decoded event without waiting, if one is buffered.
+    ///
+    /// Lets the event loop drain bursts (mouse tracking, paste) in one pass
+    /// instead of paying a full poll/draw cycle per record.
+    pub(super) fn try_next(&mut self) -> Option<io::Result<Event>> {
+        use futures_util::FutureExt;
+        #[cfg(not(windows))]
+        {
+            self.stream.next().now_or_never().flatten()
+        }
+        #[cfg(windows)]
+        {
+            match self.stream.as_mut() {
+                Some(WindowsStream::Vt(input)) => input.try_next(),
+                Some(WindowsStream::Legacy(stream)) => stream.next().now_or_never().flatten(),
+                None => None,
+            }
+        }
+    }
+
     pub(super) async fn next(&mut self) -> io::Result<Event> {
         #[cfg(not(windows))]
         {
@@ -66,6 +102,6 @@ fn event_result(event: Option<io::Result<Event>>) -> io::Result<Event> {
     event.unwrap_or_else(|| Err(stream_ended_error()))
 }
 
-fn stream_ended_error() -> io::Error {
+pub(super) fn stream_ended_error() -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, "terminal event stream ended")
 }
